@@ -1,0 +1,622 @@
+#include "network.h"
+#include "orbit.h"
+#include "packages.h"
+#include "firmware.h"
+#include "state_file.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <openssl/rand.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+/* Keep the large empty catalogue in BSS. Embedding it in the initialized Orbit
+ * object writes megabytes of zeroes into both the runtime and public ELF. */
+static Release releases[ORBIT_MAX_RELEASES + 1];
+/* The range splits older builds can read; a finished download is saved as one range. */
+static bool legacy_ranges(const Job *j) {
+    unsigned n = j->range_count;
+    return n == 1 || n == 2 || n == 4 || n == 8;
+}
+static bool whole_range(const Job *j) { return !strcmp(j->status, "complete") && !legacy_ranges(j); }
+Orbit orbit = {.releases = releases,
+               .mutex = PTHREAD_MUTEX_INITIALIZER,
+               .changed = PTHREAD_COND_INITIALIZER,
+               .port = ORBIT_HTTP_PORT,
+               .state_fd = -1,
+               .delete_archives = true,
+               .extract_archives = true,
+               .download_notifications = true,
+               .notify_events = NOTIFY_EVENTS_ALL,
+               .download_policy = DOWNLOAD_POLICY_DEFAULT,
+               .concurrent_downloads = ORBIT_DEFAULT_DOWNLOADS,
+               .download_connections = ORBIT_DEFAULT_CONNECTIONS};
+void copy_text(char *to, size_t cap, const char *s) {
+    if (cap)
+        snprintf(to, cap, "%s", s ? s : "");
+}
+bool utf8_text(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        if (*p < 0x20 || *p == 0x7f) return false;
+        int n = *p < 0x80 ? 0 : (*p & 0xe0) == 0xc0 ? 1 : (*p & 0xf0) == 0xe0 ? 2 : (*p & 0xf8) == 0xf0 ? 3 : -1;
+        if (n < 0 || (n == 1 && *p < 0xc2)) return false;
+        p++;
+        for (int i = 0; i < n; i++, p++)
+            if ((*p & 0xc0) != 0x80) return false;
+    }
+    return true;
+}
+const char *json_text(const cJSON *o, const char *k) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsString(v) ? v->valuestring : "";
+}
+int64_t json_int(const cJSON *o, const char *k) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, k);
+    return cJSON_IsNumber(v) ? (int64_t)v->valuedouble : 0;
+}
+static uint64_t json_identity(const cJSON *o, const char *key) {
+    const char *s = json_text(o, key);
+    return *s ? strtoumax(s, NULL, 10) : (uint64_t)json_int(o, key);
+}
+void random_hex(char *out, size_t n) {
+    unsigned char b[32];
+    if (n > 32 || RAND_bytes(b, (int)n) != 1) {
+        fputs("Secure randomness unavailable\n", stderr);
+        exit(1);
+    }
+    for (size_t i = 0; i < n; i++)
+        snprintf(out + 2 * i, 3, "%02x", b[i]);
+}
+Release *release_find(const char *id) {
+    for (size_t i = 0; i < orbit.release_count; i++)
+        if (!strcmp(orbit.releases[i].id, id))
+            return &orbit.releases[i];
+    return NULL;
+}
+Job *job_find(const char *id) {
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (!strcmp(orbit.jobs[i].id, id))
+            return &orbit.jobs[i];
+    return NULL;
+}
+static cJSON *job_json(const Job *j, bool private_fields) {
+    cJSON *o = cJSON_CreateObject();
+#define S(k, f) cJSON_AddStringToObject(o, k, j->f)
+    S("id", id);
+    S("releaseId", release_id);
+    S("storageId", storage_id);
+    S("filename", filename);
+    S("status", status);
+    S("error", error);
+    S("removalError", removal_error);
+    cJSON_AddBoolToObject(o, "removingFiles", j->history_removing);
+    S("verification", verification);
+    firmware_describe_download(o, j, orbit.firmware);
+    cJSON_AddBoolToObject(o, "canRefreshLink", job_can_refresh_link(j));
+    cJSON_AddStringToObject(o, "delivery", j->delivery[0] ? j->delivery : "direct");
+    S("deliveryPhase", delivery_phase);
+    int64_t received = j->received;
+    if (private_fields && j->segmented) {
+        received = 0;
+        for (unsigned i = 0; i < j->range_count; i++) received += j->range_received[i];
+    }
+    cJSON_AddNumberToObject(o, "received", (double)received);
+    cJSON_AddNumberToObject(o, "total", (double)j->total);
+    cJSON_AddNumberToObject(o, "speed", j->speed);
+    cJSON_AddNumberToObject(o, "retryAt", (double)j->retry_at);
+    cJSON_AddNumberToObject(o, "order", j->order);
+    char display_title[512];
+    release_download_title(&j->release, display_title, sizeof display_title);
+    cJSON_AddStringToObject(o, "title", display_title);
+    if (j->release.addon_id[0]) {
+        cJSON_AddStringToObject(o, "addonId", j->release.addon_id);
+        cJSON_AddStringToObject(o, "addonTitle", j->release.title);
+        cJSON_AddStringToObject(o, "baseGameId", j->release.base_game_id);
+        cJSON_AddStringToObject(o, "baseGameTitle", j->release.base_title);
+        cJSON_AddStringToObject(o, "addonType", j->release.addon_type);
+        cJSON_AddStringToObject(o, "contentId", j->release.content_id);
+        cJSON_AddItemToObject(o, "requirements", cJSON_Parse(j->release.requirements));
+    }
+    /* Get everything: installs once checked, after install_after's. */
+    cJSON_AddBoolToObject(o, "autoInstall", j->auto_install);
+    cJSON_AddStringToObject(o, "installAfter", j->install_after);
+    cJSON_AddStringToObject(o, "titleId", j->release.title_id);
+    cJSON_AddStringToObject(o, "format", j->release.format);
+    if (j->release.content_format[0]) cJSON_AddStringToObject(o, "contentFormat", j->release.content_format);
+    if (j->release.asset_compression[0]) cJSON_AddStringToObject(o, "assetCompression", j->release.asset_compression);
+    cJSON_AddStringToObject(o, "gameId", j->release.game_id);
+    if (j->release.compression[0]) {
+        cJSON_AddStringToObject(o, "compression", j->release.compression);
+        cJSON_AddNumberToObject(o, "extracted", (double)j->extracted);
+        cJSON_AddNumberToObject(o, "extractTotal", (double)(j->release.archive_unverified ? j->inspected_size : j->release.extracted_size));
+        if (j->release.archive_unverified) {
+            cJSON_AddStringToObject(o, "archiveContents", "unverified");
+            cJSON_AddNumberToObject(o, "inspectedBytes", (double)j->inspected_size);
+            S("detectedFormat", inspected_format);
+        }
+        S("output", output);
+        cJSON_AddBoolToObject(o, "archiveKept", j->archive_kept);
+        if (j->keep_packed) cJSON_AddBoolToObject(o, "keepPacked", true);
+        cJSON_AddBoolToObject(o, "canEnterArchivePassword", j->archive_ready && j->archive_locked && !job_active(j) &&
+            (!strcmp(j->status, "error") || !strcmp(j->status, "paused")));
+    }
+    char path[700];
+    snprintf(path, sizeof path, "%s/homebrew/%s", j->root, j->output[0] ? j->output : j->filename);
+    cJSON_AddStringToObject(o, "path", path);
+    if (!private_fields && !strcmp(j->status, "complete"))
+        cJSON_AddItemToObject(o, "installation", packages_for_download(j->id));
+    if (private_fields) {
+        cJSON_AddNumberToObject(o, "extractedFirmware", j->extracted_firmware);
+        if (j->extracted_backport) cJSON_AddTrueToObject(o, "extractedBackport");
+        if (!strcmp(j->delivery, "torbox")) {
+            S("debridAccount", debrid_account);
+            cJSON_AddNumberToObject(o, "debridId", (double)j->debrid_id);
+            cJSON_AddNumberToObject(o, "debridFile", (double)j->debrid_file);
+            cJSON_AddBoolToObject(o, "debridSubmitted", j->debrid_submitted);
+            if (j->debrid_submitted_at > 0) cJSON_AddNumberToObject(o, "debridSubmittedAt", (double)j->debrid_submitted_at);
+        }
+        if (j->segmented) {
+            cJSON *ranges = cJSON_AddArrayToObject(o, "rangeReceived");
+            if (whole_range(j))
+                cJSON_AddItemToArray(ranges, cJSON_CreateNumber((double)j->received));
+            else
+                for (unsigned i = 0; i < j->range_count; i++)
+                    cJSON_AddItemToArray(ranges, cJSON_CreateNumber((double)j->range_received[i]));
+        }
+        if (j->archive_ready) cJSON_AddBoolToObject(o, "archiveReady", true);
+        if (j->archive_locked) cJSON_AddBoolToObject(o, "archiveLocked", true);
+        if (j->resume_after_restart) cJSON_AddBoolToObject(o, "resumeAfterRestart", true);
+        if (j->archive_password[0]) { S("archivePassword", archive_password); }
+        cJSON_AddItemToObject(o, "release", release_json(&j->release));
+        if (j->release.viking_context) {
+            cJSON_AddNumberToObject(o, "vikingContext", j->release.viking_context);
+            cJSON_AddNumberToObject(o, "vikingUser", j->release.viking_user);
+            cJSON_AddBoolToObject(o, "vikingAuthenticated", j->release.viking_authenticated);
+        }
+        S("root", root);
+        S("etag", etag);
+        S("modified", modified);
+        char device[32], inode[32];
+        snprintf(device, sizeof device, "%ju", (uintmax_t)j->device);
+        snprintf(inode, sizeof inode, "%ju", (uintmax_t)j->inode);
+        cJSON_AddStringToObject(o, "device", device);
+        cJSON_AddStringToObject(o, "inode", inode);
+        if (j->drive_mark[0]) S("driveMark", drive_mark);
+        cJSON_AddNumberToObject(o, "attempts", j->attempts);
+    }
+#undef S
+    return o;
+}
+cJSON *jobs_json_locked(void) {
+    cJSON *a = cJSON_CreateArray();
+    /* Sort references only. The transfer worker retains a pointer to its fixed slot. */
+    const Job *ordered[ORBIT_MAX_JOBS];
+    size_t count = 0;
+    for (size_t i = 0; i < orbit.job_count; i++) {
+        const Job *j = &orbit.jobs[i];
+        if (!j->id[0])
+            continue;
+        size_t p = count++;
+        while (p && ordered[p - 1]->order > j->order) {
+            ordered[p] = ordered[p - 1];
+            p--;
+        }
+        ordered[p] = j;
+    }
+    for (size_t i = 0; i < count; i++)
+        cJSON_AddItemToArray(a, job_json(ordered[i], false));
+    return a;
+}
+/* Snapshots are numbered under orbit.mutex, so a higher number always holds
+ * newer state; state_file_write drops one older than the file on disk. */
+static uint64_t snapshot_generation;
+/* The snapshot whose save result orbit.state_failed shows: a late, older
+ * save must not overwrite the result of a newer one. orbit.mutex. */
+static uint64_t outcome_generation;
+static void state_outcome_locked(uint64_t generation, int rc) {
+    if (generation > outcome_generation) {
+        outcome_generation = generation;
+        orbit.state_failed = rc != 0;
+    }
+}
+static cJSON *state_json_locked(void) {
+    cJSON *o = cJSON_CreateObject(), *a = cJSON_AddArrayToObject(o, "jobs"),
+          *t = cJSON_AddArrayToObject(o, "tokens"), *used = cJSON_AddArrayToObject(o, "tokenUsed");
+    /* Direct queues retain the 0.7.0 durable layout. TorBox queues must
+     * reject older builds, which cannot retain the delivery/account identity. */
+    unsigned schema = 4;
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (orbit.jobs[i].id[0] && !strcmp(orbit.jobs[i].delivery, "torbox") && schema < 5) schema = 5;
+    /* Older builds would treat a compressed download as a finished plain file. */
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (orbit.jobs[i].id[0] && orbit.jobs[i].release.compression[0]) schema = 6;
+    /* Older builds only read splits of 1, 2, 4 or 8 ranges: an unfinished
+     * download with another split needs this build to resume it. */
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (orbit.jobs[i].id[0] && orbit.jobs[i].segmented && !legacy_ranges(&orbit.jobs[i]) && !whole_range(&orbit.jobs[i]))
+            schema = 7;
+    cJSON_AddNumberToObject(o, "schema", schema);
+    cJSON_AddStringToObject(o, "preferredStorage", orbit.preferred_storage);
+    cJSON_AddBoolToObject(o, "deleteArchives", orbit.delete_archives);
+    cJSON_AddBoolToObject(o, "extractArchives", orbit.extract_archives);
+    cJSON_AddBoolToObject(o, "downloadNotifications", orbit.download_notifications);
+    cJSON *events = cJSON_AddArrayToObject(o, "notificationEvents");
+    for (unsigned i = 0; notify_event_name(i); i++)
+        if (orbit.notify_events & (1u << i)) cJSON_AddItemToArray(events, cJSON_CreateString(notify_event_name(i)));
+    cJSON_AddStringToObject(o, "notifiedUpdate", orbit.notified_update);
+    cJSON_AddBoolToObject(o, "deletePackages", orbit.delete_packages);
+    cJSON_AddBoolToObject(o, "alwaysUseTorBox", orbit.always_use_torbox);
+    cJSON_AddStringToObject(o, "lastDelivery", !strcmp(orbit.last_delivery, "torbox") ? "torbox" : "direct");
+    cJSON_AddBoolToObject(o, "shutdownWhenDone", orbit.shutdown_when_done);
+    cJSON_AddStringToObject(o, "shutdownJob", orbit.shutdown_job);
+    cJSON *holds = cJSON_AddArrayToObject(o, "shutdownHolds");
+    for (size_t i = 0; i < 16; ++i)
+        if (orbit.shutdown_holds[i][0]) cJSON_AddItemToArray(holds, cJSON_CreateString(orbit.shutdown_holds[i]));
+    cJSON_AddStringToObject(o, "historyFiles", *orbit.history_files ? orbit.history_files : "ask");
+    cJSON_AddNumberToObject(o, "concurrentDownloads", orbit.concurrent_downloads);
+    cJSON_AddNumberToObject(o, "downloadConnections", orbit.download_connections);
+    download_policy_json(o, &orbit.download_policy);
+    cJSON_AddNumberToObject(o, "debridNextCreate", (double)orbit.debrid_next_create);
+    cJSON_AddItemToObject(o, "favorites", favorites_json_locked());
+    cJSON_AddItemToObject(o, "savedFilters", saved_filters_json_locked());
+    cJSON *sources = cJSON_AddObjectToObject(o, "sources");
+    cJSON_AddNumberToObject(sources, "enabled", orbit.sources.enabled);
+    cJSON_AddNumberToObject(sources, "noticeVersion", orbit.sources.notice_version);
+    cJSON_AddNumberToObject(sources, "acknowledgedAt", (double)orbit.sources.acknowledged_at);
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (orbit.jobs[i].id[0])
+            cJSON_AddItemToArray(a, job_json(&orbit.jobs[i], true));
+    for (size_t i = 0; i < orbit.token_count; i++) {
+        cJSON_AddItemToArray(t, cJSON_CreateString(orbit.tokens[i]));
+        cJSON_AddItemToArray(used, cJSON_CreateNumber((double)orbit.token_used[i]));
+    }
+    return o;
+}
+int state_save_locked(void) {
+    cJSON *o = state_json_locked();
+    const uint64_t generation = ++snapshot_generation;
+    char *s = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!s)
+        return -1;
+    int rc = state_file_write(orbit.state_fd, generation, s, strlen(s));
+    free(s);
+    state_outcome_locked(generation, rc);
+    return rc;
+}
+struct StateSnapshot {
+    cJSON *json;
+    uint64_t generation;
+};
+StateSnapshot *state_snapshot_locked(void) {
+    StateSnapshot *snapshot = malloc(sizeof *snapshot);
+    if (!snapshot) return NULL;
+    snapshot->json = state_json_locked();
+    snapshot->generation = ++snapshot_generation;
+    return snapshot;
+}
+int state_snapshot_save(StateSnapshot *snapshot) {
+    if (!snapshot) return -1;
+    char *s = cJSON_PrintUnformatted(snapshot->json);
+    cJSON_Delete(snapshot->json);
+    const uint64_t generation = snapshot->generation;
+    free(snapshot);
+    if (!s)
+        return -1;
+    int rc = state_file_write(orbit.state_fd, generation, s, strlen(s));
+    free(s);
+    pthread_mutex_lock(&orbit.mutex);
+    state_outcome_locked(generation, rc);
+    pthread_mutex_unlock(&orbit.mutex);
+    return rc;
+}
+static int backup_legacy_state(const char *data, size_t length) {
+    char nonce[17], name[64];
+    random_hex(nonce, 8);
+    snprintf(name, sizeof name, "state-before-buffered-%s.json", nonce);
+    int fd = openat(orbit.state_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t n = write(fd, data + written, length - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        written += (size_t)n;
+    }
+    int rc = written == length ? fsync(fd) : -1;
+    if (close(fd)) rc = -1;
+    if (!rc) rc = fsync(orbit.state_fd);
+    if (rc) unlinkat(orbit.state_fd, name, 0);
+    else orbit.queue_backup_created = true;
+    return rc;
+}
+int state_load(void) {
+    int fd = openat(orbit.state_fd, "state.json", O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+        return 0;
+    struct stat st;
+    if (fstat(fd, &st) || st.st_size < 1 || st.st_size > 1024 * 1024) {
+        close(fd);
+        return -1;
+    }
+    size_t n = (size_t)st.st_size;
+    char *s = calloc(n + 1, 1);
+    if (!s) {
+        close(fd);
+        return -1;
+    }
+    size_t p = 0;
+    while (p < n) {
+        ssize_t got = read(fd, s + p, n - p);
+        if (got <= 0)
+            break;
+        p += (size_t)got;
+    }
+    close(fd);
+    cJSON *o = p == n ? cJSON_Parse(s) : NULL;
+    const cJSON *schema_value = cJSON_GetObjectItemCaseSensitive(o, "schema");
+    if (!cJSON_IsNumber(schema_value) ||
+        (schema_value->valuedouble != 1 && schema_value->valuedouble != 2 && schema_value->valuedouble != 3 &&
+         schema_value->valuedouble != 4 && schema_value->valuedouble != 5 && schema_value->valuedouble != 6 &&
+         schema_value->valuedouble != 7)) {
+        free(s);
+        cJSON_Delete(o);
+        return -1;
+    }
+    int schema = (int)schema_value->valuedouble;
+    /* Save the exact old queue before any buffered-schema write. No overwrite and no
+     * migration when backup fails; filenames/credentials stay on the console. */
+    if (schema < 4 && backup_legacy_state(s, n)) {
+        free(s);
+        cJSON_Delete(o);
+        return -1;
+    }
+    free(s);
+    const cJSON *x;
+    const cJSON *next_create = cJSON_GetObjectItemCaseSensitive(o, "debridNextCreate");
+    if (next_create) {
+        if (!cJSON_IsNumber(next_create) || !(next_create->valuedouble >= 0 && next_create->valuedouble <= 4102444800.0) ||
+            next_create->valuedouble != (double)(time_t)next_create->valuedouble) { cJSON_Delete(o); return -1; }
+        orbit.debrid_next_create = (time_t)next_create->valuedouble;
+    }
+    copy_text(orbit.preferred_storage, sizeof orbit.preferred_storage,
+              json_text(o, "preferredStorage"));
+    const cJSON *delete_archives = cJSON_GetObjectItemCaseSensitive(o, "deleteArchives");
+    if (cJSON_IsBool(delete_archives)) orbit.delete_archives = cJSON_IsTrue(delete_archives);
+    const cJSON *extract_archives = cJSON_GetObjectItemCaseSensitive(o, "extractArchives");
+    if (cJSON_IsBool(extract_archives)) orbit.extract_archives = cJSON_IsTrue(extract_archives);
+    const cJSON *notifications = cJSON_GetObjectItemCaseSensitive(o, "downloadNotifications");
+    if (cJSON_IsBool(notifications)) orbit.download_notifications = cJSON_IsTrue(notifications);
+    /* Without the list (1.5.0 and older), every event stays on. Unknown names are a newer build's. */
+    const cJSON *events = cJSON_GetObjectItemCaseSensitive(o, "notificationEvents"), *event;
+    if (cJSON_IsArray(events)) {
+        orbit.notify_events = 0;
+        cJSON_ArrayForEach(event, events)
+            for (unsigned i = 0; cJSON_IsString(event) && notify_event_name(i); i++)
+                if (!strcmp(event->valuestring, notify_event_name(i))) orbit.notify_events |= 1u << i;
+    }
+    const char *notified = json_text(o, "notifiedUpdate");
+    if (strlen(notified) < sizeof orbit.notified_update) copy_text(orbit.notified_update, sizeof orbit.notified_update, notified);
+    const cJSON *delete_packages = cJSON_GetObjectItemCaseSensitive(o, "deletePackages");
+    if (cJSON_IsBool(delete_packages)) orbit.delete_packages = cJSON_IsTrue(delete_packages);
+    orbit.shutdown_when_done = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "shutdownWhenDone"));
+    copy_text(orbit.shutdown_job, sizeof orbit.shutdown_job, json_text(o, "shutdownJob"));
+    const cJSON *hold;
+    size_t hold_count = 0;
+    cJSON_ArrayForEach(hold, cJSON_GetObjectItemCaseSensitive(o, "shutdownHolds")) {
+        if (hold_count < 16 && cJSON_IsString(hold) && strlen(hold->valuestring) == 64 &&
+            strspn(hold->valuestring, "0123456789abcdef") == 64)
+            copy_text(orbit.shutdown_holds[hold_count++], 65, hold->valuestring);
+    }
+    const char *history_files = json_text(o, "historyFiles");
+    copy_text(orbit.history_files, sizeof orbit.history_files,
+        !strcmp(history_files, "keep") || !strcmp(history_files, "delete") ? history_files : "ask");
+    orbit.always_use_torbox = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "alwaysUseTorBox"));
+    copy_text(orbit.last_delivery, sizeof orbit.last_delivery,
+              !strcmp(json_text(o, "lastDelivery"), "torbox") ? "torbox" : "direct");
+    download_policy_load(o, &orbit.download_policy);
+    const cJSON *limit = cJSON_GetObjectItemCaseSensitive(o, "concurrentDownloads");
+    if (cJSON_IsNumber(limit) && limit->valuedouble >= 1 &&
+        limit->valuedouble <= ORBIT_MAX_DOWNLOADS && limit->valuedouble == limit->valueint)
+        orbit.concurrent_downloads = (unsigned)limit->valueint;
+    const cJSON *connections = cJSON_GetObjectItemCaseSensitive(o, "downloadConnections");
+    if (cJSON_IsNumber(connections) && connections->valuedouble >= 1 &&
+        connections->valuedouble <= ORBIT_MAX_RANGES && connections->valuedouble == connections->valueint)
+        orbit.download_connections = (unsigned)connections->valueint;
+    const cJSON *sources = cJSON_GetObjectItemCaseSensitive(o, "sources");
+    if (json_int(sources, "noticeVersion") == ORBIT_SOURCE_NOTICE_VERSION &&
+        json_int(sources, "acknowledgedAt") > 0 && json_int(sources, "enabled") >= 0 &&
+        json_int(sources, "enabled") <= ORBIT_SOURCE_ALL) {
+        orbit.sources.enabled = (unsigned)json_int(sources, "enabled");
+        orbit.sources.notice_version = ORBIT_SOURCE_NOTICE_VERSION;
+        orbit.sources.acknowledged_at = (time_t)json_int(sources, "acknowledgedAt");
+    }
+    /* tokenUsed lines up with tokens; releases before 1.8.1 saved no times. */
+    const cJSON *used = cJSON_GetObjectItemCaseSensitive(o, "tokenUsed");
+    int token_index = 0;
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(o, "tokens")) {
+        const cJSON *when = cJSON_GetArrayItem(used, token_index++);
+        if (cJSON_IsString(x) && strlen(x->valuestring) == 64 && orbit.token_count < 16) {
+            orbit.token_used[orbit.token_count] = cJSON_IsNumber(when) && when->valuedouble > 0 ? (time_t)when->valuedouble : 0;
+            copy_text(orbit.tokens[orbit.token_count++], 65, x->valuestring);
+        }
+    }
+    saved_filters_load_locked(cJSON_GetObjectItemCaseSensitive(o, "savedFilters"));
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(o, "favorites")) {
+        if (!cJSON_IsString(x) || !*x->valuestring || strlen(x->valuestring) >= 64 ||
+            orbit.favorite_count >= ORBIT_MAX_RELEASES)
+            continue;
+        bool duplicate = false;
+        for (size_t i = 0; i < orbit.favorite_count; i++)
+            if (!strcmp(orbit.favorites[i], x->valuestring))
+                duplicate = true;
+        if (!duplicate)
+            copy_text(orbit.favorites[orbit.favorite_count++], 64, x->valuestring);
+    }
+    cJSON_ArrayForEach(x, cJSON_GetObjectItemCaseSensitive(o, "jobs")) {
+        Release snapshot, *r = release_find(json_text(x, "releaseId"));
+        const cJSON *saved = cJSON_GetObjectItemCaseSensitive(x, "release");
+        if (saved) {
+            /* A bad saved identity must never silently switch to the current file. */
+            if (release_parse(saved, &snapshot, true) ||
+                strcmp(snapshot.id, json_text(x, "releaseId"))) {
+                cJSON_Delete(o);
+                return -1;
+            }
+            r = &snapshot;
+        }
+        if (!r || orbit.job_count >= ORBIT_MAX_JOBS)
+            continue;
+        Job *j = &orbit.jobs[orbit.job_count++];
+        j->release = *r;
+        const cJSON *viking = cJSON_GetObjectItemCaseSensitive(x, "vikingContext");
+        if (viking) {
+            const cJSON *user = cJSON_GetObjectItemCaseSensitive(x, "vikingUser");
+            if (strcmp(r->source, "vikingfile") || !cJSON_IsNumber(viking) ||
+                (viking->valuedouble != 1 && viking->valuedouble != 2 && viking->valuedouble != 3) ||
+                !cJSON_IsNumber(user) || user->valuedouble < -1 || user->valuedouble > INT_MAX ||
+                floor(user->valuedouble) != user->valuedouble) { cJSON_Delete(o); return -1; }
+            j->release.viking_context = (unsigned)viking->valueint;
+            j->release.viking_user = user->valueint;
+            j->release.viking_authenticated = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "vikingAuthenticated"));
+        }
+#define R(k, f) copy_text(j->f, sizeof j->f, json_text(x, k))
+        R("id", id);
+        R("releaseId", release_id);
+        R("storageId", storage_id);
+        R("root", root);
+        R("status", status);
+        R("etag", etag);
+        R("modified", modified);
+        R("error", error);
+        R("removalError", removal_error);
+        R("verification", verification);
+        R("output", output);
+        j->extracted_firmware = (uint32_t)json_int(x, "extractedFirmware");
+        if (!firmware_known(j->extracted_firmware)) j->extracted_firmware = 0;
+        j->extracted_backport = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "extractedBackport"));
+
+#undef R
+        const cJSON *password = cJSON_GetObjectItemCaseSensitive(x, "archivePassword");
+        if (password) {
+            if (!r->compression[0] || !cJSON_IsString(password) ||
+                !*password->valuestring || strlen(password->valuestring) >= sizeof j->archive_password) {
+                cJSON_Delete(o); return -1;
+            }
+            for (const unsigned char *p = (const void *)password->valuestring; *p; p++)
+                if (*p < 32 || *p == 127) { cJSON_Delete(o); return -1; }
+            copy_text(j->archive_password, sizeof j->archive_password, password->valuestring);
+        }
+        if (strchr(j->output, '/') || !strcmp(j->output, "..")) { cJSON_Delete(o); return -1; }
+        j->archive_ready = r->compression[0] && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "archiveReady"));
+        j->archive_locked = j->archive_ready && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "archiveLocked"));
+        const cJSON *inspected = cJSON_GetObjectItemCaseSensitive(x, "inspectedBytes");
+        if (inspected) {
+            const char *format = json_text(x, "detectedFormat");
+            if (!r->archive_unverified || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
+                inspected->valuedouble < 0 || inspected->valuedouble > 9007199254740991.0 ||
+                floor(inspected->valuedouble) != inspected->valuedouble ||
+                (*format && strcmp(format, "PKG") && strcmp(format, "exFAT") && strcmp(format, "FFPFSC") &&
+                 strcmp(format, "Game folder") && strcmp(format, "Unknown"))) {
+                cJSON_Delete(o); return -1;
+            }
+            j->inspected_size = (int64_t)inspected->valuedouble;
+            copy_text(j->inspected_format, sizeof j->inspected_format, format);
+        }
+        j->archive_kept = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "archiveKept"));
+        j->keep_packed = r->compression[0] && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "keepPacked"));
+        /* Optional (1.9.5): Get everything's install order. */
+        j->auto_install = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "autoInstall"));
+        const char *after = json_text(x, "installAfter");
+        if (strlen(after) >= sizeof j->install_after || (*after && strspn(after, "0123456789abcdef") != strlen(after))) {
+            cJSON_Delete(o); return -1;
+        }
+        copy_text(j->install_after, sizeof j->install_after, after);
+        const char *delivery = json_text(x, "delivery");
+        if (*delivery && strcmp(delivery, "direct") && strcmp(delivery, "torbox")) { cJSON_Delete(o); return -1; }
+        if (!strcmp(delivery, "torbox")) {
+            const cJSON *web = cJSON_GetObjectItemCaseSensitive(x, "debridId"),
+                        *file = cJSON_GetObjectItemCaseSensitive(x, "debridFile");
+            const char *account = json_text(x, "debridAccount");
+            if ((schema != 3 && schema != 5 && schema != 6 && schema != 7) || strlen(account) != 64 || strspn(account, "0123456789abcdef") != 64 ||
+                !cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(x, "debridSubmitted")) ||
+                !cJSON_IsNumber(web) || !cJSON_IsNumber(file) ||
+                !(web->valuedouble >= -1 && web->valuedouble <= 9007199254740991.0) ||
+                !(file->valuedouble >= -1 && file->valuedouble <= 9007199254740991.0) ||
+                web->valuedouble != (double)(int64_t)web->valuedouble ||
+                file->valuedouble != (double)(int64_t)file->valuedouble) { cJSON_Delete(o); return -1; }
+            copy_text(j->delivery, sizeof j->delivery, "torbox");
+            copy_text(j->debrid_account, sizeof j->debrid_account, json_text(x, "debridAccount"));
+            j->debrid_id = (int64_t)web->valuedouble; j->debrid_file = (int64_t)file->valuedouble;
+            j->debrid_submitted = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "debridSubmitted"));
+            /* Optional (1.9.5): older state has none, which reads as long ago. */
+            const cJSON *sent = cJSON_GetObjectItemCaseSensitive(x, "debridSubmittedAt");
+            if (cJSON_IsNumber(sent) && sent->valuedouble > 0 && sent->valuedouble < 9007199254740991.0)
+                j->debrid_submitted_at = (time_t)sent->valuedouble;
+        }
+        copy_text(j->filename, sizeof j->filename, r->filename);
+        j->device = (dev_t)json_identity(x, "device");
+        j->inode = (ino_t)json_identity(x, "inode");
+        const char *mark = json_text(x, "driveMark");
+        if (strlen(mark) == 32 && strspn(mark, "0123456789abcdef") == 32)
+            copy_text(j->drive_mark, sizeof j->drive_mark, mark);
+        j->received = json_int(x, "received");
+        const cJSON *ranges = cJSON_GetObjectItemCaseSensitive(x, "rangeReceived");
+        if (ranges) {
+            int count = cJSON_GetArraySize(ranges);
+            if (!cJSON_IsArray(ranges) ||
+                !(((schema == 2 || schema == 3) && count == 2) || ((schema >= 4) && (count == 1 || count == 2 || count == 4 || count == 8)) ||
+                  (schema >= 7 && count >= 1)) ||
+                count > ORBIT_MAX_RANGES ||
+                (count > 1 && (!j->etag[0] || !strncmp(j->etag, "W/", 2)))) {
+                cJSON_Delete(o);
+                return -1;
+            }
+            j->range_count = (unsigned)count;
+            j->received = 0;
+            for (unsigned i = 0; i < j->range_count; i++) {
+                const cJSON *v = cJSON_GetArrayItem(ranges, i);
+                int64_t length = range_boundary(r->size, j->range_count, i + 1) -
+                                 range_boundary(r->size, j->range_count, i);
+                if (!cJSON_IsNumber(v) || !(v->valuedouble >= 0 && v->valuedouble <= length) ||
+                    v->valuedouble != (double)(int64_t)v->valuedouble) {
+                    cJSON_Delete(o);
+                    return -1;
+                }
+                j->range_received[i] = (int64_t)v->valuedouble;
+                j->received += j->range_received[i];
+            }
+            j->segmented = true;
+        }
+        j->total = r->size;
+        j->attempts = (unsigned)json_int(x, "attempts");
+        int64_t order = json_int(x, "order");
+        j->order = order > 0 && order < 2147483647 ? (unsigned)order : (unsigned)orbit.job_count;
+        j->retry_at = (time_t)json_int(x, "retryAt");
+        if (job_active(j)) {
+            copy_text(j->status, sizeof j->status, "paused");
+            copy_text(j->error, sizeof j->error, "Interrupted. Resume to continue.");
+        }
+        /* Downloads Orbit paused to restart itself continue where they were. */
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "resumeAfterRestart")) &&
+            !strcmp(j->status, "paused")) {
+            copy_text(j->status, sizeof j->status, "queued");
+            j->error[0] = 0;
+            j->retry_at = 0;
+        }
+        if (!source_enabled_locked(r) &&
+            (!strcmp(j->status, "queued") || !strcmp(j->status, "retrying") ||
+             !strcmp(j->status, "paused"))) {
+            copy_text(j->status, sizeof j->status, "paused");
+            copy_text(j->error, sizeof j->error,
+                      "Source disabled. Enable it in Sources before resuming.");
+        }
+    }
+    cJSON_Delete(o);
+    return 0;
+}

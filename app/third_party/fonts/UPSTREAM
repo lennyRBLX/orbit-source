@@ -1,0 +1,23 @@
+Inter 4.1, https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+SHA-256 of the release archive: 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
+Files taken from extras/ttf/: Inter-Regular.ttf, Inter-Medium.ttf, Inter-SemiBold.ttf, InterDisplay-Light.ttf
+
+Interface faces (Crossbar, Cinema, Panorama): google/fonts commit 66928797f271fed5ee428544e7229685e2d90127
+  ofl/sora/Sora[wght].ttf (SHA-256 84ff7096ae3ec6c8be47d906d1a0ba4de7f2ce78c615275c77301964a316e16c)
+  ofl/intertight/InterTight[wght].ttf (SHA-256 b81b73dcb64df3c230cabade7df6c5773bf863233f24c9ee51087519f1f88b6f)
+Static instances made with fontTools 4.66.1 (fonttools varLib.instancer --static):
+  Sora-Regular.ttf wght=400, Sora-SemiBold.ttf wght=600 (--update-name-table)
+  InterTight-ExtraLight.ttf wght=200, InterTight-Light.ttf wght=300, InterTight-Medium.ttf wght=500,
+  InterTight-SemiBold.ttf wght=600 (--update-name-table)
+  InterTight-Medium.ttf and InterTight-SemiBold.ttf were then subset to the baked glyphs (fonttools subset, --layout-features='*') and their
+  Extension lookups unwrapped, so their pair kerning is in a plain GPOS lookup the baker reads.
+
+Language fallback fonts (original OpenType/TrueType files, SIL OFL 1.1):
+Noto Sans CJK regional subsets 2.004: https://github.com/notofonts/noto-cjk
+Noto Sans Arabic 2.013: https://github.com/notofonts/arabic
+Rebuild compressed atlases with app/tools/bake-language-fonts.sh.
+  NotoSansArabic-Regular.ttf: SHA-256 bdff3e5659d67e67def05b33f749683b9376ae819d65d3dd62ac4640b3aaef48
+  NotoSansJP-Regular.otf: SHA-256 dff723ba59d57d136764a04b9b2d03205544f7cd785a711442d6d2d085ac5073
+  NotoSansKR-Regular.otf: SHA-256 69975a0ac8472717870aefeab0a4d52739308d90856b9955313b2ad5e0148d68
+  NotoSansSC-Regular.otf: SHA-256 faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9
+  NotoSansTC-Regular.otf: SHA-256 5bab0cb3c1cf89dde07c4a95a4054b195afbcfe784d69d75c340780712237537

@@ -1,0 +1,1839 @@
+#include "power.h"
+/* Paired LAN file receiver. Disk I/O and hashing never run on the HTTP thread. */
+#include "receive.h"
+#include "packages.h"
+#include "extract.h"
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef struct {
+    char id[33], owner[65], state[24], error[192], hash[65];
+    char folder[512]; /* Below homebrew: empty, or a path inside an open bundle. */
+    Job pin;
+    int64_t offset, size;
+    uint64_t file_device, file_inode;
+    bool partials_retained, recovery_proof;
+} Receiver;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wake = PTHREAD_COND_INITIALIZER;
+static pthread_t thread;
+static bool started, stopping, working;
+static Receiver current;
+/* A fresh console code may release an abandoned pairing's reservation, but
+ * never while that sender is still using it. Status polls count as activity. */
+static struct timespec owner_seen;
+static char recovery_nonce[65];
+static void receiver_touch(void) {
+    clock_gettime(CLOCK_MONOTONIC, &owner_seen);
+    /* Invalidating a review is cheap, even during rapid transfer polling. */
+    recovery_nonce[0] = 0;
+}
+static int64_t owner_idle_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - owner_seen.tv_sec) * INT64_C(1000) + (now.tv_nsec - owner_seen.tv_nsec) / 1000000;
+}
+static unsigned recovery_wait_seconds(void) {
+    int64_t idle_ms = owner_idle_ms();
+    int64_t wait_ms = 120000;
+#ifdef ORBIT_TEST
+    const char *test = getenv("ORBIT_TEST_RECEIVE_RECOVERY_IDLE_MS");
+    if (test) { long n = strtol(test, NULL, 10); if (n >= 1 && n <= 120000) wait_ms = n; }
+#endif
+    return idle_ms >= wait_ms ? 0 : (unsigned)((wait_ms - idle_ms + 999) / 1000);
+}
+static bool recovery_ticket(const char *owner, char out[65]) {
+    unsigned char digest[32]; unsigned length = 0;
+    char material[130];
+    if (!recovery_nonce[0]) random_hex(recovery_nonce, 32);
+    snprintf(material, sizeof material, "%s:%s", recovery_nonce, owner);
+    if (!EVP_Digest(material, strlen(material), digest, &length, EVP_sha256(), NULL) || length != 32) return false;
+    for (int i = 0; i < 32; ++i) snprintf(out + i * 2, 3, "%02x", digest[i]);
+    return true;
+}
+/* A folder sent as several files. They publish inside a private staging folder,
+ * which becomes the visible folder only once every file has arrived. */
+typedef struct {
+    char id[33], owner[65], state[16], name[256], last[33];
+    Job pin;
+    int64_t files, bytes, total;
+    uint64_t folder_device, folder_inode;
+} Bundle;
+static Bundle bundle;
+static char command[16];
+static char command_proof[65];
+typedef struct {
+    unsigned char *data;
+    size_t size;
+    char hash[65];
+} Chunk;
+/* Includes the active disk write: never buffer more than 32 MiB here.
+ * HTTP request bodies have their own separate two-request limit. */
+static Chunk pending[ORBIT_RECEIVE_WINDOW];
+static size_t pending_count;
+static bool writing_chunk;
+static int64_t accepted_offset;
+/* Where the disk worker spent the current transfer's time, so an owner can see
+ * whether the network, hashing, writes or checkpoints set the pace. `timing`
+ * is guarded by `lock`; the chunk_* values belong to the disk worker. */
+static struct {
+    char id[33];
+    double wait, hash, write, sync, journal;
+    unsigned checkpoints;
+} timing;
+static double chunk_hash, chunk_write;
+static double seconds_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+typedef struct {
+    int fd, dir;
+    char id[33];
+    EVP_MD_CTX *hash;
+    int64_t hashed;
+    struct stat stamp;
+} ReceiverDisk;
+/* Owned exclusively by the disk worker, retained across checkpoints. */
+static ReceiverDisk disk = {.fd = -1, .dir = -1};
+/* Bytes the worker has read while checking a saved file. Checking a large
+ * saved part takes minutes, so status replies report it and the sender can
+ * tell a slow check from a stalled one. */
+static _Atomic int64_t check_done, check_total;
+static void check_begin(int64_t total) {
+    atomic_store(&check_done, 0);
+    atomic_store(&check_total, total);
+}
+static void check_end(void) {
+    atomic_store(&check_total, 0);
+    atomic_store(&check_done, 0);
+}
+#ifdef ORBIT_TEST
+static atomic_uint checkpoint_count, prefix_hash_reads;
+#endif
+
+static void disk_close(void) {
+    if (disk.fd >= 0) close(disk.fd);
+    if (disk.dir >= 0) close(disk.dir);
+    EVP_MD_CTX_free(disk.hash);
+    disk = (ReceiverDisk){.fd = -1, .dir = -1};
+}
+
+static bool hex(const char *s, size_t n) {
+    return strlen(s) == n && strspn(s, "0123456789abcdef") == n;
+}
+static bool name_ok(const char *s) {
+    size_t n = strlen(s);
+    if (!n || n >= sizeof current.pin.filename || s[0] == '.' || strchr(s, '/') || strchr(s, '\\'))
+        return false;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)s[i] < 32 || s[i] == 127)
+            return false;
+    return true;
+}
+static bool active(const Receiver *r) {
+    return r->id[0] && strcmp(r->state, "complete") && strcmp(r->state, "cancelled");
+}
+static bool bundle_open(void) {
+    return bundle.id[0] && !strcmp(bundle.state, "open");
+}
+static void bundle_folder(const char *id, char *out, size_t cap) {
+    snprintf(out, cap, ".orbit-bundle-%s", id);
+}
+static bool in_bundle(const Receiver *r) {
+    char folder[64];
+    bundle_folder(bundle.id, folder, sizeof folder);
+    size_t n = strlen(folder);
+    return bundle.id[0] && !strncmp(r->folder, folder, n) && (!r->folder[n] || r->folder[n] == '/');
+}
+/* ".orbit-bundle-<id>" followed by an optional relative path of plain names. */
+static bool folder_ok(const char *folder) {
+    if (!*folder) return true;
+    if (strncmp(folder, ".orbit-bundle-", 14) || strlen(folder) >= sizeof current.folder) return false;
+    char path[sizeof current.folder];
+    copy_text(path, sizeof path, folder + 14);
+    char *rest = strchr(path, '/');
+    if (rest) *rest++ = 0;
+    if (!hex(path, 32)) return false;
+    for (char *part = rest, *next; part; part = next) {
+        next = strchr(part, '/');
+        if (next) *next++ = 0;
+        if (!extract_name_ok(part)) return false;
+    }
+    return true;
+}
+/* The transfer's folder below homebrew. Each level is opened without following
+ * links; `create` adds missing levels inside the bundle, never the bundle itself. */
+static int receiver_dir(const Job *pin, const char *folder, bool create) {
+    int fd = storage_open(pin);
+    char path[sizeof current.folder];
+    copy_text(path, sizeof path, folder);
+    bool first = true;
+    for (char *part = *path ? path : NULL, *next; fd >= 0 && part; part = next, first = false) {
+        next = strchr(part, '/');
+        if (next) *next++ = 0;
+        int child = -1;
+        if ((!create || first || !mkdirat(fd, part, 0755) || errno == EEXIST) && !fsync(fd))
+            child = openat(fd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        if (first && child >= 0 && bundle.id[0]) {
+            char expected[64];
+            struct stat st;
+            bundle_folder(bundle.id, expected, sizeof expected);
+            if (!strcmp(part, expected) && (fstat(child, &st) ||
+                (uint64_t)st.st_dev != bundle.folder_device || (uint64_t)st.st_ino != bundle.folder_inode)) {
+                close(child); child = -1; errno = ESTALE;
+            }
+        }
+        int saved = errno;
+        close(fd);
+        fd = child;
+        errno = saved;
+    }
+    return fd;
+}
+/* What the transfer still writes, so downloads starting meanwhile leave room
+ * for it and keep away from its name. Needs `lock` and orbit.mutex. */
+static void hold_locked(bool value) {
+    StorageHold *h = &orbit.holds[HOLD_RECEIVE];
+    memset(h, 0, sizeof *h);
+    if (!value) return;
+    const bool folder = bundle_open();
+    const Job *pin = folder ? &bundle.pin : &current.pin;
+    const int64_t left = folder ? bundle.total - bundle.bytes - (in_bundle(&current) && active(&current) ? current.offset : 0)
+                                : current.size - current.offset;
+    h->device = pin->device;
+    h->bytes = left > 0 ? (uint64_t)left : 0;
+    if (folder) snprintf(h->path, sizeof h->path, "%s/homebrew/%s", pin->root, bundle.name);
+    else if (current.folder[0]) snprintf(h->path, sizeof h->path, "%s/homebrew/%s/%s", pin->root, current.folder, pin->filename);
+    else snprintf(h->path, sizeof h->path, "%s/homebrew/%s", pin->root, pin->filename);
+}
+static void busy(bool value) {
+    pthread_mutex_lock(&orbit.mutex);
+    orbit.receiver_active = value;
+    hold_locked(value);
+    pthread_cond_broadcast(&orbit.changed);
+    pthread_mutex_unlock(&orbit.mutex);
+}
+static void fail(Receiver *r, const char *message) {
+    copy_text(r->state, sizeof r->state, "error");
+    copy_text(r->error, sizeof r->error, message);
+}
+static void partial(const Receiver *r, char *s, size_t n) {
+    snprintf(s, n, ".orbit-zero-%s.part", r->id);
+}
+static cJSON *json(const Receiver *r, bool disk) {
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "protocol", 1);
+    cJSON_AddNumberToObject(o, "chunkBytes", ORBIT_RECEIVE_CHUNK);
+    cJSON_AddStringToObject(o, "id", r->id);
+    cJSON_AddStringToObject(o, "state", r->id[0] ? r->state : "idle");
+    cJSON_AddStringToObject(o, "error", r->error);
+    cJSON_AddStringToObject(o, "filename", r->pin.filename);
+    cJSON_AddStringToObject(o, "storageId", r->pin.storage_id);
+    cJSON_AddNumberToObject(o, "size", (double)r->size);
+    cJSON_AddNumberToObject(o, "offset", (double)r->offset);
+    cJSON_AddBoolToObject(o, "partialsRetained", r->partials_retained);
+    cJSON_AddBoolToObject(o, "recoveryProofRequired", r->recovery_proof);
+    cJSON_AddItemToObject(o, "content", release_context_json(&r->pin.release));
+    if (disk) {
+        cJSON_AddStringToObject(o, "owner", r->owner);
+        cJSON_AddStringToObject(o, "folder", r->folder);
+        cJSON_AddStringToObject(o, "root", r->pin.root);
+        cJSON_AddStringToObject(o, "sha256", r->hash);
+        char n[32];
+#define ID(k, v)                                                                                   \
+    snprintf(n, sizeof n, "%llu", (unsigned long long)(v));                                        \
+    cJSON_AddStringToObject(o, k, n)
+        ID("device", r->pin.device);
+        ID("inode", r->pin.inode);
+        ID("fileDevice", r->file_device);
+        ID("fileInode", r->file_inode);
+#undef ID
+    }
+    return o;
+}
+static int allwrite(int fd, const void *data, size_t n) {
+    const unsigned char *p = data;
+    while (n) {
+        ssize_t k = write(fd, p, n);
+        if (k < 0 && errno == EINTR)
+            continue;
+        if (k <= 0)
+            return -1;
+        p += k;
+        n -= k;
+    }
+    return 0;
+}
+static int save(const Receiver *r) {
+    cJSON *o = json(r, true);
+    char *s = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!s)
+        return -1;
+    int fd = openat(orbit.state_fd, "receive.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    int result = fd < 0 ? -1 : allwrite(fd, s, strlen(s));
+    free(s);
+    if (fd >= 0) {
+        if (fsync(fd))
+            result = -1;
+        if (close(fd))
+            result = -1;
+    }
+    if (!result && renameat(orbit.state_fd, "receive.tmp", orbit.state_fd, "receive.json"))
+        result = -1;
+    if (!result && fsync(orbit.state_fd))
+        result = -1;
+    return result;
+}
+static int bundle_save(void) {
+    cJSON *o = cJSON_CreateObject();
+    char n[32];
+    cJSON_AddStringToObject(o, "id", bundle.id);
+    cJSON_AddStringToObject(o, "owner", bundle.owner);
+    cJSON_AddStringToObject(o, "state", bundle.state);
+    cJSON_AddStringToObject(o, "name", bundle.name);
+    cJSON_AddStringToObject(o, "last", bundle.last);
+    cJSON_AddItemToObject(o, "content", release_context_json(&bundle.pin.release));
+    cJSON_AddStringToObject(o, "storageId", bundle.pin.storage_id);
+    cJSON_AddStringToObject(o, "root", bundle.pin.root);
+#define ID(k, v) snprintf(n, sizeof n, "%llu", (unsigned long long)(v)); cJSON_AddStringToObject(o, k, n)
+    ID("device", bundle.pin.device);
+    ID("inode", bundle.pin.inode);
+    ID("folderDevice", bundle.folder_device);
+    ID("folderInode", bundle.folder_inode);
+#undef ID
+    cJSON_AddNumberToObject(o, "files", (double)bundle.files);
+    cJSON_AddNumberToObject(o, "bytes", (double)bundle.bytes);
+    cJSON_AddNumberToObject(o, "total", (double)bundle.total);
+    char *s = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!s) return -1;
+    int fd = openat(orbit.state_fd, "receive-bundle.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    int result = fd < 0 ? -1 : allwrite(fd, s, strlen(s));
+    free(s);
+    if (fd >= 0) {
+        if (fsync(fd)) result = -1;
+        if (close(fd)) result = -1;
+    }
+    if (!result && renameat(orbit.state_fd, "receive-bundle.tmp", orbit.state_fd, "receive-bundle.json")) result = -1;
+    if (!result && fsync(orbit.state_fd)) result = -1;
+    return result;
+}
+static void digest_text(const unsigned char *hash, char *out) {
+    for (int i = 0; i < 32; i++)
+        snprintf(out + i * 2, 3, "%02x", hash[i]);
+}
+static bool digest_bytes(const unsigned char *data, size_t size, const char *expected) {
+    unsigned char hash[32];
+    unsigned n = 0;
+    char text[65];
+    if (!EVP_Digest(data, size, hash, &n, EVP_sha256(), NULL) || n != 32)
+        return false;
+    digest_text(hash, text);
+    return !strcmp(text, expected);
+}
+static int hash_file(int fd, char *out) {
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char data[65536], hash[32];
+    unsigned n = 0;
+    if (!ctx || !EVP_DigestInit_ex(ctx, EVP_sha256(), NULL)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    struct stat st;
+    if (lseek(fd, 0, SEEK_SET) < 0 || fstat(fd, &st)) {
+        EVP_MD_CTX_free(ctx);
+        return -1;
+    }
+    check_begin(st.st_size);
+    int result = 0;
+    for (;;) {
+        ssize_t k = read(fd, data, sizeof data);
+        if (k < 0 && errno == EINTR)
+            continue;
+        if (k < 0) {
+            result = -1;
+            break;
+        }
+        if (!k)
+            break;
+        if (!EVP_DigestUpdate(ctx, data, (size_t)k)) {
+            result = -1;
+            break;
+        }
+        atomic_fetch_add(&check_done, k);
+    }
+    check_end();
+    if (!result && (!EVP_DigestFinal_ex(ctx, hash, &n) || n != 32))
+        result = -1;
+    EVP_MD_CTX_free(ctx);
+    if (!result)
+        digest_text(hash, out);
+    return result;
+}
+static int open_partial(Receiver *r, int dir, bool create, bool removing) {
+    char path[80];
+    partial(r, path, sizeof path);
+    int fd = openat(dir, path, O_RDWR | O_NOFOLLOW | (create ? O_CREAT | O_EXCL : 0), 0600);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
+        (!create && ((uint64_t)st.st_dev != r->file_device ||
+                     (uint64_t)st.st_ino != r->file_inode || (!removing && st.st_size < r->offset)))) {
+        close(fd);
+        errno = ESTALE;
+        return -1;
+    }
+    if (create) {
+        r->file_device = (uint64_t)st.st_dev;
+        r->file_inode = (uint64_t)st.st_ino;
+    }
+    return fd;
+}
+/* Mount device/inode numbers can change after suspend. Only an explicit paired
+ * request carrying the computer's checksum of the entire durable prefix may
+ * rebind a transfer. A USB slot or a matching filename alone is not identity.
+ * On success, *kept holds the checksum state of the verified prefix and
+ * *checked the file it was read from, so a resume need not read it again. */
+static bool rebind_partial(Receiver *r, const char *proof, EVP_MD_CTX **kept, struct stat *checked) {
+    *kept = NULL;
+    if (!hex(proof, 64) || r->offset <= 0 || !r->file_inode) return false;
+    Storage choices[ORBIT_MAX_STORAGE], *selected = NULL;
+    size_t count = storage_list(choices);
+    for (size_t i = 0; i < count; i++)
+        if (!strcmp(choices[i].id, r->pin.storage_id) && !strcmp(choices[i].root, r->pin.root))
+            selected = &choices[i];
+    if (!selected) {
+        fail(r, "Reconnect the original destination drive, then resume.");
+        return false;
+    }
+    Job pin = r->pin;
+    pin.device = selected->device; pin.inode = selected->inode;
+    int dir = receiver_dir(&pin, r->folder, false), fd = -1;
+    EVP_MD_CTX *ctx = NULL, *copy = NULL;
+    bool ok = false;
+    char path[80]; partial(r, path, sizeof path);
+    struct stat before, after, named, destination;
+    check_begin(r->offset);
+    if (dir < 0) goto done;
+    /* Never adopt, replace or remove an already-published destination. */
+    if (!fstatat(dir, pin.filename, &destination, AT_SYMLINK_NOFOLLOW) || errno != ENOENT)
+        goto done;
+    fd = openat(dir, path, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &before) || !S_ISREG(before.st_mode) || before.st_nlink != 1 ||
+        before.st_dev != pin.device || before.st_size < r->offset || before.st_size > r->size)
+        goto done;
+    ctx = EVP_MD_CTX_new();
+    if (!ctx || !EVP_DigestInit_ex(ctx, EVP_sha256(), NULL)) goto done;
+    unsigned char bytes[256 * 1024], digest[32]; unsigned length = 0;
+    int64_t left = r->offset;
+    while (left) {
+        pthread_mutex_lock(&lock); bool stop = stopping; pthread_mutex_unlock(&lock);
+        if (stop) goto done;
+        ssize_t n = read(fd, bytes, left < (int64_t)sizeof bytes ? (size_t)left : sizeof bytes);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0 || !EVP_DigestUpdate(ctx, bytes, (size_t)n)) goto done;
+        left -= n;
+        atomic_fetch_add(&check_done, n);
+    }
+    char checksum[65];
+    copy = EVP_MD_CTX_new();
+    if (!copy || !EVP_MD_CTX_copy_ex(copy, ctx) ||
+        !EVP_DigestFinal_ex(copy, digest, &length) || length != 32) goto done;
+    digest_text(digest, checksum);
+    if (strcmp(checksum, proof) || fstat(fd, &after) ||
+        before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+        before.st_size != after.st_size || after.st_nlink != 1 ||
+        before.st_mtim.tv_sec != after.st_mtim.tv_sec || before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+        before.st_ctim.tv_sec != after.st_ctim.tv_sec || before.st_ctim.tv_nsec != after.st_ctim.tv_nsec ||
+        !storage_matches(&pin) || fstatat(dir, path, &named, AT_SYMLINK_NOFOLLOW) ||
+        !S_ISREG(named.st_mode) || named.st_nlink != 1 ||
+        named.st_dev != after.st_dev || named.st_ino != after.st_ino)
+        goto done;
+    r->pin = pin;
+    r->file_device = (uint64_t)after.st_dev;
+    r->file_inode = (uint64_t)after.st_ino;
+    *checked = after;
+    *kept = ctx;
+    ctx = NULL;
+    ok = true;
+done:
+    check_end();
+    EVP_MD_CTX_free(copy);
+    EVP_MD_CTX_free(ctx);
+    if (fd >= 0) close(fd);
+    if (dir >= 0) close(dir);
+    if (!ok) fail(r, "The saved PS5 partial could not be verified against the computer copy. No files were changed.");
+    return ok;
+}
+/* Reconstruct only a resumed prefix. Fresh transfers hash buffers as written. */
+static int disk_hash_prefix(Receiver *r) {
+    EVP_MD_CTX_free(disk.hash);
+    disk.hash = EVP_MD_CTX_new();
+    if (!disk.hash || !EVP_DigestInit_ex(disk.hash, EVP_sha256(), NULL) ||
+        lseek(disk.fd, 0, SEEK_SET) < 0) return -1;
+    unsigned char bytes[256 * 1024];
+    int64_t left = r->offset;
+    check_begin(left);
+#ifdef ORBIT_TEST
+    if (left) {
+        atomic_fetch_add(&prefix_hash_reads, 1);
+        const char *delay = getenv("ORBIT_TEST_RECEIVE_PREFIX_DELAY_MS");
+        long ms = delay ? strtol(delay, NULL, 10) : 0;
+        if (ms > 0 && ms <= 2000) {
+            struct timespec pause = {ms / 1000, (ms % 1000) * 1000000};
+            nanosleep(&pause, NULL);
+        }
+    }
+#endif
+    int result = 0;
+    while (left) {
+        /* Reading a large saved part takes minutes; don't hold up stopping Orbit. */
+        pthread_mutex_lock(&lock); bool stop = stopping; pthread_mutex_unlock(&lock);
+        size_t count = left < (int64_t)sizeof bytes ? (size_t)left : sizeof bytes;
+        ssize_t n = stop ? -1 : read(disk.fd, bytes, count);
+        if (n < 0 && errno == EINTR && !stop) continue;
+        if (n <= 0 || !EVP_DigestUpdate(disk.hash, bytes, (size_t)n)) { result = -1; break; }
+        left -= n;
+        atomic_fetch_add(&check_done, n);
+    }
+    check_end();
+    if (result) return -1;
+    disk.hashed = r->offset;
+    return fstat(disk.fd, &disk.stamp);
+}
+/* A verified rebind has already read the whole durable prefix. Keep its
+ * checksum for this resume when the writable handle opens the same file. */
+static void disk_adopt(Receiver *r, EVP_MD_CTX *verified, const struct stat *checked) {
+    disk_close();
+    struct stat st;
+    disk.dir = receiver_dir(&r->pin, r->folder, false);
+    if (disk.dir >= 0) disk.fd = open_partial(r, disk.dir, false, false);
+    if (disk.fd < 0 || fstat(disk.fd, &st) || st.st_dev != checked->st_dev || st.st_ino != checked->st_ino ||
+        st.st_size != checked->st_size ||
+        st.st_mtim.tv_sec != checked->st_mtim.tv_sec || st.st_mtim.tv_nsec != checked->st_mtim.tv_nsec ||
+        st.st_ctim.tv_sec != checked->st_ctim.tv_sec || st.st_ctim.tv_nsec != checked->st_ctim.tv_nsec) {
+        EVP_MD_CTX_free(verified);
+        disk_close(); // disk_open() reads the prefix again.
+        return;
+    }
+    copy_text(disk.id, sizeof disk.id, r->id);
+    disk.hash = verified;
+    disk.hashed = r->offset;
+    disk.stamp = st;
+}
+static bool disk_unchanged(const struct stat *st) {
+    return st->st_size == disk.stamp.st_size &&
+           st->st_mtim.tv_sec == disk.stamp.st_mtim.tv_sec &&
+           st->st_mtim.tv_nsec == disk.stamp.st_mtim.tv_nsec &&
+           st->st_ctim.tv_sec == disk.stamp.st_ctim.tv_sec &&
+           st->st_ctim.tv_nsec == disk.stamp.st_ctim.tv_nsec;
+}
+static int disk_open(Receiver *r) {
+    if (disk.fd < 0 || strcmp(disk.id, r->id)) {
+        disk_close();
+        disk.dir = receiver_dir(&r->pin, r->folder, false);
+        if (disk.dir < 0) return -1;
+        disk.fd = open_partial(r, disk.dir, false, false);
+        if (disk.fd < 0) { disk_close(); return -1; }
+        copy_text(disk.id, sizeof disk.id, r->id);
+        if (disk_hash_prefix(r)) { disk_close(); return -1; }
+    }
+    struct stat root, folder, opened_folder, file, path;
+    char directory[sizeof r->pin.root + sizeof r->folder + 16];
+    if (r->folder[0]) snprintf(directory, sizeof directory, "%s/homebrew/%s", r->pin.root, r->folder);
+    else snprintf(directory, sizeof directory, "%s/homebrew", r->pin.root);
+    char name[80]; partial(r, name, sizeof name);
+    if (lstat(r->pin.root, &root) || !S_ISDIR(root.st_mode) ||
+        root.st_dev != r->pin.device || root.st_ino != r->pin.inode ||
+        lstat(directory, &folder) || !S_ISDIR(folder.st_mode) ||
+        fstat(disk.dir, &opened_folder) || folder.st_dev != opened_folder.st_dev ||
+        folder.st_ino != opened_folder.st_ino ||
+        fstat(disk.fd, &file) || fstatat(disk.dir, name, &path, AT_SYMLINK_NOFOLLOW) ||
+        !S_ISREG(path.st_mode) || path.st_nlink != 1 || file.st_nlink != 1 ||
+        (uint64_t)file.st_dev != r->file_device || (uint64_t)file.st_ino != r->file_inode ||
+        path.st_dev != file.st_dev || path.st_ino != file.st_ino || file.st_size < r->offset)
+        return -1;
+    // External edits invalidate the running checksum, including same-size edits.
+    if (disk.hashed != r->offset || !disk_unchanged(&file)) return disk_hash_prefix(r);
+    return 0;
+}
+static int disk_digest(Receiver *r, char *out) {
+    if (disk_open(r)) return -1;
+    EVP_MD_CTX *copy = EVP_MD_CTX_new();
+    unsigned char hash[32]; unsigned n = 0;
+    bool ok = copy && EVP_MD_CTX_copy_ex(copy, disk.hash) &&
+              EVP_DigestFinal_ex(copy, hash, &n) && n == 32;
+    EVP_MD_CTX_free(copy);
+    if (!ok) return -1;
+    digest_text(hash, out);
+    return 0;
+}
+/* Private transfer files must become readable by the title's runtime user.
+ * Never inherit modes, ownership or special permission bits from the sender. */
+static mode_t published_mode(const char *name) {
+    const char *ext = strrchr(name, '.');
+    return ext && (!strcasecmp(ext, ".bin") || !strcasecmp(ext, ".elf") ||
+                   !strcasecmp(ext, ".self") || !strcasecmp(ext, ".prx") ||
+                   !strcasecmp(ext, ".sprx")) ? 0755 : 0644;
+}
+static int publish_access(int fd, mode_t mode) {
+    struct stat st;
+    if (fstat(fd, &st)) return -1;
+    /* exFAT can expose fixed 0777 permissions. Already accessible files do
+     * not need chmod; private files on a POSIX filesystem do. */
+    if ((st.st_mode & mode) == mode && !(st.st_mode & 07000)) return 0;
+#ifdef ORBIT_TEST
+    if (getenv("ORBIT_TEST_RECEIVE_PERMISSION_FAILURE")) { errno = EACCES; return -1; }
+#endif
+    if (fchmod(fd, mode) || fsync(fd) || fstat(fd, &st) ||
+        (st.st_mode & mode) != mode || (st.st_mode & 07000)) return -1;
+    return 0;
+}
+
+/* A resumed bundle can contain files finished by an older receiver. Zero
+ * skips those files, so check the whole owned staging tree before publishing.
+ * Traverse descriptors only, rejecting links, special files and other mounts. */
+typedef struct { int64_t files, bytes, entries; } PermissionTally;
+static int bundle_access_tree(int fd, dev_t device, unsigned depth, PermissionTally *t) {
+    if (depth > 256 || ++t->entries > 10000000) return -1;
+    int scan = dup(fd);
+    DIR *d = scan >= 0 ? fdopendir(scan) : NULL;
+    if (!d) { if (scan >= 0) close(scan); return -1; }
+    int rc = 0;
+    while (!rc) {
+        errno = 0;
+        struct dirent *e = readdir(d);
+        if (!e) { if (errno) rc = -1; break; }
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        struct stat named, opened;
+        if (!extract_name_ok(e->d_name) || fstatat(fd, e->d_name, &named, AT_SYMLINK_NOFOLLOW) ||
+            named.st_dev != device || (!S_ISDIR(named.st_mode) && !S_ISREG(named.st_mode)) ||
+            (S_ISREG(named.st_mode) && named.st_nlink != 1)) { rc = -1; break; }
+        bool directory = S_ISDIR(named.st_mode);
+        int child = openat(fd, e->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | (directory ? O_DIRECTORY : 0));
+        if (child < 0 || fstat(child, &opened) || opened.st_dev != named.st_dev ||
+            opened.st_ino != named.st_ino || (opened.st_mode & S_IFMT) != (named.st_mode & S_IFMT) ||
+            (!directory && opened.st_nlink != 1)) rc = -1;
+        else if (directory) rc = bundle_access_tree(child, device, depth + 1, t);
+        else if (++t->entries > 10000000 || ++t->files > bundle.files || opened.st_size < 0 ||
+                 opened.st_size > bundle.bytes - t->bytes) rc = -1;
+        else {
+            t->bytes += opened.st_size;
+            rc = publish_access(child, published_mode(e->d_name));
+        }
+        if (!rc && (fstatat(fd, e->d_name, &named, AT_SYMLINK_NOFOLLOW) ||
+                    named.st_dev != opened.st_dev || named.st_ino != opened.st_ino)) rc = -1;
+        if (child >= 0) close(child);
+    }
+    closedir(d);
+    return rc ? rc : publish_access(fd, 0755);
+}
+static int bundle_access(int dir, const char *name) {
+    int fd = openat(dir, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    struct stat st, named;
+    PermissionTally tally = {0};
+    int rc = fd < 0 || fstat(fd, &st) || (uint64_t)st.st_dev != bundle.folder_device ||
+        (uint64_t)st.st_ino != bundle.folder_inode || bundle_access_tree(fd, st.st_dev, 0, &tally) ||
+        tally.files != bundle.files || tally.bytes != bundle.bytes ||
+        fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) ||
+        named.st_dev != st.st_dev || named.st_ino != st.st_ino ? -1 : 0;
+    if (fd >= 0) close(fd);
+    return rc;
+}
+/* Recover a crash after publishing but before the completion journal was saved.
+ * Only the exact inode created by this transfer can be recovered. */
+static bool recover_published(Receiver *r, int dir) {
+    if (r->offset != r->size || !hex(r->hash, 64) || !r->file_inode)
+        return false;
+    int fd = openat(dir, r->pin.filename, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0)
+        return false;
+    struct stat st;
+    bool owned = !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+                 (uint64_t)st.st_dev == r->file_device && (uint64_t)st.st_ino == r->file_inode;
+    if (!owned) {
+        close(fd);
+        return false;
+    }
+    char hash[65], path[80];
+    partial(r, path, sizeof path);
+    if (st.st_size != r->size || hash_file(fd, hash) || strcmp(hash, r->hash))
+        fail(r, "The published file changed. It was not modified.");
+    else {
+        struct stat stage;
+        int found = fstatat(dir, path, &stage, AT_SYMLINK_NOFOLLOW);
+        if (!found && (!S_ISREG(stage.st_mode) || (uint64_t)stage.st_dev != r->file_device ||
+                       (uint64_t)stage.st_ino != r->file_inode))
+            fail(r, "The partial file changed. It was not modified.");
+        else if ((found && errno != ENOENT) || st.st_nlink != (found ? 1 : 2) ||
+                 (!found && unlinkat(dir, path, 0)) || publish_access(fd, published_mode(r->pin.filename)) || fsync(dir))
+            fail(r, "Could not confirm the completed file on disk. Retry after checking storage.");
+        else
+            copy_text(r->state, sizeof r->state, "complete");
+    }
+    close(fd);
+    return true;
+}
+static void execute(Receiver *r, const char *action, unsigned char *data, size_t n,
+                    const char *sha) {
+    if (!strcmp(action, "chunk")) {
+        double at = seconds_now();
+        chunk_hash = chunk_write = 0;
+        if (disk_open(r)) {
+            fail(r, "Cannot open the original partial file safely.");
+            return;
+        }
+        chunk_write = seconds_now() - at;
+        at = seconds_now();
+        bool matches = digest_bytes(data, n, sha);
+        chunk_hash = seconds_now() - at;
+        if (!matches) {
+            fail(r, "Chunk checksum did not match. Retry this chunk.");
+            return;
+        }
+        at = seconds_now();
+        bool stored = lseek(disk.fd, r->offset, SEEK_SET) >= 0 && !allwrite(disk.fd, data, n);
+        chunk_write += seconds_now() - at;
+        at = seconds_now();
+        if (!stored || !EVP_DigestUpdate(disk.hash, data, n) || fstat(disk.fd, &disk.stamp))
+            fail(r, "Could not write and flush the chunk. Check storage space.");
+        else {
+            r->offset += (int64_t)n;
+            disk.hashed = r->offset;
+            copy_text(r->state, sizeof r->state, "ready");
+        }
+        chunk_hash += seconds_now() - at;
+        return;
+    }
+    // A same-process resume can reuse the checksum of unchanged, durable bytes.
+    if (strcmp(action, "finish") && strcmp(action, "resume")) disk_close();
+    if (!strcmp(action, "abandon")) {
+        /* Explicit owner confirmation releases only the reservation. No drive
+         * access: unavailable or unverified files must remain untouched. */
+        r->partials_retained = true;
+        r->recovery_proof = false;
+        copy_text(r->state, sizeof r->state, "cancelled");
+        return;
+    }
+    if (!strcmp(action, "cancel") && !r->file_inode) {
+        /* A failed begin never created a file; unavailable storage must not
+         * prevent cancelling that empty reservation. */
+        r->offset = 0;
+        copy_text(r->state, sizeof r->state, "cancelled");
+        return;
+    }
+    if (sha && *sha && (!strcmp(action, "resume") || !strcmp(action, "cancel"))) {
+        disk_close(); // A verified rebind may point to a different mounted inode.
+        EVP_MD_CTX *verified;
+        struct stat checked;
+        if (!rebind_partial(r, sha, &verified, &checked)) return;
+        if (!strcmp(action, "resume")) disk_adopt(r, verified, &checked);
+        else EVP_MD_CTX_free(verified);
+    }
+    int dir = receiver_dir(&r->pin, r->folder, !strcmp(action, "begin"));
+    if (dir < 0) {
+        fail(r, "Reconnect the original destination drive.");
+        return;
+    }
+    if (!strcmp(action, "check-complete")) {
+        struct stat st;
+        if (fstatat(dir, r->pin.filename, &st, AT_SYMLINK_NOFOLLOW) || !S_ISREG(st.st_mode) ||
+            st.st_size != r->size || (uint64_t)st.st_dev != r->file_device || (uint64_t)st.st_ino != r->file_inode)
+            fail(r, "The completed PS5 file is missing or changed. Keep the computer copy and restart the PS5 transfer after checking the destination.");
+        else if (sha && *sha) {
+            int checked = openat(dir, r->pin.filename, O_RDONLY | O_NOFOLLOW);
+            char digest[65]; struct stat before, after, named;
+            bool ok = checked >= 0 && !fstat(checked, &before) && S_ISREG(before.st_mode) && before.st_nlink == 1 &&
+                !hash_file(checked, digest) && !strcmp(digest, sha) && !fstat(checked, &after) &&
+                before.st_size == after.st_size && before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+                before.st_mtim.tv_nsec == after.st_mtim.tv_nsec && before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+                before.st_ctim.tv_nsec == after.st_ctim.tv_nsec &&
+                !fstatat(dir, r->pin.filename, &named, AT_SYMLINK_NOFOLLOW) &&
+                named.st_dev == before.st_dev && named.st_ino == before.st_ino && after.st_nlink == 1;
+            if (checked >= 0) close(checked);
+            if (ok) copy_text(r->state, sizeof r->state, "complete");
+            else fail(r, "The saved PS5 file does not match the computer copy. No files were changed.");
+        } else copy_text(r->state, sizeof r->state, "complete");
+        close(dir);
+        return;
+    }
+    char path[80];
+    partial(r, path, sizeof path);
+    if ((!strcmp(action, "resume") || !strcmp(action, "finish") || !strcmp(action, "cancel")) &&
+        recover_published(r, dir)) {
+        close(dir);
+        return;
+    }
+    if (!strcmp(action, "cancel")) {
+        int fd = open_partial(r, dir, false, true);
+        if (fd < 0 && errno != ENOENT)
+            fail(r, "The partial file changed; it was not deleted.");
+        else {
+            if (fd >= 0)
+                close(fd);
+            if ((unlinkat(dir, path, 0) && errno != ENOENT) || fsync(dir))
+                fail(r, "Could not remove the partial file.");
+            else {
+                r->offset = 0;
+                r->recovery_proof = false;
+                copy_text(r->state, sizeof r->state, "cancelled");
+            }
+        }
+        close(dir);
+        return;
+    }
+    bool create = !strcmp(action, "begin");
+    if (create) {
+        struct stat st;
+        if (!fstatat(dir, r->pin.filename, &st, AT_SYMLINK_NOFOLLOW) || errno != ENOENT) {
+            close(dir);
+            fail(r, "A destination file already exists.");
+            return;
+        }
+    }
+    int fd = open_partial(r, dir, create, false);
+    if (fd < 0) {
+        close(dir);
+        fail(r, "Cannot open the original partial file safely.");
+        return;
+    }
+    if (create) {
+        if (fsync(fd) || fsync(dir))
+            fail(r, "Cannot save the new partial file.");
+        else
+            copy_text(r->state, sizeof r->state, "ready");
+    } else if (!strcmp(action, "resume")) {
+        // Rebuild a cold checksum while the public state is still "preparing".
+        // Doing this on the next chunk looks like a stalled write to the sender
+        // when a large saved prefix takes minutes to read.
+        if (disk_open(r))
+            fail(r, "Cannot open the original partial file safely.");
+        else
+            copy_text(r->state, sizeof r->state, "ready");
+    } else if (!strcmp(action, "finish")) {
+        char hash[65];
+        struct stat st;
+        if (fstat(fd, &st) || st.st_size != r->size || disk_digest(r, hash) || strcmp(hash, r->hash))
+            fail(r, "Complete-file checksum did not match. The partial file was retained.");
+        else if (publish_access(fd, published_mode(r->pin.filename)))
+            fail(r, "Could not confirm the completed file on disk. Retry after checking storage.");
+        else if (linkat(dir, path, dir, r->pin.filename, 0)) {
+            /* Same exclusive reservation strategy used by Orbit's download writer on exFAT. */
+            if (errno != EPERM && errno != EOPNOTSUPP && errno != ENOSYS)
+                fail(r, "Cannot publish: the destination name is already in use or inaccessible.");
+            else {
+                int reserve =
+                    openat(dir, r->pin.filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+                if (reserve < 0)
+                    fail(r, "Destination filename is already in use.");
+                else {
+                    close(reserve);
+                    if (renameat(dir, path, dir, r->pin.filename)) {
+                        unlinkat(dir, r->pin.filename, 0);
+                        fail(r, "Could not publish the completed file.");
+                    } else
+                        copy_text(r->state, sizeof r->state, "complete");
+                }
+            }
+        } else {
+            unlinkat(dir, path, 0);
+            copy_text(r->state, sizeof r->state, "complete");
+        }
+        if (!strcmp(r->state, "complete") && fsync(dir))
+            fail(r, "File published, but directory durability could not be confirmed.");
+    }
+    close(fd);
+    close(dir);
+}
+static struct timespec checkpoint_deadline(void) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 250000000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+    return deadline;
+}
+static bool deadline_passed(struct timespec deadline) {
+    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+    return now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+/* How long a failed transfer that wrote nothing may hold the receiver after its sender goes
+ * quiet. Library and Files actions wait while it does. */
+static int64_t abandoned_failure_ms(void) {
+#ifdef ORBIT_TEST
+    const char *test = getenv("ORBIT_TEST_RECEIVE_ABANDON_MS");
+    if (test) { long n = strtol(test, NULL, 10); if (n >= 1 && n <= 600000) return n; }
+#endif
+    return 600000;
+}
+/* Releases that transfer as a recovery stop would; there are no partial files to keep. Call
+ * with lock held. */
+static void release_abandoned_failure(void) {
+    if (!active(&current) || strcmp(current.state, "error") || current.offset || bundle_open() ||
+        working || pending_count || writing_chunk || owner_idle_ms() < abandoned_failure_ms())
+        return;
+    Receiver next = current;
+    next.partials_retained = true;
+    next.recovery_proof = false;
+    next.error[0] = 0;
+    copy_text(next.state, sizeof next.state, "cancelled");
+    if (save(&next))
+        return;
+    current = next;
+    accepted_offset = next.offset;
+    busy(active(&current) || bundle_open());
+}
+static void *worker(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&lock);
+    for (;;) {
+        double idle = seconds_now();
+        while (!working && !stopping) {
+            struct timespec tick;
+            clock_gettime(CLOCK_REALTIME, &tick);
+            int64_t step_ms = abandoned_failure_ms() < 60000 ? 100 : 30000;
+            tick.tv_sec += step_ms / 1000;
+            tick.tv_nsec += (step_ms % 1000) * 1000000;
+            if (tick.tv_nsec >= 1000000000) { tick.tv_sec++; tick.tv_nsec -= 1000000000; }
+            if (pthread_cond_timedwait(&wake, &lock, &tick) == ETIMEDOUT)
+                release_abandoned_failure();
+        }
+        if (!working && stopping) break;
+        if (!strcmp(command, "chunk") && !strcmp(timing.id, current.id)) timing.wait += seconds_now() - idle;
+        Receiver next = current;
+        int64_t previous_offset = current.offset;
+        char action[16]; copy_text(action, sizeof action, command);
+        char proof[65]; copy_text(proof, sizeof proof, command_proof);
+        if (!strcmp(action, "chunk")) {
+            struct timespec deadline = checkpoint_deadline();
+            if (strcmp(timing.id, current.id)) {
+                memset(&timing, 0, sizeof timing);
+                copy_text(timing.id, sizeof timing.id, current.id);
+            }
+            for (;;) {
+                double waited = seconds_now();
+                while (!pending_count && !stopping && !deadline_passed(deadline))
+                    pthread_cond_timedwait(&wake, &lock, &deadline);
+                timing.wait += seconds_now() - waited;
+                if (!pending_count) break;
+                Chunk block = pending[0];
+                pending_count--;
+                memmove(pending, pending + 1, pending_count * sizeof *pending);
+                writing_chunk = true;
+                pthread_mutex_unlock(&lock);
+#ifdef ORBIT_TEST
+                const char *delay = getenv("ORBIT_TEST_RECEIVE_DELAY_MS");
+                if (delay) {
+                    long ms = strtol(delay, NULL, 10);
+                    if (ms > 0 && ms <= 2000) {
+                        struct timespec pause = {ms / 1000, (ms % 1000) * 1000000};
+                        nanosleep(&pause, NULL);
+                    }
+                }
+#endif
+                next.error[0] = 0;
+                execute(&next, action, block.data, block.size, block.hash);
+                free(block.data);
+                pthread_mutex_lock(&lock);
+                writing_chunk = false;
+                timing.hash += chunk_hash;
+                timing.write += chunk_write;
+                if (!strcmp(next.state, "error") || next.offset == next.size || stopping ||
+                    next.offset - previous_offset >= ORBIT_RECEIVE_CHUNK * ORBIT_RECEIVE_WINDOW ||
+                    deadline_passed(deadline)) break;
+            }
+            pthread_mutex_unlock(&lock);
+#ifdef ORBIT_TEST
+            /* A slow drive's flush, for checking that uploads keep arriving meanwhile. */
+            const char *flush = getenv("ORBIT_TEST_CHECKPOINT_DELAY_MS");
+            if (flush && next.offset > previous_offset) {
+                long ms = strtol(flush, NULL, 10);
+                if (ms > 0 && ms <= 2000) {
+                    struct timespec pause = {ms / 1000, (ms % 1000) * 1000000};
+                    nanosleep(&pause, NULL);
+                }
+            }
+#endif
+            double synced = seconds_now();
+            if (next.offset > previous_offset && (disk.fd < 0 || fsync(disk.fd))) {
+                next.offset = previous_offset;
+                fail(&next, "Could not persist transfer progress. Stop and check console storage.");
+            }
+            synced = seconds_now() - synced;
+            pthread_mutex_lock(&lock);
+            timing.sync += synced;
+            if (next.offset > previous_offset) timing.checkpoints++;
+            pthread_mutex_unlock(&lock);
+#ifdef ORBIT_TEST
+            atomic_fetch_add(&checkpoint_count, 1);
+#endif
+        } else {
+            pthread_mutex_unlock(&lock);
+            next.error[0] = 0;
+            if (!strcmp(action, "finish") && save(&next))
+                fail(&next, "Could not save verification progress. The partial file was retained.");
+            else execute(&next, action, NULL, 0, proof);
+        }
+        if ((!strcmp(action, "resume") || !strcmp(action, "check-complete")) && strcmp(next.state, "error"))
+            next.recovery_proof = false;
+        double journaled = seconds_now();
+        int saved = save(&next);
+        journaled = seconds_now() - journaled;
+        if (saved) {
+            next.recovery_proof = current.recovery_proof;
+            next.offset = previous_offset;
+            fail(&next, "Could not persist transfer progress. Stop and check console storage.");
+        }
+        if (!strcmp(next.state, "error") || !strcmp(next.state, "complete") || !strcmp(next.state, "cancelled"))
+            disk_close();
+        pthread_mutex_lock(&lock);
+        if (!strcmp(action, "chunk") && !strcmp(timing.id, next.id)) timing.journal += journaled;
+        current = next;
+        if (!strcmp(current.state, "complete") && !current.folder[0]) {
+            power_download_completed();
+            packages_completed(&current.pin, current.id, current.pin.filename, true);
+        }
+        /* Count each published file once, even when a lost reply repeats finish. */
+        if (!strcmp(current.state, "complete") && bundle_open() && in_bundle(&current) &&
+            strcmp(bundle.last, current.id)) {
+            bundle.files++;
+            bundle.bytes += current.size;
+            copy_text(bundle.last, sizeof bundle.last, current.id);
+            if (bundle_save()) {
+                fail(&current, "Could not save folder progress. Stop and check console storage.");
+            }
+        }
+        if (!strcmp(current.state, "error")) {
+            for (size_t i = 0; i < pending_count; i++) free(pending[i].data);
+            pending_count = 0;
+        }
+        working = pending_count > 0;
+        if (working) copy_text(current.state, sizeof current.state, "writing");
+        else accepted_offset = current.offset;
+        busy(active(&current) || bundle_open());
+    }
+    pthread_mutex_unlock(&lock);
+    disk_close();
+    return NULL;
+}
+/* Canonical file/folder journals are flushed before replacing this record.
+ * Thus a crash cannot leave half a folder assigned to the former pairing. */
+static int handoff_save(const char *owner) {
+    cJSON *o = cJSON_CreateObject();
+    bool file = active(&current) || (bundle_open() && in_bundle(&current));
+    cJSON_AddStringToObject(o, "file", file ? current.id : "");
+    cJSON_AddStringToObject(o, "fileOwner", file ? current.owner : "");
+    cJSON_AddStringToObject(o, "bundle", bundle_open() ? bundle.id : "");
+    cJSON_AddStringToObject(o, "bundleOwner", bundle_open() ? bundle.owner : "");
+    cJSON_AddStringToObject(o, "owner", owner);
+    char *text = cJSON_PrintUnformatted(o); cJSON_Delete(o);
+    if (!text) return -1;
+    int fd = openat(orbit.state_fd, "receive-handoff.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    int result = fd < 0 ? -1 : allwrite(fd, text, strlen(text)); free(text);
+    if (fd >= 0) { if (fsync(fd)) result = -1; if (close(fd)) result = -1; }
+    if (!result && renameat(orbit.state_fd, "receive-handoff.tmp", orbit.state_fd, "receive-handoff.json")) result = -1;
+    if (!result && fsync(orbit.state_fd)) result = -1;
+    return result;
+}
+static int handoff_load(void) {
+    int fd = openat(orbit.state_fd, "receive-handoff.json", O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    char data[1025]; ssize_t n = read(fd, data, 1024); close(fd);
+    if (n <= 0 || n >= 1024) return -1;
+    data[n] = 0; cJSON *o = cJSON_Parse(data);
+    const char *owner = json_text(o, "owner"), *file = json_text(o, "file"), *folder = json_text(o, "bundle");
+    bool valid = hex(owner, 64) && (!*file || (hex(file, 32) && hex(json_text(o, "fileOwner"), 64))) &&
+                 (!*folder || (hex(folder, 32) && hex(json_text(o, "bundleOwner"), 64)));
+    if (valid && *file && !strcmp(file, current.id) && !strcmp(current.owner, json_text(o, "fileOwner"))) {
+        copy_text(current.owner, sizeof current.owner, owner);
+        current.recovery_proof = current.offset > 0;
+    }
+    if (valid && *folder && !strcmp(folder, bundle.id) && !strcmp(bundle.owner, json_text(o, "bundleOwner")))
+        copy_text(bundle.owner, sizeof bundle.owner, owner);
+    cJSON_Delete(o); return valid ? 0 : -1;
+}
+static bool integer(const cJSON *o, const char *key, int64_t min, int64_t max, int64_t *out) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
+    if (!cJSON_IsNumber(v) || !(v->valuedouble >= (double)min && v->valuedouble <= (double)max) ||
+        v->valuedouble != (double)(int64_t)v->valuedouble)
+        return false;
+    *out = (int64_t)v->valuedouble;
+    return true;
+}
+int receive_start(void) {
+    int fd = openat(orbit.state_fd, "receive.json", O_RDONLY | O_NOFOLLOW);
+    if (fd >= 0) {
+        char data[16385];
+        ssize_t n = read(fd, data, 16384);
+        close(fd);
+        if (n <= 0 || n >= 16384)
+            return -1;
+        data[n] = 0;
+        cJSON *o = cJSON_Parse(data);
+        Receiver r = {0};
+        const char *folder = json_text(o, "folder");
+        bool valid = !release_context_parse(cJSON_GetObjectItemCaseSensitive(o, "content"), &r.pin.release) &&
+                     hex(json_text(o, "id"), 32) && hex(json_text(o, "owner"), 64) && folder_ok(folder) &&
+                     (*folder ? extract_name_ok(json_text(o, "filename")) : name_ok(json_text(o, "filename"))) &&
+                     integer(o, "size", *folder ? 0 : 1, INT64_C(8) * 1024 * 1024 * 1024 * 1024, &r.size) &&
+                     integer(o, "offset", 0, r.size, &r.offset);
+        if (valid) {
+            copy_text(r.id, sizeof r.id, json_text(o, "id"));
+            copy_text(r.owner, sizeof r.owner, json_text(o, "owner"));
+            copy_text(r.folder, sizeof r.folder, folder);
+            copy_text(r.pin.filename, sizeof r.pin.filename, json_text(o, "filename"));
+            copy_text(r.pin.storage_id, sizeof r.pin.storage_id, json_text(o, "storageId"));
+            copy_text(r.pin.root, sizeof r.pin.root, json_text(o, "root"));
+            copy_text(r.hash, sizeof r.hash, json_text(o, "sha256"));
+            r.pin.device = (dev_t)strtoull(json_text(o, "device"), NULL, 10);
+            r.pin.inode = (ino_t)strtoull(json_text(o, "inode"), NULL, 10);
+            r.file_device = strtoull(json_text(o, "fileDevice"), NULL, 10);
+            r.file_inode = strtoull(json_text(o, "fileInode"), NULL, 10);
+            r.partials_retained = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "partialsRetained"));
+            r.recovery_proof = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "recoveryProofRequired"));
+            const char *s = json_text(o, "state");
+            copy_text(r.state, sizeof r.state,
+                      !strcmp(s, "complete") || !strcmp(s, "cancelled") ? s : "ready");
+            current = r;
+        }
+        cJSON_Delete(o);
+        if (!valid)
+            return -1;
+    } else if (errno != ENOENT)
+        return -1;
+    fd = openat(orbit.state_fd, "receive-bundle.json", O_RDONLY | O_NOFOLLOW);
+    if (fd >= 0) {
+        char data[16385];
+        ssize_t n = read(fd, data, 16384);
+        close(fd);
+        if (n <= 0 || n >= 16384) return -1;
+        data[n] = 0;
+        cJSON *o = cJSON_Parse(data);
+        const char *state = json_text(o, "state"), *last = json_text(o, "last");
+        Bundle b = {0};
+        bool valid = !release_context_parse(cJSON_GetObjectItemCaseSensitive(o, "content"), &b.pin.release) &&
+                     hex(json_text(o, "id"), 32) && hex(json_text(o, "owner"), 64) &&
+                     extract_name_ok(json_text(o, "name")) && strlen(json_text(o, "name")) < sizeof b.name &&
+                     (!*last || hex(last, 32)) &&
+                     (!strcmp(state, "open") || !strcmp(state, "complete") || !strcmp(state, "cancelled") ||
+                      !strcmp(state, "abandoned")) &&
+                     integer(o, "total", 0, INT64_C(8) * 1024 * 1024 * 1024 * 1024, &b.total) &&
+                     integer(o, "bytes", 0, b.total, &b.bytes) && integer(o, "files", 0, 10000000, &b.files);
+        if (valid) {
+            copy_text(b.id, sizeof b.id, json_text(o, "id"));
+            copy_text(b.owner, sizeof b.owner, json_text(o, "owner"));
+            copy_text(b.state, sizeof b.state, state);
+            copy_text(b.name, sizeof b.name, json_text(o, "name"));
+            copy_text(b.last, sizeof b.last, last);
+            copy_text(b.pin.storage_id, sizeof b.pin.storage_id, json_text(o, "storageId"));
+            copy_text(b.pin.root, sizeof b.pin.root, json_text(o, "root"));
+            b.pin.device = (dev_t)strtoull(json_text(o, "device"), NULL, 10);
+            b.pin.inode = (ino_t)strtoull(json_text(o, "inode"), NULL, 10);
+            b.folder_device = strtoull(json_text(o, "folderDevice"), NULL, 10);
+            b.folder_inode = strtoull(json_text(o, "folderInode"), NULL, 10);
+            bundle = b;
+        }
+        cJSON_Delete(o);
+        if (!valid) return -1;
+    } else if (errno != ENOENT)
+        return -1;
+    if (handoff_load()) return -1;
+    /* A crash may occur after the file journal is durable but before the
+     * bundle count is saved. Reconcile that one last file before accepting
+     * another transfer; its completion was already verified and published. */
+    if (!strcmp(current.state, "complete") && bundle_open() && in_bundle(&current) &&
+        !strcmp(current.owner, bundle.owner) &&
+        strcmp(bundle.last, current.id)) {
+        if (current.size > bundle.total - bundle.bytes) return -1;
+        bundle.files++;
+        bundle.bytes += current.size;
+        copy_text(bundle.last, sizeof bundle.last, current.id);
+        if (bundle_save()) return -1;
+    }
+    accepted_offset = current.offset;
+    receiver_touch();
+    busy(active(&current) || bundle_open());
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr))
+        return -1;
+    int rc = pthread_attr_setstacksize(&attr, ORBIT_THREAD_STACK);
+    if (!rc)
+        rc = pthread_create(&thread, &attr, worker, NULL);
+    pthread_attr_destroy(&attr);
+    started = !rc;
+    return rc;
+}
+void receive_stop(void) {
+    if (!started)
+        return;
+    pthread_mutex_lock(&lock);
+    stopping = true;
+    pthread_cond_signal(&wake);
+    pthread_mutex_unlock(&lock);
+    pthread_join(thread, NULL);
+    pthread_mutex_lock(&lock);
+    started = false;
+    pthread_mutex_unlock(&lock);
+}
+bool receive_available(void) {
+    pthread_mutex_lock(&lock);
+    bool available = started && !stopping;
+    pthread_mutex_unlock(&lock);
+    return available;
+}
+cJSON *receive_status(const char *owner) {
+    pthread_mutex_lock(&lock);
+    const bool foreign = (active(&current) && strcmp(owner, current.owner)) ||
+                         (bundle_open() && strcmp(owner, bundle.owner));
+    if ((active(&current) && !strcmp(owner, current.owner)) ||
+        (bundle_open() && !strcmp(owner, bundle.owner))) receiver_touch();
+    cJSON *o = json(&current, false);
+    if (current.id[0] && strcmp(owner, current.owner)) {
+        cJSON_Delete(o);
+        o = cJSON_CreateObject();
+        /* A completed/cancelled file does not reserve the receiver. Keep its
+         * identity private, but don't block another paired client forever. */
+        cJSON_AddStringToObject(o, "state", active(&current) || working ? "other-client" : "idle");
+    }
+    if (!current.id[0] || !strcmp(owner, current.owner) || (!active(&current) && !working)) {
+        cJSON_AddNumberToObject(o, "pipelineChunks", ORBIT_RECEIVE_WINDOW);
+        cJSON_AddNumberToObject(o, "acceptedOffset", !strcmp(owner, current.owner) ? (double)accepted_offset : 0);
+        cJSON_AddNumberToObject(o, "bufferedChunks", pending_count + (writing_chunk ? 1 : 0));
+        cJSON_AddNumberToObject(o, "partialVerification", 1);
+        cJSON_AddNumberToObject(o, "stopTransfer", 1);
+        cJSON_AddNumberToObject(o, "folders", 1);
+        cJSON_AddNumberToObject(o, "checkProgress", 1);
+    }
+    /* Only the transfer's owner sees how far a check of its saved file has got. */
+    int64_t checking = atomic_load(&check_total);
+    if (checking > 0 && current.id[0] && !strcmp(owner, current.owner) && working) {
+        cJSON_AddNumberToObject(o, "checkedBytes", (double)atomic_load(&check_done));
+        cJSON_AddNumberToObject(o, "checkBytes", (double)checking);
+    }
+    if (current.id[0] && !strcmp(owner, current.owner) && !strcmp(timing.id, current.id)) {
+        cJSON *t = cJSON_AddObjectToObject(o, "stats");
+        cJSON_AddNumberToObject(t, "waitSeconds", timing.wait);
+        cJSON_AddNumberToObject(t, "hashSeconds", timing.hash);
+        cJSON_AddNumberToObject(t, "writeSeconds", timing.write);
+        cJSON_AddNumberToObject(t, "syncSeconds", timing.sync);
+        cJSON_AddNumberToObject(t, "journalSeconds", timing.journal);
+        cJSON_AddNumberToObject(t, "checkpoints", timing.checkpoints);
+    }
+    if (bundle.id[0] && !strcmp(owner, bundle.owner)) {
+        cJSON *b = cJSON_AddObjectToObject(o, "bundle");
+        cJSON_AddStringToObject(b, "id", bundle.id);
+        cJSON_AddStringToObject(b, "state", bundle.state);
+        cJSON_AddStringToObject(b, "name", bundle.name);
+        cJSON_AddNumberToObject(b, "files", (double)bundle.files);
+        cJSON_AddNumberToObject(b, "bytes", (double)bundle.bytes);
+    } else if (bundle_open())
+        cJSON_AddStringToObject(o, "bundleState", "other-client");
+    if (foreign) {
+        char ticket[65];
+        unsigned wait = recovery_wait_seconds();
+        bool can_recover = started && !stopping && !working && !pending_count && !writing_chunk && !wait && recovery_ticket(owner, ticket);
+        cJSON_AddNumberToObject(o, "pairingRecovery", 1);
+        cJSON_AddBoolToObject(o, "canRecoverPairing", can_recover);
+        cJSON_AddNumberToObject(o, "recoveryWaitSeconds", wait);
+        if (can_recover) cJSON_AddStringToObject(o, "recoveryTicket", ticket);
+    }
+#ifdef ORBIT_TEST
+    cJSON_AddNumberToObject(o, "checkpointCount", atomic_load(&checkpoint_count));
+    cJSON_AddNumberToObject(o, "prefixHashReads", atomic_load(&prefix_hash_reads));
+#endif
+    cJSON_AddBoolToObject(o, "available", started);
+    pthread_mutex_unlock(&lock);
+    return o;
+}
+int receive_command(const char *action, const cJSON *input, const char *owner, char *error,
+                    size_t cap) {
+    int code = 202;
+    const char *message = NULL, *id = json_text(input, "id");
+    pthread_mutex_lock(&lock);
+    if (!started || stopping) {
+        code = 503;
+        message = "The local receiver could not start. Check console storage.";
+    } else if (!hex(id, 32)) {
+        code = 400;
+        message = "Invalid transfer ID.";
+    } else if (working) {
+        code = 409;
+        message = "Wait for the current disk operation.";
+    } else if (!strcmp(action, "begin")) {
+        int64_t size = 0;
+        Release content = {0};
+        const char *name = json_text(input, "filename"), *sid = json_text(input, "storageId");
+        /* A file of a folder transfer goes to its place inside the bundle's staging folder. */
+        const char *group = json_text(input, "bundle"), *directory = json_text(input, "directory");
+        char folder[sizeof current.folder] = "";
+        bool fits = !*group || snprintf(folder, sizeof folder, *directory ? ".orbit-bundle-%s/%s" : ".orbit-bundle-%s",
+                                        group, directory) < (int)sizeof folder;
+        if (release_context_parse(cJSON_GetObjectItemCaseSensitive(input, "content"), &content) ||
+            (*group ? !extract_name_ok(name) || !hex(group, 32) || !fits || !folder_ok(folder) : !name_ok(name) || *directory) ||
+            !integer(input, "size", *group ? 0 : 1, INT64_C(8) * 1024 * 1024 * 1024 * 1024, &size)) {
+            code = 400;
+            message = "Invalid filename or size.";
+        } else if (*group && (!bundle_open() || strcmp(bundle.id, group) || strcmp(bundle.owner, owner) ||
+                              strcmp(bundle.pin.storage_id, sid))) {
+            code = 409;
+            message = "Open this folder transfer before sending its files.";
+        } else if (!*group && bundle_open()) {
+            code = 409;
+            message = "Finish or cancel the folder transfer in progress first.";
+        } else if (!strcmp(current.id, id)) {
+            code = 200;
+            if (strcmp(current.owner, owner) || strcmp(current.pin.filename, name) ||
+                strcmp(current.pin.storage_id, sid) || current.size != size || strcmp(current.folder, folder) ||
+                strcmp(current.pin.release.addon_id, content.addon_id) ||
+                strcmp(current.pin.release.content_id, content.content_id)) {
+                code = 409;
+                message = "Transfer identity does not match.";
+            } else if (!strcmp(current.state, "complete")) {
+                code = 202;
+                action = "check-complete";
+                copy_text(current.state, sizeof current.state, "preparing");
+            }
+        } else if (current.recovery_proof) {
+            code = 409; message = "Verify the saved PS5 partial before continuing this transfer.";
+        } else if (active(&current)) {
+            code = 409;
+            message = "Finish or cancel the existing local transfer first.";
+        } else {
+            Storage choices[ORBIT_MAX_STORAGE], *selected = NULL;
+            size_t count = storage_list(choices);
+            for (size_t i = 0; i < count; i++)
+                if (!strcmp(choices[i].id, sid))
+                    selected = &choices[i];
+            char destination[sizeof current.pin.root + sizeof current.folder + 300] = "";
+            if (selected) {
+                if (*folder) snprintf(destination, sizeof destination, "%s/homebrew/%s/%s", selected->root, folder, name);
+                else snprintf(destination, sizeof destination, "%s/homebrew/%s", selected->root, name);
+            }
+            pthread_mutex_lock(&orbit.mutex);
+            /* Downloads keep running; Files actions and Library copies take turns. */
+            bool occupied = orbit.library_storage_busy || orbit.files_storage_busy || orbit.stop;
+            if (occupied) {
+                code = 409;
+                message = "Another file operation is running. Wait for it to finish, or cancel it.";
+            } else if (*destination && storage_path_downloading_locked(destination)) {
+                code = 409;
+                message = "A download or transfer is using this.";
+            } else if (!selected || (*group && (strcmp(selected->root, bundle.pin.root) ||
+                                                selected->device != bundle.pin.device ||
+                                                selected->inode != bundle.pin.inode))) {
+                code = 409;
+                message = "Selected storage is unavailable.";
+            } else {
+                uint64_t pending = storage_pending_locked(selected, NULL);
+                if (pending > selected->free_bytes ||
+                    (uint64_t)size + 16 * 1024 * 1024 > selected->free_bytes - pending) {
+                    code = 409;
+                    message = "Not enough free space after queued downloads.";
+                }
+            }
+            if (!message) {
+                Receiver r = {0};
+                r.pin.release = content;
+                copy_text(r.id, sizeof r.id, id);
+                copy_text(r.owner, sizeof r.owner, owner);
+                copy_text(r.pin.storage_id, sizeof r.pin.storage_id, sid);
+                copy_text(r.pin.root, sizeof r.pin.root, selected->root);
+                copy_text(r.pin.filename, sizeof r.pin.filename, name);
+                copy_text(r.folder, sizeof r.folder, folder);
+                r.pin.device = selected->device;
+                r.pin.inode = selected->inode;
+                r.size = size;
+                copy_text(r.state, sizeof r.state, "preparing");
+                current = r;
+                accepted_offset = 0;
+                orbit.receiver_active = true;
+                hold_locked(true);
+            }
+            pthread_mutex_unlock(&orbit.mutex);
+        }
+    } else if (strcmp(id, current.id) || strcmp(owner, current.owner)) {
+        code = 409;
+        message = "This is not your active transfer.";
+    } else if (current.recovery_proof && (!strcmp(action, "finish") ||
+               (!strcmp(action, "resume") && (!hex(json_text(input, "prefixSha256"), 64) ||
+                json_int(input, "prefixBytes") != current.offset)))) {
+        code = 409; message = "Verify the saved PS5 partial before continuing this transfer.";
+    } else if ((!strcmp(action, "resume") || !strcmp(action, "cancel")) &&
+               (cJSON_HasObjectItem(input, "prefixSha256") || cJSON_HasObjectItem(input, "prefixBytes")) &&
+               (!hex(json_text(input, "prefixSha256"), 64) || current.offset <= 0 ||
+                !cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(input, "prefixBytes")) ||
+                cJSON_GetObjectItemCaseSensitive(input, "prefixBytes")->valuedouble != (double)current.offset)) {
+        code = 409;
+        message = "Read the current durable offset before verifying the partial file.";
+    } else if (!strcmp(action, "abandon")) {
+        if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "confirmed"))) {
+            code = 400;
+            message = "Confirm stopping this transfer and keeping its remaining files.";
+        } else if (!active(&current))
+            code = 200;
+        else
+            copy_text(current.state, sizeof current.state, "cancelling");
+    } else if (!strcmp(action, "resume")) {
+        if (!strcmp(current.state, "complete")) {
+            action = "check-complete";
+            copy_text(current.state, sizeof current.state, "preparing");
+        }
+        else if (!active(&current)) {
+            code = 409;
+            message = "This transfer has been cancelled.";
+        } else
+            copy_text(current.state, sizeof current.state, "preparing");
+    } else if (!strcmp(action, "finish")) {
+        if (!strcmp(current.state, "complete")) {
+            action = "check-complete";
+            copy_text(current.state, sizeof current.state, "preparing");
+        }
+        else if (!active(&current)) {
+            code = 409;
+            message = "This transfer has been cancelled.";
+        }
+        else if (current.offset != current.size || !hex(json_text(input, "sha256"), 64)) {
+            code = 409;
+            message = "The file is incomplete or its checksum is missing.";
+        } else {
+            copy_text(current.hash, sizeof current.hash, json_text(input, "sha256"));
+            copy_text(current.state, sizeof current.state, "verifying");
+        }
+    } else if (!strcmp(action, "cancel")) {
+        if (!active(&current))
+            code = 200;
+        else
+            copy_text(current.state, sizeof current.state, "cancelling");
+    } else {
+        code = 400;
+        message = "Unknown receiver operation.";
+    }
+    if (code == 202 && !message) {
+        copy_text(command, sizeof command, action);
+        copy_text(command_proof, sizeof command_proof, json_text(input, "prefixSha256"));
+        working = true;
+        receiver_touch();
+        pthread_cond_signal(&wake);
+    }
+    if (message)
+        copy_text(error, cap, message);
+    pthread_mutex_unlock(&lock);
+    return code;
+}
+int receive_chunk(const char *id, const char *offset, const char *sha, unsigned char **data,
+                  size_t n, const char *owner, char *error, size_t cap) {
+    int code = 202;
+    const char *message = NULL;
+    char *end = NULL;
+    errno = 0;
+    long long at = offset ? strtoll(offset, &end, 10) : -1;
+    pthread_mutex_lock(&lock);
+    if (!started || stopping) {
+        code = 503;
+        message = "Receiver unavailable.";
+    } else if (!id || !offset || !sha || !hex(id, 32) || !hex(sha, 64) || !*offset || *end ||
+               errno || at < 0 || !n || n > ORBIT_RECEIVE_CHUNK) {
+        code = 400;
+        message = "Invalid chunk metadata.";
+    } else if (working && strcmp(command, "chunk")) {
+        code = 409;
+        message = "Wait for the current disk operation.";
+    } else if (strcmp(current.id, id) || strcmp(current.owner, owner) || !active(&current)) {
+        code = 409;
+        message = "This is not your active transfer.";
+    } else if (current.recovery_proof) {
+        code = 409; message = "Verify the saved PS5 partial before continuing this transfer.";
+    } else if (at != accepted_offset || (int64_t)n > current.size - accepted_offset) {
+        code = 409;
+        message = "Read the accepted and durable offsets before sending another chunk.";
+    } else if (pending_count + (writing_chunk ? 1U : 0U) >= ORBIT_RECEIVE_WINDOW) {
+        code = 429;
+        message = "The receiver buffer is full. Wait for durable progress.";
+    } else {
+        Chunk *block = &pending[pending_count++];
+        block->data = *data;
+        *data = NULL;
+        block->size = n;
+        copy_text(block->hash, sizeof block->hash, sha);
+        accepted_offset += (int64_t)n;
+        copy_text(command, sizeof command, "chunk");
+        copy_text(current.state, sizeof current.state, "writing");
+        working = true;
+        receiver_touch();
+        pthread_cond_signal(&wake);
+    }
+    if (message)
+        copy_text(error, cap, message);
+    pthread_mutex_unlock(&lock);
+    return code;
+}
+
+static int bundle_select(const char *sid, const char *name, Storage *out, int64_t total, const char **message) {
+    Storage choices[ORBIT_MAX_STORAGE];
+    size_t count = storage_list(choices);
+    bool found = false;
+    for (size_t i = 0; i < count; i++)
+        if (!strcmp(choices[i].id, sid)) { *out = choices[i]; found = true; }
+    char destination[sizeof out->root + 300] = "";
+    if (found) snprintf(destination, sizeof destination, "%s/homebrew/%s", out->root, name);
+    pthread_mutex_lock(&orbit.mutex);
+    /* Downloads keep running; Files actions and Library copies take turns. */
+    bool occupied = orbit.library_storage_busy || orbit.files_storage_busy || orbit.stop;
+    bool downloading = found && storage_path_downloading_locked(destination);
+    uint64_t pending = found ? storage_pending_locked(out, NULL) : 0;
+    if (occupied) *message = "Another file operation is running. Wait for it to finish, or cancel it.";
+    else if (!found) *message = "Selected storage is unavailable.";
+    else if (downloading) *message = "A download or transfer is using this.";
+    else if (pending > out->free_bytes || (uint64_t)total + 16 * 1024 * 1024 > out->free_bytes - pending)
+        *message = "Not enough free space after queued downloads.";
+    if (!*message) {
+        /* Reserve before releasing the queue lock; receive_bundle refreshes or
+         * clears this hold after opening the folder, including failed opens. */
+        orbit.receiver_active = true;
+        StorageHold *h = &orbit.holds[HOLD_RECEIVE];
+        memset(h, 0, sizeof *h);
+        h->device = out->device;
+        h->bytes = (uint64_t)total;
+        copy_text(h->path, sizeof h->path, destination);
+    }
+    pthread_mutex_unlock(&orbit.mutex);
+    return *message ? 409 : 200;
+}
+static int bundle_check_completed(const char **message) {
+    int dir = storage_open(&bundle.pin);
+    struct stat st;
+    bool present = dir >= 0 && !fstatat(dir, bundle.name, &st, AT_SYMLINK_NOFOLLOW) &&
+        S_ISDIR(st.st_mode) && (uint64_t)st.st_dev == bundle.folder_device &&
+        (uint64_t)st.st_ino == bundle.folder_inode;
+    if (dir >= 0) close(dir);
+    if (!present) *message = "The completed PS5 folder is missing or changed. Keep the computer copy and restart the PS5 transfer after checking the destination.";
+    return present ? 200 : 409;
+}
+static int bundle_start(const char *id, const cJSON *input, const char *owner, const char **message) {
+    const char *name = json_text(input, "name"), *sid = json_text(input, "storageId");
+    int64_t total = 0;
+    Release content = {0};
+    if (release_context_parse(cJSON_GetObjectItemCaseSensitive(input, "content"), &content) ||
+        !extract_name_ok(name) || strlen(name) >= sizeof bundle.name ||
+        !integer(input, "totalBytes", 0, INT64_C(8) * 1024 * 1024 * 1024 * 1024, &total)) {
+        *message = "Invalid folder name or size.";
+        return 400;
+    }
+    if (!strcmp(bundle.id, id)) { /* Repeating the same identity resumes it. */
+        if (strcmp(bundle.owner, owner) || strcmp(bundle.name, name) ||
+            strcmp(bundle.pin.storage_id, sid) || bundle.total != total || strcmp(bundle.pin.release.addon_id, content.addon_id)) {
+            *message = "Folder transfer identity does not match.";
+            return 409;
+        }
+        if (bundle_open()) return 200;
+        if (!strcmp(bundle.state, "complete")) return bundle_check_completed(message);
+        *message = "This folder transfer has been cancelled.";
+        return 409;
+    }
+    if (bundle_open()) {
+        *message = "Finish or cancel the existing folder transfer first.";
+        return 409;
+    }
+    if (active(&current)) {
+        *message = "Finish or cancel the existing local transfer first.";
+        return 409;
+    }
+    Storage selected = {0};
+    int code = bundle_select(sid, name, &selected, total, message);
+    if (code != 200) return code;
+    Bundle next = {0};
+    next.pin.release = content;
+    copy_text(next.id, sizeof next.id, id);
+    copy_text(next.owner, sizeof next.owner, owner);
+    copy_text(next.state, sizeof next.state, "open");
+    copy_text(next.name, sizeof next.name, name);
+    copy_text(next.pin.storage_id, sizeof next.pin.storage_id, sid);
+    copy_text(next.pin.root, sizeof next.pin.root, selected.root);
+    next.pin.device = selected.device;
+    next.pin.inode = selected.inode;
+    next.total = total;
+    char folder[64];
+    bundle_folder(id, folder, sizeof folder);
+    int dir = storage_open(&next.pin);
+    struct stat st;
+    if (dir < 0) {
+        *message = "Selected storage is unavailable.";
+        return 409;
+    }
+    if (!fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) || errno != ENOENT)
+        *message = "A file or folder with this name already exists on the drive. Orbit will not overwrite it.";
+    else if (mkdirat(dir, folder, 0755) || fstatat(dir, folder, &st, AT_SYMLINK_NOFOLLOW) || fsync(dir))
+        *message = "Could not create the folder on the drive.";
+    if (*message) {
+        close(dir);
+        return 409;
+    }
+    next.folder_device = (uint64_t)st.st_dev;
+    next.folder_inode = (uint64_t)st.st_ino;
+    Bundle previous = bundle;
+    bundle = next;
+    if (bundle_save()) {
+        bundle = previous;
+        unlinkat(dir, folder, AT_REMOVEDIR);
+        close(dir);
+        *message = "Could not save the folder transfer. Check console storage.";
+        return 503;
+    }
+    close(dir);
+    return 200;
+}
+static int bundle_commit(const cJSON *input, const char **message) {
+    int64_t files = 0, bytes = 0;
+    if (!strcmp(bundle.state, "complete")) return bundle_check_completed(message);
+    if (!bundle_open()) {
+        *message = "This folder transfer has been cancelled.";
+        return 409;
+    }
+    if (active(&current)) {
+        *message = "Finish sending the current file first.";
+        return 409;
+    }
+    if (!integer(input, "files", 0, 10000000, &files) ||
+        !integer(input, "totalBytes", 0, INT64_C(8) * 1024 * 1024 * 1024 * 1024, &bytes)) {
+        *message = "Expected the folder's file count and size.";
+        return 400;
+    }
+    if (files != bundle.files || bytes != bundle.bytes || bytes != bundle.total) {
+        *message = "The PS5 has not received every file in this folder. Resume to send the rest.";
+        return 409;
+    }
+    int dir = storage_open(&bundle.pin);
+    if (dir < 0) {
+        *message = "Reconnect the original destination drive.";
+        return 409;
+    }
+    char folder[64];
+    bundle_folder(bundle.id, folder, sizeof folder);
+    struct stat staged, published;
+    bool moved = fstatat(dir, folder, &staged, AT_SYMLINK_NOFOLLOW) && errno == ENOENT &&
+                 !fstatat(dir, bundle.name, &published, AT_SYMLINK_NOFOLLOW) && S_ISDIR(published.st_mode) &&
+                 (uint64_t)published.st_dev == bundle.folder_device &&
+                 (uint64_t)published.st_ino == bundle.folder_inode;
+    /* A folder can only replace an empty folder, so check, then rename. */
+    if (!moved && (fstatat(dir, folder, &staged, AT_SYMLINK_NOFOLLOW) || !S_ISDIR(staged.st_mode) ||
+                  (uint64_t)staged.st_dev != bundle.folder_device || (uint64_t)staged.st_ino != bundle.folder_inode))
+        *message = "The partial folder changed. It was kept for you to check.";
+    else if (!moved && (!fstatat(dir, bundle.name, &published, AT_SYMLINK_NOFOLLOW) || errno != ENOENT))
+        *message = "A file or folder with this name already exists on the drive. Orbit will not overwrite it.";
+    else if (bundle_access(dir, moved ? bundle.name : folder))
+        *message = "Could not save the folder transfer. Check console storage.";
+    else if (!moved && (renameat(dir, folder, dir, bundle.name) || fsync(dir)))
+        *message = "Could not move the folder into place.";
+    close(dir);
+    if (*message) return 409;
+    copy_text(bundle.state, sizeof bundle.state, "complete");
+    if (bundle_save()) {
+        *message = "The folder is in place, but its status could not be saved. Commit again.";
+        copy_text(bundle.state, sizeof bundle.state, "open");
+        return 503;
+    }
+    power_download_completed();
+    packages_completed(&bundle.pin, bundle.id, bundle.name, true);
+    return 200;
+}
+static int bundle_cancel(const char **message) {
+    if (!strcmp(bundle.state, "cancelled") || !strcmp(bundle.state, "abandoned")) return 200;
+    if (!strcmp(bundle.state, "complete")) {
+        *message = "This folder is already on the PS5.";
+        return 409;
+    }
+    if (active(&current) && in_bundle(&current)) {
+        *message = "Cancel the file being sent first.";
+        return 409;
+    }
+    int dir = storage_open(&bundle.pin);
+    if (dir < 0) {
+        *message = "Reconnect the original destination drive before removing the partial folder.";
+        return 409;
+    }
+    char folder[64], path[sizeof bundle.pin.root + 96];
+    bundle_folder(bundle.id, folder, sizeof folder);
+    snprintf(path, sizeof path, "%s/homebrew/%s", bundle.pin.root, folder);
+    struct stat staged;
+    int status = fstatat(dir, folder, &staged, AT_SYMLINK_NOFOLLOW);
+    if ((!status && (!S_ISDIR(staged.st_mode) || (uint64_t)staged.st_dev != bundle.folder_device ||
+                     (uint64_t)staged.st_ino != bundle.folder_inode)) || (status && errno != ENOENT)) {
+        close(dir);
+        *message = "The partial folder changed. It was kept for you to check.";
+        return 409;
+    }
+    int removed = extract_remove_tree(dir, folder, path);
+    if (!removed) fsync(dir);
+    close(dir);
+    if (removed) {
+        *message = "Could not remove the partial folder.";
+        return 409;
+    }
+    copy_text(bundle.state, sizeof bundle.state, "cancelled");
+    if (bundle_save()) {
+        *message = "Could not save the folder transfer. Check console storage.";
+        return 503;
+    }
+    return 200;
+}
+static int bundle_mkdir(const cJSON *input, const char **message) {
+    if (!strcmp(bundle.state, "complete")) return 200;
+    const char *directory = json_text(input, "directory");
+    char folder[sizeof current.folder];
+    if (!bundle_open() || !*directory ||
+        snprintf(folder, sizeof folder, ".orbit-bundle-%s/%s", bundle.id, directory) >= (int)sizeof folder ||
+        !folder_ok(folder)) {
+        *message = "Invalid folder name or size.";
+        return 400;
+    }
+    int fd = receiver_dir(&bundle.pin, folder, true);
+    if (fd < 0) {
+        *message = "Could not create the folder on the drive.";
+        return 409;
+    }
+    int rc = fsync(fd);
+    close(fd);
+    if (rc) { *message = "Could not save the folder transfer. Check console storage."; return 503; }
+    return 200;
+}
+int receive_bundle(const char *action, const cJSON *input, const char *owner, char *error, size_t cap) {
+    int code = 400;
+    const char *message = NULL, *id = json_text(input, "bundle");
+    pthread_mutex_lock(&lock);
+    if (!started || stopping) {
+        code = 503;
+        message = "The local receiver could not start. Check console storage.";
+    } else if (!hex(id, 32))
+        message = "Invalid folder transfer ID.";
+    else if (working) {
+        code = 409;
+        message = "Wait for the current disk operation.";
+    } else if (current.recovery_proof && strcmp(action, "cancel") && strcmp(action, "abandon")) {
+        code = 409; message = "Verify the saved PS5 partial before continuing this transfer.";
+    } else if (!strcmp(action, "open"))
+        code = bundle_start(id, input, owner, &message);
+    else if (strcmp(bundle.id, id) || strcmp(bundle.owner, owner)) {
+        code = 409;
+        message = "This is not your folder transfer.";
+    } else if (!strcmp(action, "commit"))
+        code = bundle_commit(input, &message);
+    else if (!strcmp(action, "mkdir"))
+        code = bundle_mkdir(input, &message);
+    else if (!strcmp(action, "cancel"))
+        code = bundle_cancel(&message);
+    else if (!strcmp(action, "abandon")) {
+        /* Releases the reservation only; nothing on the drive is touched. */
+        if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "confirmed")))
+            message = "Confirm stopping this transfer and keeping its remaining files.";
+        else if (bundle_open()) {
+            copy_text(bundle.state, sizeof bundle.state, "abandoned");
+            code = bundle_save() ? 503 : 200;
+            if (code != 200) {
+                copy_text(bundle.state, sizeof bundle.state, "open");
+                message = "Could not save the folder transfer. Check console storage.";
+            }
+        } else
+            code = 200;
+    } else
+        message = "Unknown folder operation.";
+    if (message) copy_text(error, cap, message);
+    if (!message) receiver_touch();
+    busy(active(&current) || bundle_open());
+    pthread_mutex_unlock(&lock);
+    return message ? code : 200;
+}
+
+/* Console-authorized handoff keeps saved progress, requiring byte verification
+ * before resuming. The legacy stop action only releases reservations. */
+int receive_recover(const cJSON *input, const char *owner, char *error, size_t cap, cJSON **reply) {
+    const char *message = NULL, *ticket = json_text(input, "ticket"), *code = json_text(input, "code");
+    int status = 200;
+    char expected[65];
+    pthread_mutex_lock(&lock);
+    const bool foreign = (active(&current) && strcmp(owner, current.owner)) ||
+                         (bundle_open() && strcmp(owner, bundle.owner));
+    if (!started || stopping) { status = 503; message = "Receiver unavailable."; }
+    else if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "confirmed"))) {
+        status = 400; message = "Confirm stopping the old transfer and keeping its files.";
+    } else if (!foreign || working || pending_count || writing_chunk || recovery_wait_seconds() ||
+               !hex(ticket, 64) || !recovery_ticket(owner, expected) || CRYPTO_memcmp(ticket, expected, 64)) {
+        status = 409; message = "The PS5 transfer changed or its sender is still active. Close the app that started it, wait two minutes, then review again.";
+    } else {
+        /* Share pairing's attempt limit. A bearer token or confirmation alone
+         * cannot release a different pairing's reservation. */
+        pthread_mutex_lock(&orbit.mutex);
+        const time_t now = time(NULL);
+        if (now < orbit.pair_locked_until) {
+            status = 429; message = "Too many attempts. Wait one minute.";
+        } else if (strlen(code) != 6 || CRYPTO_memcmp(code, orbit.pair_code, 6)) {
+            status = 403; message = "Enter the six-digit code currently shown on your PS5.";
+            if (++orbit.pair_failures >= 5) { orbit.pair_locked_until = now + 60; orbit.pair_failures = 0; }
+        } else orbit.pair_failures = 0;
+        pthread_mutex_unlock(&orbit.mutex);
+        const bool code_verified = !message;
+        const char *action = json_text(input, "action");
+        if (!message && !strcmp(action, "inspect")) {
+            bool file = active(&current) || (bundle_open() && in_bundle(&current));
+            *reply = file ? json(&current, false) : cJSON_CreateObject();
+            if (file) cJSON_AddStringToObject(*reply, "directory", current.folder);
+            if (bundle_open()) {
+                cJSON *b = cJSON_AddObjectToObject(*reply, "bundle");
+                cJSON_AddStringToObject(b, "id", bundle.id); cJSON_AddStringToObject(b, "state", bundle.state);
+                cJSON_AddStringToObject(b, "name", bundle.name); cJSON_AddStringToObject(b, "storageId", bundle.pin.storage_id);
+                cJSON_AddNumberToObject(b, "files", (double)bundle.files); cJSON_AddNumberToObject(b, "bytes", (double)bundle.bytes);
+                cJSON_AddNumberToObject(b, "totalBytes", (double)bundle.total);
+            }
+            /* Inspection does not change files, ownership or the review ticket. */
+            pthread_mutex_unlock(&lock); return 200;
+        }
+        if (!message && !strcmp(action, "claim")) {
+            bool file = active(&current) || (bundle_open() && in_bundle(&current));
+            if (strcmp(json_text(input, "id"), file ? current.id : "") ||
+                strcmp(json_text(input, "bundle"), bundle_open() ? bundle.id : "")) {
+                status = 409; message = "The PS5 transfer changed. Review it again.";
+            } else if ((current.id[0] && save(&current)) || (bundle.id[0] && bundle_save()) || handoff_save(owner)) {
+                status = 503; message = "Could not save transfer recovery. Your files were kept. Review the PS5 transfer again.";
+            } else {
+                if (file) { copy_text(current.owner, sizeof current.owner, owner); current.recovery_proof = current.offset > 0; }
+                if (bundle_open()) copy_text(bundle.owner, sizeof bundle.owner, owner);
+            }
+            receiver_touch();
+            if (message) copy_text(error, cap, message);
+            pthread_mutex_unlock(&lock); return status;
+        }
+        if (!message && *action && strcmp(action, "stop")) { status = 400; message = "Unknown recovery action."; }
+        if (!message && active(&current)) {
+            Receiver next = current;
+            next.partials_retained = true;
+            next.recovery_proof = false;
+            next.error[0] = 0;
+            copy_text(next.state, sizeof next.state, "cancelled");
+            if (save(&next)) { status = 503; message = "Could not save transfer recovery. Your files were kept. Review the PS5 transfer again."; }
+            else { current = next; accepted_offset = next.offset; }
+        }
+        if (!message && bundle_open()) {
+            copy_text(bundle.state, sizeof bundle.state, "abandoned");
+            if (bundle_save()) {
+                copy_text(bundle.state, sizeof bundle.state, "open");
+                status = 503; message = "Could not save folder recovery. Your files were kept. Review the PS5 transfer again.";
+            }
+        }
+        if (code_verified) receiver_touch();
+        busy(active(&current) || bundle_open());
+    }
+    if (message) copy_text(error, cap, message);
+    pthread_mutex_unlock(&lock);
+    return status;
+}

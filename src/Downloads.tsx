@@ -1,0 +1,600 @@
+import { InstallationDialog, InstallationSummary, installationLabel } from "./Installation";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Icon, Modal } from "./components";
+import { QueuePosition } from "./QueuePosition";
+import { Artwork } from "./Artwork";
+import { PowerJobDialog } from "./PowerSetting";
+import { HistoryRemoval } from "./HistoryRemoval";
+import {
+  bytes,
+  formatLabel,
+  type Game,
+  type Job,
+  type Storage,
+  type System,
+} from "./types";
+import { formatNumber, placeName, t, tn } from "./i18n";
+import { useInterfacePrefs } from "./interfaces/choice";
+import { CrossbarDownloads } from "./interfaces/CrossbarDownloads";
+import { PanoramaDownloads } from "./interfaces/PanoramaDownloads";
+import { powerJobAction, inactive, retryWait, statusLabels, timeLeft, waiting, type DownloadView } from "./jobs";
+export function Downloads({
+  jobs,
+  games,
+  drives,
+  action,
+  browse,
+  targetId,
+  openLibrary,
+  concurrent,
+  deletePackages = false,
+  power,
+  refresh,
+}: {
+  jobs: Job[];
+  power?: System["power"];
+  games: Game[];
+  drives: Storage[];
+  action: (id: string, name: string, remove?: boolean, password?: string) => Promise<void>;
+  browse: () => void;
+  targetId: string | null;
+  // Finished downloads can open their game in Library (Cinema, Crossbar, Panorama).
+  openLibrary?: (job: Job) => void;
+  // How many downloads run at once (Panorama's live tile).
+  concurrent?: number;
+  // Whether the PS5 deletes a package once it is installed (App settings → Storage).
+  deletePackages?: boolean;
+  refresh: () => Promise<unknown>;
+}) {
+  const iface = useInterfacePrefs().prefs.name;
+  const [view, setView] = useState<DownloadView>("Active");
+  const [error, setError] = useState(""),
+    [busy, setBusy] = useState("");
+  const [powerJob, setPowerJob] = useState<{ job: Job; enabled: boolean } | null>(null);
+  const [cancel, setCancel] = useState<Job | null>(null);
+  const [forget, setForget] = useState(false);
+  const [message, setMessage] = useState("");
+  const [installationJob, setInstallationJob] = useState("");
+  const [historyJobs, setHistoryJobs] = useState<Job[]>([]);
+  const [passwordJob, setPasswordJob] = useState<Job | null>(null);
+  const [archivePassword, setArchivePassword] = useState("");
+  async function retryExtraction() {
+    if (!passwordJob || !archivePassword) return;
+    setBusy(passwordJob.id); setError("");
+    try {
+      await action(passwordJob.id, "archive-password", false, archivePassword);
+      setArchivePassword(""); setPasswordJob(null);
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(""); }
+  }
+  const shownTarget = useRef<string | null>(null);
+  const scrolledTarget = useRef<string | null>(null);
+  const targetStatus = jobs.find((j) => j.id === targetId)?.status;
+  useEffect(() => {
+    if (!targetId) shownTarget.current = null;
+    if (targetId && targetStatus && shownTarget.current !== targetId) {
+      shownTarget.current = targetId;
+      setView(
+        targetStatus === "complete"
+          ? "Finished"
+          : targetStatus === "cancelled"
+            ? "Cancelled"
+            : targetStatus === "error"
+              ? "Failed"
+              : "Active",
+      );
+    }
+  }, [targetId, targetStatus]);
+  useEffect(() => {
+    if (!targetId) { scrolledTarget.current = null; return; }
+    if (scrolledTarget.current === targetId) return;
+    const row = [...document.querySelectorAll<HTMLElement>("[data-job]")].find(
+      (el) => el.dataset.job === targetId,
+    );
+    if (row) scrolledTarget.current = targetId;
+    row?.scrollIntoView({ block: "center" });
+    row
+      ?.querySelector<HTMLButtonElement>("button")
+      ?.focus({ preventScroll: true });
+  }, [targetId, view]);
+  const gameByRelease = useMemo(
+    () =>
+      new Map(games.flatMap((g) => g.releases.map((r) => [r.id, g] as const))),
+    [games],
+  );
+  const groups = {
+    Active: jobs.filter((j) => !inactive(j) && j.status !== "error"),
+    Finished: jobs.filter((j) => j.status === "complete"),
+    Failed: jobs.filter((j) => j.status === "error"),
+    Cancelled: jobs.filter((j) => j.status === "cancelled"),
+  };
+  const queued = jobs.filter(waiting);
+  function restoreFocus() {
+    requestAnimationFrame(() => {
+      if (document.activeElement === document.body && !document.querySelector(".queue-row, .xb-row, .pn-tile[data-queue-key]"))
+        document
+          .querySelector<HTMLButtonElement>(
+            ".download-tabs [aria-pressed=true]",
+          )
+          ?.focus({ preventScroll: true });
+    });
+  }
+  async function run(job: Job, name: string, remove = false) {
+    if (job.removingFiles) return;
+    if (name === "power" && powerJobAction(job, power)) { setMessage(""); setPowerJob({ job, enabled: !(power?.enabled && power.jobId === job.id) }); return; }
+    if (name === "remove" || name === "forget") { setCancel(null); setHistoryJobs([job]); return; }
+    if (name === "packages") { setError(""); setInstallationJob(job.id); return; }
+    setBusy(job.id);
+    setError("");
+    setMessage("");
+    try {
+      await action(job.id, name, remove);
+      setCancel(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy("");
+      restoreFocus();
+    }
+  }
+  function clearSelectedHistory() {
+    setHistoryJobs(jobs.filter(j => !j.removingFiles && j.status === (view === "Cancelled" ? "cancelled" : "complete")));
+  }
+  // The dialogs every layout shares: archive password, cancel or delete, clear history.
+  const dialogs = (
+    <>
+      {powerJob && <PowerJobDialog {...powerJob} refresh={refresh} close={() => setPowerJob(null)} done={message => { setPowerJob(null); setMessage(message); restoreFocus(); }} />}
+      {historyJobs.length > 0 && <HistoryRemoval key={historyJobs.map(job=>job.id).join(",")} jobs={historyJobs} close={()=>setHistoryJobs([])} done={async message=>{await refresh();setHistoryJobs([]);setMessage(message);restoreFocus();}}/>}
+      {installationJob && jobs.find(j => j.id === installationJob) && <InstallationDialog
+        job={jobs.find(j => j.id === installationJob)!} close={() => { if (!busy) setInstallationJob(""); }} run={run} busy={!!busy} error={error} deletePackages={deletePackages} />}
+      {passwordJob && <Modal title={t("Enter archive password")} close={() => { if (!busy) { setPasswordJob(null); setArchivePassword(""); } }}>
+        <form className="archive-password-form" onSubmit={e => { e.preventDefault(); void retryExtraction(); }}>
+          <h2>{t("Enter archive password")}</h2>
+          <p>{t("Retry extraction using the downloaded archive. Nothing will be downloaded again.")}</p>
+          <label>{t("Archive password")}<input type="password" autoComplete="off" data-initial-focus autoFocus maxLength={128}
+            value={archivePassword} onChange={e => setArchivePassword(e.target.value)} disabled={!!busy} /></label>
+          {error && <p role="alert">{t(error)}</p>}
+          <div className="actions"><button className="primary" type="submit" disabled={!!busy || !archivePassword}>{t("Retry extraction")}</button>
+            <button type="button" disabled={!!busy} onClick={() => { setPasswordJob(null); setArchivePassword(""); }}>{t("Cancel")}</button></div>
+        </form>
+      </Modal>}
+      {cancel && (
+        <Modal
+          title={
+            cancel.status === "cancelled"
+              ? t("Delete download")
+              : t("Cancel download")
+          }
+          close={() => !busy && setCancel(null)}
+        >
+          <h2>
+            {cancel.status === "cancelled"
+              ? forget
+                ? t("Remove from history?")
+                : t("Delete this cancelled download?")
+              : t("Cancel this download?")}
+          </h2>
+          <p>
+            {cancel.status === "cancelled"
+              ? forget
+                ? t(
+                    "Only the history entry will be removed. Any partial file stays on its drive and must be deleted before downloading there again.",
+                  )
+                : t(
+                    "Delete the partial file and remove this entry. If the file is already gone, the entry will still be removed. Completed files are kept.",
+                  )
+              : t(
+                  "Keep the partial file to resume later, or delete only the partial file.",
+                )}
+          </p>
+          {error && (
+            <p className="job-error" role="alert">
+              {t(error)}
+            </p>
+          )}
+          <div className="dialog-actions">
+            {cancel.status === "cancelled" ? (
+              <>
+                <button
+                  className="danger"
+                  disabled={!!busy}
+                  onClick={() => void run(cancel, forget ? "forget" : "delete")}
+                >
+                  {forget ? t("Remove from history") : t("Delete download")}
+                </button>
+                {!forget && (
+                  <button
+                    disabled={!!busy}
+                    onClick={() => {
+                      setForget(true);
+                      setError("");
+                    }}
+                  >
+                    {t("Remove from history")}
+                  </button>
+                )}
+              </>
+            ) : (
+              <>
+                <button
+                  onClick={() => void run(cancel, "cancel")}
+                  disabled={!!busy}
+                >
+                  {t("Keep partial file")}
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => void run(cancel, "cancel", true)}
+                  disabled={!!busy}
+                >
+                  {t("Delete partial file")}
+                </button>
+              </>
+            )}
+            <button disabled={!!busy} onClick={() => setCancel(null)}>
+              {t("Go back")}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+    </>
+  );
+  if (iface === "crossbar")
+    return (
+      <CrossbarDownloads
+        groups={groups}
+        queued={queued}
+        view={view}
+        setView={(v) => {
+          setView(v);
+          setMessage("");
+        }}
+        targetId={targetId}
+        gameByRelease={gameByRelease}
+        drives={drives}
+        power={power}
+        busy={busy}
+        error={error}
+        message={message}
+        run={run}
+        cancel={(job) => {
+          setForget(false);
+          setError("");
+          setCancel(job);
+        }}
+        password={(job) => {
+          setArchivePassword("");
+          setError("");
+          setPasswordJob(job);
+        }}
+        clear={() => clearSelectedHistory()}
+        browse={browse}
+        openLibrary={openLibrary}
+        dialogs={dialogs}
+      />
+    );
+  if (iface === "panorama")
+    return (
+      <QueuePosition resetKey={iface}><PanoramaDownloads
+        groups={groups}
+        queued={queued}
+        targetId={targetId}
+        gameByRelease={gameByRelease}
+        drives={drives}
+        power={power}
+        concurrent={concurrent}
+        busy={busy}
+        error={error}
+        message={message}
+        run={run}
+        cancel={(job) => {
+          setForget(false);
+          setError("");
+          setCancel(job);
+        }}
+        password={(job) => {
+          setArchivePassword("");
+          setError("");
+          setPasswordJob(job);
+        }}
+        clear={(v) => {
+          // The clear dialog and its request follow the view.
+          setView(v);
+          clearSelectedHistory();
+        }}
+        browse={browse}
+        openLibrary={openLibrary}
+        dialogs={dialogs}
+      /></QueuePosition>
+    );
+  return (
+    <QueuePosition resetKey={`${iface}:${view}`}><section className="page downloads">
+      <div className="page-heading">
+        <h1>{t("Downloads")}</h1>
+        <p>
+          {tn(groups.Active.length, "{count} active", "{count} active")} ·{" "}
+          {tn(
+            groups.Failed.length,
+            "{count} needs attention",
+            "{count} need attention",
+          )}
+        </p>
+      </div>
+      <div className="download-toolbar">
+        <div
+          className="download-tabs"
+          role="group"
+          aria-label={t("Download views")}
+        >
+          {(
+            [
+              /* i18n */ "Active",
+              /* i18n */ "Finished",
+              /* i18n */ "Failed",
+              /* i18n */ "Cancelled",
+            ] as const
+          ).map((v) => (
+            <button
+              key={v}
+              aria-pressed={view === v}
+              onClick={() => {
+                setView(v);
+                setMessage("");
+              }}
+            >
+              {t(v)} <span>{groups[v].length}</span>
+            </button>
+          ))}
+        </div>
+        {(view === "Finished" || view === "Cancelled") &&
+          groups[view].length > 0 && (
+            <button disabled={!!busy} onClick={() => clearSelectedHistory()}>
+              {view === "Cancelled"
+                ? t("Clear cancelled history")
+                : t("Clear finished history")}
+            </button>
+          )}
+      </div>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      {message && (
+        <p className="notice" role="status">
+          {message}
+        </p>
+      )}
+      {!groups[view].length ? (
+        <div className="empty compact">
+          <Icon name={view === "Finished" ? "check" : "download"} />
+          <h2>
+            {view === "Active"
+              ? t("Nothing in progress")
+              : view === "Failed"
+                ? t("No failed downloads")
+                : view === "Cancelled"
+                  ? t("No cancelled downloads")
+                  : t("No finished downloads")}
+          </h2>
+          <p>
+            {view === "Active"
+              ? t("Choose a game to add it to your queue.")
+              : view === "Failed"
+                ? t("Downloads that need your attention appear here.")
+                : view === "Cancelled"
+                  ? t(
+                      "Cancelled downloads appear here. Kept partial files can be resumed.",
+                    )
+                  : t("Successfully completed downloads appear here.")}
+          </p>
+          <button className="primary" onClick={browse}>
+            {t("Browse games")}
+          </button>
+        </div>
+      ) : (
+        <div className="queue">
+          {groups[view].map((j) => {
+            const g = gameByRelease.get(j.releaseId),
+              r = g?.releases.find((r) => r.id === j.releaseId);
+            const title = g?.title || j.title || j.filename;
+            const active = [
+              "queued",
+              "downloading",
+              "retrying",
+              "verifying",
+              "waiting-extraction",
+              "inspecting",
+              "extracting",
+            ].includes(j.status);
+            // While extracting, progress is the extraction's.
+            const extracting = j.status === "extracting";
+            const done = extracting ? j.extracted || 0 : j.received,
+              total = extracting ? j.extractTotal || 0 : j.total;
+            const progress =
+              total > 0
+                ? Math.min(100, Math.max(0, (100 * done) / total))
+                : 0;
+            const position = queued.findIndex((q) => q.id === j.id);
+            const seconds = Math.max(
+              0,
+              Math.ceil(j.retryAt - Date.now() / 1000),
+            );
+            const drive = drives.find((d) => d.id === j.storageId);
+            return (
+              <article
+                className="queue-row"
+                key={j.id}
+                data-job={j.id}
+                data-queue-key={j.id}
+                tabIndex={-1}
+                aria-label={title}
+              >
+                <Artwork
+                  key={g?.cover || "/orbit.svg"}
+                  src={g?.cover || "/orbit.svg"}
+                  fallbackSrc={g?.coverFallback}
+                  className={g ? undefined : "queue-placeholder"}
+                  alt=""
+                  decoding="async"
+                  referrerPolicy="no-referrer"
+                />
+                <div className="queue-info">
+                  <div className="queue-title">
+                    <h2>{title}</h2>
+                    <span className={`status ${j.status}`}>
+                      {j.status === "complete" && <Icon name="check" />}{" "}
+                      {t(statusLabels[j.status] || j.status)}
+                    </span>
+                  </div>
+                  <p>
+                    {r && `${r.provider} · ${formatLabel(r)} · `}
+                    {j.delivery === "torbox" && `${t("via TorBox")} · `}
+                    {drive ? placeName(drive.label) : j.storageId}
+                    {!drive && j.status !== "complete"
+                      ? ` · ${t("Reconnect this drive")}`
+                      : ""}
+                  </p>
+                  <progress
+                    max="100"
+                    value={progress}
+                    aria-label={t("{title} progress", { title })}
+                  />
+                  <div className="transfer-meta">
+                    <span>
+                      {extracting && `${t("Extracting")} · `}
+                      {bytes(done)} / {bytes(total)} ·{" "}
+                      {formatNumber(progress / 100, {
+                        style: "percent",
+                        minimumFractionDigits: 1,
+                        maximumFractionDigits: 1,
+                      })}
+                    </span>
+                    <span>
+                      {j.status === "retrying"
+                        ? seconds > 0
+                          ? retryWait(seconds)
+                          : t("Waiting to retry…")
+                        : j.speed > 0
+                          ? timeLeft(bytes(j.speed), (total - done) / j.speed)
+                          : j.status === "complete"
+                            ? j.verification === "sha256"
+                              ? t("SHA-256 verified")
+                              : t("Size verified")
+                            : t("{size} remaining", {
+                                size: bytes(Math.max(0, j.total - j.received)),
+                              })}
+                    </span>
+                  </div>
+                  {j.deliveryPhase &&
+                    ["queued", "downloading"].includes(j.status) && (
+                      <p className="fine">{t(j.deliveryPhase)}</p>
+                    )}
+                  {j.error && <p className="job-error">{t(j.error)}</p>}
+                  {j.removingFiles && <p role="status">{t("Deleting downloaded files…")}</p>}
+                  {j.removalError && <p className="job-error" role="alert">{t(j.removalError)}</p>}
+                  {j.status === "cancelled" && j.received > 0 && (
+                    <p className="fine">
+                      {t(
+                        "Partial file kept. Resume it, or delete the partial file before removing this entry.",
+                      )}
+                    </p>
+                  )}
+                  {j.status === "complete" && j.path && (
+                    <p className="download-location">
+                      <span>{t("Location")}</span>
+                      <code dir="ltr">{j.path}</code>
+                    </p>
+                  )}
+                  <InstallationSummary job={j} />
+                  <div className="queue-actions">
+                    {j.status === "complete" && <button disabled={!!busy} onClick={() => void run(j, "packages")}>{installationLabel(j)}</button>}
+                    {j.canEnterArchivePassword && <button disabled={!!busy || !drive} onClick={() => {
+                      setArchivePassword(""); setError(""); setPasswordJob(j);
+                    }}>{t("Enter archive password")}</button>}
+                    {j.status !== "complete" ? (
+                      <>
+                        <button
+                          disabled={!!busy || (!active && !drive)}
+                          onClick={() =>
+                            void run(
+                              j,
+                              active
+                                ? "pause"
+                                : j.status === "error"
+                                  ? "retry"
+                                  : "resume",
+                            )
+                          }
+                        >
+                          {active
+                            ? t("Pause")
+                            : j.status === "error"
+                              ? t("Retry download")
+                              : j.status === "cancelled" && !j.received
+                                ? t("Start again")
+                                : t("Resume")}
+                        </button>
+                        <button
+                          disabled={!!busy}
+                          onClick={() => {
+                            setForget(false);
+                            setError("");
+                            setCancel(j);
+                          }}
+                        >
+                          {j.status === "cancelled"
+                            ? t("Delete download")
+                            : t("Cancel")}
+                        </button>
+                      </>
+                    ) : null}
+                    {j.canRefreshLink && (
+                      <button disabled={!!busy} onClick={() => void run(j, "refresh-link")}>
+                        {t("Refresh download link")}
+                      </button>
+                    )}
+                    {waiting(j) && (
+                      <div
+                        className="queue-order"
+                        role="group"
+                        aria-label={t("Queue position for {title}", { title })}
+                      >
+                        <button
+                          disabled={!!busy || position <= 0}
+                          aria-label={t("Move {title} up", { title })}
+                          onClick={() => void run(j, "move-up")}
+                        >
+                          {t("↑ Move up")}
+                        </button>
+                        <button
+                          disabled={!!busy || position === queued.length - 1}
+                          aria-label={t("Move {title} down", { title })}
+                          onClick={() => void run(j, "move-down")}
+                        >
+                          {t("↓ Move down")}
+                        </button>
+                      </div>
+                    )}
+                    {inactive(j) &&
+                      (j.status === "complete" || j.received === 0) && (
+                        <button
+                          disabled={!!busy}
+                          onClick={() => void run(j, "remove")}
+                        >
+                          {t("Remove from history")}
+                        </button>
+                      )}
+                    {powerJobAction(j, power, !!busy) && <button disabled={!!busy || !!j.removingFiles} onClick={() => void run(j, "power")}>{t(powerJobAction(j, power)!.label)}</button>}
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+      {dialogs}
+    </section></QueuePosition>
+  );
+}

@@ -1,0 +1,30 @@
+Review scores and estimated playtimes
+
+Some optional catalogue records are adapted from these independently published datasets:
+
+Zaire Ali, HowLongToBeat Games Scraper (2/16/2025), snapshot published 17 February 2025.
+https://www.kaggle.com/datasets/zaireali/howlongtobeat-games-scraper-2162025
+Licence: Creative Commons Attribution-ShareAlike 4.0 International
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Zaire Ali, Metacritic Games Scraper (2/15/2025), snapshot published 16 February 2025.
+https://www.kaggle.com/datasets/zaireali/metacritic-games-scrape
+Licence: Creative Commons Attribution-ShareAlike 4.0 International
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Sina Ghafouri, Video Games on Metacritic.com, snapshot published 5 March 2023.
+https://www.kaggle.com/datasets/sinaghafouri/video-games-on-metacriticcom
+Licence: CC0 1.0 Universal Public Domain Dedication
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Orbit's adaptations select exact game/edition and supported-platform matches,
+exclude ambiguous records, require at least three playtime submissions per style,
+and convert documented average playtimes in seconds to rounded minutes.
+Platform-specific critic scores are kept separate from scores for other platforms.
+
+The adapted CC BY-SA records are available under CC BY-SA 4.0. That licence
+applies to those metadata records, separately from Orbit's application code and
+other catalogue fields. Per-record source, licence and snapshot provenance are
+retained. No review text, player reviews or individual user submissions are included.
+Metacritic and HowLongToBeat are credited as the original score/playtime services;
+their inclusion does not imply endorsement of Orbit.

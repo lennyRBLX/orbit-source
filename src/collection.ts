@@ -1,0 +1,152 @@
+import type { Game, Job, LibraryGame, Release, Storage } from "./types";
+import { gamePlatform } from "./platform";
+
+export function downloadSpacePlan(
+  release: Release,
+  drive: Storage,
+  jobs: Job[],
+) {
+  const planned = jobs.some(
+    (job) =>
+      job.releaseId === release.id &&
+      job.storageId === drive.id &&
+      job.status !== "complete" &&
+      job.status !== "cancelled",
+  );
+  // Download again starts from zero. A cancelled record is not reusable data:
+  // its file may have been deleted manually or belong to a disconnected drive.
+  // Only the download: Orbit checks for room to unpack an archive just before
+  // unpacking it, so games can be queued before that room exists.
+  const after = drive.projectedFreeBytes - (planned ? 0 : release.sizeBytes);
+  return { planned, after, enough: after >= 16 * 1024 ** 2 };
+}
+
+// Where a new download of this option goes unless the user picks a drive: the
+// drive already downloading it, the console's preferred drive while it has
+// room, then the drive with the most room left. When none has room, the
+// preferred drive, then the first external.
+export function defaultDrive(
+  drives: Storage[],
+  preferred: string | undefined,
+  release: Release,
+  jobs: Job[],
+) {
+  let best: Storage | undefined, room = 0;
+  const plans = drives.map((drive) => downloadSpacePlan(release, drive, jobs));
+  const queued = drives.find((_, i) => plans[i].planned);
+  if (queued) return queued;
+  for (const [i, drive] of drives.entries()) {
+    const plan = plans[i];
+    if (!plan.enough) continue;
+    if (drive.id === preferred) return drive;
+    if (!best || plan.after > room) { best = drive; room = plan.after; }
+  }
+  return best || drives.find((d) => d.id === preferred) || drives.find((d) => d.external) || drives[0];
+}
+
+export interface CollectionState {
+  // English, marked for the catalogue; translated where it is shown.
+  label: string;
+  kind: "download" | "library" | "related";
+  job?: Job;
+  libraryGame?: LibraryGame;
+}
+const rank: Record<Job["status"], number> = {
+  downloading: 0,
+  verifying: 1,
+  "waiting-extraction": 1,
+  inspecting: 1,
+  extracting: 1,
+  queued: 2,
+  retrying: 3,
+  paused: 4,
+  error: 5,
+  complete: 6,
+  cancelled: 7,
+};
+const labels: Record<Job["status"], string> = {
+  downloading: /* i18n */ "Downloading",
+  verifying: /* i18n */ "Verifying",
+  "waiting-extraction": /* i18n */ "Waiting to unpack",
+  inspecting: /* i18n */ "Inspecting archive",
+  extracting: /* i18n */ "Extracting",
+  queued: /* i18n */ "Queued",
+  retrying: /* i18n */ "Retrying",
+  paused: /* i18n */ "Paused",
+  error: /* i18n */ "Needs attention",
+  complete: /* i18n */ "Downloaded",
+  cancelled: /* i18n */ "Cancelled",
+};
+export function releaseState(
+  release: Release,
+  jobs: Job[],
+  games: LibraryGame[],
+): CollectionState | undefined {
+  // A catalogue revision must not relabel a saved job as a different file.
+  const job = jobs
+    .filter(
+      (j) =>
+        j.releaseId === release.id &&
+        j.titleId === release.titleId &&
+        j.format === release.format &&
+        j.filename === release.filename &&
+        j.total === release.sizeBytes &&
+        j.status !== "cancelled",
+    )
+    .sort((a, b) => rank[a.status] - rank[b.status])[0];
+  if (job && job.status !== "complete")
+    return { label: labels[job.status], kind: "download", job };
+  const candidates = (release.addonId ? [] : games).filter(
+    (g) =>
+      g.titleId === release.titleId &&
+      g.platform === gamePlatform(release) &&
+      (g.onDrive || g.installed),
+  );
+  // ShadowMount does not expose a trustworthy version. Do not suppress a versioned
+  // option on the strength of its title ID, a display name or an old download record.
+  const exact = candidates.find(
+    (g) =>
+      g.onDrive &&
+      g.format === release.format &&
+      !release.version &&
+      g.path.split("/").pop() === release.filename &&
+      (g.sizeBytes === null || g.sizeBytes === release.sizeBytes),
+  );
+  if (exact)
+    return {
+      label: /* i18n */ "In Library",
+      kind: "library",
+      libraryGame: exact,
+    };
+  if (job) return { label: /* i18n */ "Downloaded", kind: "download", job };
+  if (candidates.length)
+    return {
+      label: /* i18n */ "Related copy in Library",
+      kind: "related",
+      libraryGame: candidates[0],
+    };
+}
+// A copy of the game installed on the PS5 or on one of its drives, as Library
+// lists it: the same title ID and platform as one of its options. Add-ons don't count.
+export function inLibrary(game: Game, games: LibraryGame[]): boolean {
+  return game.releases.some(
+    (release) =>
+      !release.addonId &&
+      games.some((g) => g.titleId === release.titleId && g.platform === gamePlatform(release) && (g.onDrive || g.installed)),
+  );
+}
+export function gameState(
+  game: Game,
+  jobs: Job[],
+  library: LibraryGame[],
+): CollectionState | undefined {
+  const states = game.releases
+    .map((r) => releaseState(r, jobs, library))
+    .filter((s): s is CollectionState => !!s);
+  return (
+    states.find((s) => s.job && s.job.status !== "complete") ||
+    states.find((s) => s.kind === "library") ||
+    states.find((s) => s.kind === "download") ||
+    states[0]
+  );
+}
