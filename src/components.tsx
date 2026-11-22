@@ -228,7 +228,9 @@ export const GameTile = memo(function GameTile({
       <span className="tile-title"><bdi>{game.title}</bdi></span>
       <InsightSummary insights={game.insights} />
       {game.addonId && <span className="tile-addon-info"><span><bdi>{game.baseGameTitle}</bdi></span><span>{t(addonTypes[game.addonType || "content-pack"])}</span></span>}
-      {game.platform === "ps4" && <span className="tile-platform">PS4</span>}
+      {(game.homebrew || game.platform === "ps4") && (
+        <span className="tile-platform">{game.homebrew ? t("Homebrew") : "PS4"}</span>
+      )}
       {status && <span className="tile-collection-state">{t(status)}</span>}
       {favorite && (
         <span className="tile-favorite" aria-label={t("Favourite")}>

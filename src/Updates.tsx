@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { bytes } from "./types";
-import type { UpdateStatus as Status, TvAppStatus } from "./updateStatus";
+import type { UpdateStatus as Status } from "./updateStatus";
 import { t } from "./i18n";
 import { rich } from "./Rich";
 import {
@@ -14,7 +14,6 @@ import {
 export function Updates({ onStopped }: { onStopped: () => void }) {
   const [restart, setRestart] = useState(() => readRestart(restartStorage()));
   const [status, setStatus] = useState<Status | null>(null);
-  const [tv, setTv] = useState<TvAppStatus | null>(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
   const [confirmStop, setConfirmStop] = useState(false);
@@ -36,10 +35,8 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
       loading = true;
       try {
         const next = await api<Status>("/updates");
-        const tvNext = await api<TvAppStatus>("/tv-app").catch(() => null);
         if (active) {
           setStatus(next);
-          setTv(tvNext);
           setError("");
           if (next.phase !== "restarting") setRestarting(false);
           // Update Orbit reached its restart (from here or another device): check what comes back.
@@ -105,7 +102,7 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
     }
     throw new Error(t("Update interrupted. Try again."));
   }
-  // One press: confirm what's newer if the last check is old, then install it all.
+  // One press: confirm what's newer if the last check is old, then install it and restart.
   async function updateAll() {
     if (!status) return;
     setSending(true);
@@ -115,19 +112,13 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
       const needed = (s: Status) =>
         s.updateAvailable &&
         !(s.restartRequired && s.savedVersion === s.latestVersion);
-      let service = status,
-        app = tv;
+      let service = status;
       // A check that failed says why (no network, GitHub's limit) better than the install would.
       if (needed(service) && stale(service.checkedAt)) {
         await api("/updates", { action: "check" });
         service = await settle<Status>("/updates");
         if (service.phase === "error" && service.error)
           throw new Error(service.error);
-      }
-      if (app?.updateAvailable && stale(app.checkedAt)) {
-        await api("/tv-app", { action: "check" });
-        app = await settle<TvAppStatus>("/tv-app");
-        if (app.phase === "error" && app.error) throw new Error(app.error);
       }
       const next = await api<Status>("/updates", {
         action: "update-all",
@@ -136,9 +127,6 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
               serviceVersion: service.latestVersion,
               serviceChecksum: service.checksum,
             }
-          : {}),
-        ...(app?.updateAvailable
-          ? { tvAppVersion: app.latestVersion, tvAppChecksum: app.checksum }
           : {}),
       });
       setStatus(next);
@@ -163,7 +151,6 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
       : null;
   const updating =
     !!status?.updateAll && (status.busy || status.phase === "restarting");
-  const tvUpdate = !!tv?.available && tv.updateAvailable;
   // A release that's already saved only needs a restart, offered below.
   const serviceUpdate =
     !!status?.updateAvailable &&
@@ -174,10 +161,7 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
     Math.ceil(((status?.retryAt || 0) * 1000 - now) / 1000),
   );
   // After a failed install, Orbit asks for a pause before the next one.
-  const updateWait = Math.max(
-    serviceUpdate ? wait : 0,
-    tvUpdate ? Math.ceil(((tv?.retryAt || 0) * 1000 - now) / 1000) : 0,
-  );
+  const updateWait = serviceUpdate ? wait : 0;
   const checkWait = Math.max(
     wait,
     Math.ceil(((status?.checkAfter || 0) * 1000 - now) / 1000),
@@ -279,36 +263,23 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
           ) : (
             <>
               {(serviceUpdate ||
-                tvUpdate ||
                 updating ||
                 (status.updateAll && status.phase === "updated")) && (
                 <div className="notice update-all" role="status">
                   <strong>{t("Update Orbit")}</strong>
                   <p>
-                    {serviceUpdate && tvUpdate
-                      ? t(
-                          "TV app {tv} and download service {service} are available.",
-                          {
-                            tv: tv!.latestVersion,
-                            service: status.latestVersion,
-                          },
-                        )
-                      : serviceUpdate
-                        ? t("Download service {version} is available.", {
-                            version: status.latestVersion,
-                          })
-                        : tvUpdate
-                          ? t("TV app {version} is available.", {
-                              version: tv!.latestVersion,
-                            })
-                          : ""}
+                    {serviceUpdate
+                      ? t("Download service {version} is available.", {
+                          version: status.latestVersion,
+                        })
+                      : ""}
                   </p>
                   <p className="fine">
                     {t(
-                      "Orbit saves both updates. If automatic restart is unavailable, start the saved service from your payload manager.",
+                      "Orbit saves the update. If automatic restart is unavailable, start the saved service from your payload manager.",
                     )}
                   </p>
-                  {(serviceUpdate || tvUpdate) && !updating && (
+                  {serviceUpdate && !updating && (
                     <div className="dialog-actions">
                       <button
                         className="primary"
@@ -320,36 +291,21 @@ export function Updates({ onStopped }: { onStopped: () => void }) {
                     </div>
                   )}
                   <p className="fine">
-                    {status.updateAll && status.phase === "tv-app" && tv?.busy
-                      ? t("Downloading the TV app: {received} of {size}", {
-                          received: bytes(tv.received),
-                          size: bytes(tv.size),
+                    {status.updateAll && status.phase === "downloading"
+                      ? t("Downloading Orbit: {size}", {
+                          size: bytes(status.received),
                         })
-                      : status.updateAll && status.phase === "downloading"
-                        ? t("Downloading Orbit: {size}", {
-                            size: bytes(status.received),
-                          })
-                        : status.updateAll && status.phase === "saving"
-                          ? t("Saving the verified release…")
-                          : status.phase === "restarting"
-                            ? t("Restarting Orbit…")
-                            : (serviceUpdate || tvUpdate) && updateWait > 0
-                              ? t(
-                                  "Please wait {seconds} s before another request.",
-                                  { seconds: updateWait },
-                                )
-                              : ""}
+                      : status.updateAll && status.phase === "saving"
+                        ? t("Saving the verified release…")
+                        : status.phase === "restarting"
+                          ? t("Restarting Orbit…")
+                          : serviceUpdate && updateWait > 0
+                            ? t(
+                                "Please wait {seconds} s before another request.",
+                                { seconds: updateWait },
+                              )
+                            : ""}
                   </p>
-                  {status.updateAll && status.tvAppUpdated && !status.busy && (
-                    <p>
-                      {t(
-                        "TV app {version} is installed. Close Orbit Store on your PS5 (press the PS button, then Close Application) and open it again from your Games row.",
-                        {
-                          version: status.tvAppUpdated,
-                        },
-                      )}
-                    </p>
-                  )}
                 </div>
               )}
               <p>

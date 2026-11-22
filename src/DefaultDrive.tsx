@@ -4,8 +4,8 @@ import { Icon } from "./components";
 import { placeName, t } from "./i18n";
 import { bytes, type Storage } from "./types";
 
-// The default drive, as the TV app's Storage settings choose it: new downloads start
-// with it selected under Save to. "" chooses automatically.
+// New downloads start with the default drive selected under Save to.
+// An empty preference chooses the drive automatically.
 export function DefaultDrive({
   drives,
   preferred,

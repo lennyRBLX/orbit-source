@@ -2099,7 +2099,6 @@ html:not(.pointer) .cn-shell .settings-section:focus {
 }
 /* Notices and problems: glass cards at the top right. */
 .cn-shell .update-notice,
-.cn-shell .native-app-notice,
 .cn-shell .interface-notice {
   position: fixed;
   top: 5.2rem;

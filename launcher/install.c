@@ -3,12 +3,14 @@
 #endif
 #include "install.h"
 #include "launcher.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -84,7 +86,8 @@ static int ensure_file(int parent, const char *name, const unsigned char *data, 
         }
         offset += (size_t)n;
     }
-    result = fsync(fd);
+    /* World-readable whatever the payload's umask: system services read the app files. */
+    result = fchmod(fd, 0644) || fsync(fd) ? -1 : 0;
 done: {
     int saved_error = errno;
     if (close(fd) && result == 0)
@@ -135,7 +138,18 @@ static void fingerprint(char out[18]) {
 static int open_dir(int parent, const char *name, bool create) {
     if (create && mkdirat(parent, name, 0755) && errno != EEXIST)
         return -1;
-    return openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    /* The installer already verified ownership. Let the system app service
+     * traverse these directories even if the loader started with a private umask. */
+    struct stat info;
+    if (fstat(fd, &info) || ((info.st_mode & 055) != 055 && fchmod(fd, (info.st_mode & 0777) | 055))) {
+        int error = errno;
+        close(fd);
+        errno = error;
+        return -1;
+    }
+    return fd;
 }
 
 static int absent(int parent, const char *name) {
@@ -145,12 +159,103 @@ static int absent(int parent, const char *name) {
     return errno == ENOENT ? 1 : -1;
 }
 
-int orbit_launcher_ensure_at(int state_fd, const char *user_parent, int (*prepare)(void),
-                             int (*register_title)(void)) {
-    int up = -1, user = -1, us = -1, result = -1;
-    const char *step = "open-app-parent";
-    last_error[0] = '\0';
+/* True for a non-empty regular file, never through a symlink. */
+static bool complete(int parent, const char *name) {
+    struct stat st;
+    return fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(st.st_mode) &&
+           st.st_size > 0;
+}
+
+/* True when the directory holds nothing but the allowed names. */
+static bool only_entries(int dir, const char *const *allowed, size_t count) {
+    int listing = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    DIR *d = listing < 0 ? NULL : fdopendir(listing);
+    if (!d) {
+        if (listing >= 0)
+            close(listing);
+        return false;
+    }
+    bool ok = true;
+    struct dirent *entry;
     errno = 0;
+    while (ok && (entry = readdir(d))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        ok = false;
+        for (size_t i = 0; i < count && !ok; i++)
+            ok = !strcmp(entry->d_name, allowed[i]);
+    }
+    if (errno)
+        ok = false;
+    closedir(d);
+    return ok;
+}
+
+/* An Orbit launcher whose state records were lost (for example after /data/orbit-store was
+ * reset): ORBT00001 holds only Orbit's sce_sys files and an Orbit local-deeplink manifest.
+ * Anything else is an unknown title and is never adopted or changed. */
+static bool orbit_layout(int up) {
+    static const char *const top[] = {"sce_sys"};
+    static const char *const sys[] = {"param.json", "icon0.png", "param.json.orbit-new",
+                                      "icon0.png.orbit-new"};
+    char text[4096];
+    size_t length = 0;
+    struct stat st;
+    bool result = false;
+    int us = -1, fd = -1;
+    int user = openat(up, title_id, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (user < 0 || !only_entries(user, top, sizeof top / sizeof top[0]))
+        goto done;
+    us = openat(user, "sce_sys", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (us < 0 || !only_entries(us, sys, sizeof sys / sizeof sys[0]))
+        goto done;
+    fd = openat(us, "param.json", O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size >= (off_t)sizeof text)
+        goto done;
+    while (length < (size_t)st.st_size) {
+        ssize_t n = read(fd, text + length, (size_t)st.st_size - length);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            goto done;
+        length += (size_t)n;
+    }
+    text[length] = '\0';
+    result = strlen(text) == length && strstr(text, "\"titleId\": \"ORBT00001\"") &&
+             strstr(text, "\"titleName\": \"Orbit Store\"") &&
+             strstr(text, "\"deeplinkUri\": \"http://127.0.0.1:");
+done:
+    if (fd >= 0)
+        close(fd);
+    if (us >= 0)
+        close(us);
+    if (user >= 0)
+        close(user);
+    return result;
+}
+
+int orbit_launcher_ensure_at(int state_fd, const char *user_parent, bool (*registration_missing)(void),
+                             int (*prepare)(void), int (*register_title)(void)) {
+    int lock = -1, up = -1, user = -1, us = -1, result = -1;
+    const char *step = "lock-launcher";
+    last_error[0] = '\0';
+    lock = openat(state_fd, "launcher.lock", O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (lock < 0)
+        goto done;
+    struct stat lock_info;
+    if (fstat(lock, &lock_info))
+        goto done;
+    if (!S_ISREG(lock_info.st_mode)) {
+        errno = EINVAL;
+        goto done;
+    }
+    /* A new payload can repair the shortcut while the service already runs.
+     * Serialize claims, file replacement and the native registration call. */
+    while (flock(lock, LOCK_EX))
+        if (errno != EINTR)
+            goto done;
+    step = "open-app-parent";
     up = open(user_parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (up < 0)
         goto done;
@@ -162,18 +267,26 @@ int orbit_launcher_ensure_at(int state_fd, const char *user_parent, int (*prepar
     int missing = absent(up, title_id);
     if (missing < 0)
         goto done;
+    bool adopted = false;
     if (!owned && !missing) {
-        errno = EEXIST;
-        goto done;
+        adopted = orbit_layout(up);
+        if (!adopted) {
+            /* Never change a title Orbit did not create. */
+            errno = EEXIST;
+            goto done;
+        }
+        puts("Orbit launcher: adopting the ORBT00001 icon left by an earlier Orbit.");
     }
     step = "verify-ready-record";
     int ready = matches(state_fd, "launcher-ready-v1", owner, sizeof owner - 1);
     if (ready < 0)
         goto done;
-    if (ready && !owned) {
+    if (ready && !owned && !adopted) {
         errno = EINVAL;
         goto done;
     }
+    if (adopted)
+        ready = 0; /* Claimed and registered again below, like a first installation. */
     if (ready && missing) {
         /* Removing the home-screen app leaves Orbit's state behind. Invalidate
          * its old registration before rebuilding, so a failed repair retries. */
@@ -202,7 +315,9 @@ int orbit_launcher_ensure_at(int state_fd, const char *user_parent, int (*prepar
     if (user < 0)
         goto done;
     step = "open-sce-sys-directory";
-    us = open_dir(user, "sce_sys", !ready);
+    /* The title is Orbit's here: restore a missing sce_sys instead of leaving a registered
+     * icon with nothing to start. */
+    us = open_dir(user, "sce_sys", true);
     if (us < 0)
         goto done;
     struct {
@@ -218,18 +333,43 @@ int orbit_launcher_ensure_at(int state_fd, const char *user_parent, int (*prepar
     int current =
         ready ? matches(state_fd, "launcher-files-v1", (const unsigned char *)build, strlen(build))
               : 1;
-    if (ready && current != 1) {
-        /* Installed by an older build: replace the owned files, then register the icon again.
-         * The record is written last, so a failed update is retried on the next start. */
+    bool intact = true, usable = true;
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+        intact = intact && matches(files[i].fd, files[i].name, files[i].data, files[i].length) == 1;
+        usable = usable && complete(files[i].fd, files[i].name);
+    }
+    /* The saved record certifies the previous registration. The PS5 can
+     * remove its Media entry while leaving Orbit's files and records behind. */
+    bool entry_missing = ready && registration_missing();
+    if (ready && current == 1 && intact && !entry_missing) {
+        result = 0;
+        goto done;
+    }
+    if (ready) {
+        /* Registered by an older build, or its files were removed or damaged since. The title
+         * is Orbit's: restore its files and registration as needed. The files record is
+         * written last, so a failed update is retried on the next start. */
         step = "prepare-app-update";
         errno = 0;
-        if (prepare())
+        bool registrable = !prepare();
+        if (!registrable && usable) {
+            /* The existing registration and its complete files remain usable; keep them. */
+            if (entry_missing)
+                goto done;
+            puts("Orbit launcher: registration unavailable; keeping the installed icon.");
+            result = 0;
             goto done;
+        }
         for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
             step = i ? "update-icon" : "update-manifest";
             if (matches(files[i].fd, files[i].name, files[i].data, files[i].length) != 1 &&
                 replace_file(files[i].fd, files[i].name, files[i].data, files[i].length))
                 goto done;
+        }
+        if (!registrable) {
+            /* The files are repaired. Recheck registration on the next start. */
+            result = entry_missing ? -1 : 0;
+            goto done;
         }
         step = "register-updated-title";
         errno = 0;
@@ -243,15 +383,13 @@ int orbit_launcher_ensure_at(int state_fd, const char *user_parent, int (*prepar
     }
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
         step = i ? "verify-or-write-icon" : "verify-or-write-manifest";
-        if (ready ? matches(files[i].fd, files[i].name, files[i].data, files[i].length) != 1
-                  : ensure_file(files[i].fd, files[i].name, files[i].data, files[i].length)) {
-            puts("Orbit launcher: app files differ, are missing, or cannot be written; preserved.");
+        /* Owned (or just created) here: files left by an older build or a failed attempt are
+         * replaced with complete copies, never through a symlink or over a directory. */
+        if (matches(files[i].fd, files[i].name, files[i].data, files[i].length) != 1 &&
+            replace_file(files[i].fd, files[i].name, files[i].data, files[i].length)) {
+            puts("Orbit launcher: app files are unsafe or cannot be written; preserved.");
             goto done;
         }
-    }
-    if (ready) {
-        result = 0;
-        goto done;
     }
     step = "register-title";
     errno = 0;
@@ -276,6 +414,8 @@ done:
         close(user);
     if (up >= 0)
         close(up);
+    if (lock >= 0)
+        close(lock);
     if (result < 0)
         printf("Orbit launcher is not ready: %s. Server remains available.\n", last_error);
     return result;

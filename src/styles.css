@@ -3394,3 +3394,25 @@ html.pointer .debrid-settings input:focus {
 .game-insights dl { display:flex; flex-wrap:wrap; gap:1rem 2rem; margin:.7rem 0; }
 .game-insights dt,.game-insights small { color:var(--text-3,#aaa); font-size:.8rem; }
 .game-insights dd { margin:.35rem 0; }
+
+.community-catalogues {
+  display: grid;
+  justify-items: start;
+  gap: 0.75rem;
+  margin-block-start: 1.5rem;
+}
+.community-catalogues h2 {
+  margin: 0;
+}
+.community-source,
+.community-add {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+}
+.community-source .source-row,
+.community-add input {
+  flex: 1;
+  min-width: 0;
+}

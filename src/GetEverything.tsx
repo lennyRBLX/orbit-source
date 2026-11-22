@@ -1,3 +1,4 @@
+import { releaseProvider } from "./types";
 // Get everything: the game and its DLC in one checklist, added to Downloads in
 // order with Download all (POST /api/v1/bundles), then each row's progress. One
 // model; each look draws it its own way.
@@ -50,7 +51,7 @@ export const rowTitle = (row: ChecklistRow) => (row.kind === "game" ? t("Game") 
 export const rowKind = (row: ChecklistRow) => (row.kind === "game" ? t("Game") : "DLC");
 
 // The source.
-export const rowSource = (row: ChecklistRow) => row.release.provider;
+export const rowSource = (row: ChecklistRow) => releaseProvider(row.release);
 
 export const progressLabel = (p: RowProgress) =>
   p === "added" ? t("Added") : p === "page" ? t("Open its page on your PS5") : p === "not-added" ? t("Not added") : t("Waiting");
@@ -225,7 +226,7 @@ function pageSteps(release: Release | undefined) {
     return t("Complete verification if shown, then wait. Orbit will check the generated download link automatically.");
   if (release.sourceId === "datanodes")
     return t("Scroll to the bottom, select Continue to Download, then Free Download. Wait for the countdown and select Start Download.");
-  return t("On {provider}, complete any verification and select the site’s {button} button.", { provider: release.provider, button: t("Download") });
+  return t("On {provider}, complete any verification and select the site’s {button} button.", { provider: releaseProvider(release), button: t("Download") });
 }
 
 // The provider's page is open on the PS5 for the item in turn.
@@ -233,7 +234,7 @@ export function PageCard({ m, className = "everything-page" }: { m: Everything; 
   if (!m.pageItem) return null;
   return (
     <div className={className} role="status">
-      <strong>{t("The {provider} page is open on your PS5", { provider: m.pageItem.row?.release.provider || m.pageItem.item.title })}</strong>
+      <strong>{t("The {provider} page is open on your PS5", { provider: m.pageItem.row ? releaseProvider(m.pageItem.row.release) : m.pageItem.item.title })}</strong>
       <p>{pageSteps(m.pageItem.row?.release)} {t("Orbit then comes back and the next item starts.")}</p>
     </div>
   );
@@ -290,7 +291,7 @@ export function StoreEverything({ m, close }: { m: Everything; close: () => void
                     <strong><bdi>{rowTitle(row)}</bdi></strong>
                     <small>
                       {row.kind === "game" && row.release.version
-                        ? `${row.release.provider} · ${t("version {version}", { version: row.release.version })}`
+                        ? `${releaseProvider(row.release)} · ${t("version {version}", { version: row.release.version })}`
                         : rowSource(row)}
                     </small>
                   </span>
@@ -361,7 +362,7 @@ export function CrossbarEverything({ m, close }: { m: Everything; close: () => v
               <StateMark p={entry.progress} />
               <span>
                 <strong><bdi>{itemTitle(entry)}</bdi></strong>
-                {entry.row && <small> · {entry.row.release.provider}</small>}
+                {entry.row && <small> · {releaseProvider(entry.row.release)}</small>}
               </span>
               <span className="xb-everything-value">{progressLabel(entry.progress)}</span>
             </div>
@@ -381,7 +382,7 @@ export function CrossbarEverything({ m, close }: { m: Everything; close: () => v
                 <span className="xb-check" aria-hidden="true">{on && <Glyph name="check" size={14} stroke={3} />}</span>
                 <span>
                   <strong><bdi>{rowTitle(row)}</bdi></strong>
-                  <small> · {row.release.provider}</small>
+                  <small> · {releaseProvider(row.release)}</small>
                 </span>
                 <span className="xb-everything-value">{row.installed ? t("Installed") : bytes(row.release.sizeBytes)}</span>
               </button>

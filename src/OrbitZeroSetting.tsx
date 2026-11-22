@@ -4,8 +4,8 @@ import { t } from "./i18n";
 
 type Companion = { configured: boolean; address?: string; enabled?: boolean };
 
-// Orbit Zero, as the TV app's settings show it: the computer paired as a companion and
-// whether Orbit Zero mode is on. Only Orbit on the PS5 itself may turn the mode on or off.
+// Shows the paired computer and whether Orbit Zero mode is on.
+// Only Orbit on the PS5 itself may turn the mode on or off.
 export function OrbitZeroSetting({ onConsole }: { onConsole: boolean }) {
   const [companion, setCompanion] = useState<Companion | null>(null),
     [pending, setPending] = useState(false),

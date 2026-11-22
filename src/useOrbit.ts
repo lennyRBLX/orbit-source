@@ -50,10 +50,12 @@ export function useOrbit() {
         if (!alive.current) return;
         const key = JSON.stringify([
           sys.version,
+          sys.instanceId,
           sys.catalogueRevision,
           sourceSettings.noticeVersion,
           sourceSettings.acknowledged,
           sourceSettings.enabled,
+          sourceSettings.remoteGeneration,
           sourceSettings.options.map((source) => [
             source.id,
             source.releaseCount,

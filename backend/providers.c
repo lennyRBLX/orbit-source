@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "provider_network.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,14 +21,17 @@ static bool browser_file(const Release *r) {
     const char *suffix = !strcmp(r->format, "exFAT") ? ".exfat" :
                          !strcmp(r->format, "FFPFSC") ? ".ffpfsc" :
                          (!strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG")) ? ".pkg" : NULL;
-    if (!suffix && !r->archive_unverified && (strcmp(r->format, "Game folder") || !r->compression[0] || strncmp(r->title_id, "PPSA", 4))) return false;
+    if (!suffix && !r->archive_unverified && (strcmp(r->format, "Game folder") || !r->compression[0] ||
+        (!r->remote_page && strncmp(r->title_id, "PPSA", 4)))) return false;
     if (r->compression[0]) {
-        if (r->extracted_size <= 0 && !r->archive_unverified) return false;
+        if (r->extracted_size <= 0 && !r->archive_unverified && !r->remote_page) return false;
         suffix = !strcmp(r->compression, "zip") ? ".zip" :
                  !strcmp(r->compression, "7z") ? ".7z" :
                  !strcmp(r->compression, "rar") ? ".rar" : NULL;
     }
     size_t n = strlen(r->filename);
+    if (r->remote_page && suffix && !strcmp(suffix, ".pkg") && n > 5 && !strcasecmp(r->filename + n - 5, ".fpkg"))
+        suffix = ".fpkg";
     /* The provider filename remains exact; compression selects the actual
      * RAR decoder even when the published filename has a .7z suffix. */
     if (suffix && !strcmp(r->compression, "rar") && n > 3 &&
@@ -247,7 +251,7 @@ static const char *find_nocase(const char *text, const char *word) {
 }
 /* The file name in a Content-Disposition value: filename*=UTF-8''<encoded>
  * first, then filename="<name>" or filename=<name>. */
-static bool disposition_filename(const char *value, char *out, size_t cap) {
+bool provider_header_filename(const char *value, char *out, size_t cap) {
     for (const char *p = value; (p = find_nocase(p, "filename*=")); p += 10) {
         if (p != value && p[-1] != ';' && p[-1] != ' ') continue;
         const char *v = p + 10, *quote = strstr(v, "''");
@@ -285,9 +289,9 @@ bool provider_disposition_name(const char *url, char *out, size_t cap) {
         const char *v = p + 1 + strlen(key);
         char once[1024], twice[1024];
         if (!percent_decode(v, strcspn(v, "&#"), once, sizeof once)) return false;
-        if (disposition_filename(once, out, cap)) return true;
+        if (provider_header_filename(once, out, cap)) return true;
         return strchr(once, '%') && percent_decode(once, strlen(once), twice, sizeof twice) &&
-               disposition_filename(twice, out, cap);
+               provider_header_filename(twice, out, cap);
     }
     return false;
 }
@@ -342,6 +346,7 @@ static bool viking_storage_link(const Release *r) {
 
 /* Provider boundary: never turn metadata/page URLs into unverified downloads. */
 bool provider_url_supported(const Release *release) {
+    if (!strcmp(release->source, "remote")) return remote_https_url(release->url);
     if (!strcmp(release->id, "orbit-network-check"))
         return !strcmp(release->url,
                        "https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.19/LICENSE");
@@ -402,7 +407,7 @@ bool provider_supported(const Release *release) {
 #ifdef ORBIT_TEST
     /* Test binaries may parse the catalogue, but may only transfer fixtures. */
     return !strncmp(release->url, "http://127.0.0.1:", 17) &&
-           (!strcmp(release->source, "archive") || provider_browser_source(release->source));
+           (!strcmp(release->source, "archive") || !strcmp(release->source, "remote") || provider_browser_source(release->source));
 #else
     return provider_url_supported(release);
 #endif

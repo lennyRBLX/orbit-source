@@ -7,11 +7,7 @@ import {
   type Storage,
 } from "./types";
 import type { LibraryModel } from "./useLibrary";
-import {
-  GameActions,
-  LibraryFeedback,
-  StorageProgress,
-} from "./LibraryActions";
+import { GameActions, LibraryFeedback } from "./LibraryActions";
 import { Artwork } from "./Artwork";
 import { Select } from "./Select";
 import { useInfiniteList } from "./infiniteList";
@@ -207,7 +203,7 @@ function Inventory({
           <h1>{t("Scan your drives?")}</h1>
           <p>
             {t(
-              "ShadowMount will search its configured locations for games. It may register games on the console or mount detected sources. If a game is running, the scan may wait until it is safe.",
+              "Kraken Mount will look for new games in homebrew and etaHEN/games, and at the top of M.2 and USB drives, and add them to the home screen. If a game is running, the scan waits until it closes.",
             )}
           </p>
           <div className="dialog-actions">
@@ -377,10 +373,10 @@ function Inventory({
           <p>
             {busy
               ? t(
-                  "Reading installed titles and drive availability from ShadowMount.",
+                  "Reading Kraken Mount’s games and the games installed on your PS5.",
                 )
               : t(
-                  "Library uses ShadowMount’s local games API on your PS5. Start a version with that API enabled, then select Try again.",
+                  "Library lists the games Kraken Mount runs and the games installed on your PS5. Select Try again.",
                 )}
           </p>
           {!busy && (
@@ -393,7 +389,6 @@ function Inventory({
         </div>
       ) : (
         <>
-              <StorageProgress model={model} />
               {filters}
               {rows.length ? (
                 <div className="library-grid">
@@ -440,11 +435,7 @@ function Inventory({
                   <p>
                     {games.length
                       ? t("Try a different title, status or location.")
-                      : model.snapshot?.provider === "Kraken Mount"
-                        ? t("Kraken Mount hasn't added any games yet.")
-                        : t(
-                          "ShadowMount has not reported any installed or on-drive games yet.",
-                        )}
+                      : t("Kraken Mount hasn't added any games yet.")}
                   </p>
                   {games.length > 0 && (
                     <button onClick={reset}>
@@ -488,13 +479,6 @@ function Inventory({
             <p className="notice">
               {t(
                 "Saved snapshot. These statuses may have changed.",
-              )}
-            </p>
-          )}
-          {current.foundByOrbit && (
-            <p className="notice">
-              {t(
-                "Orbit found this game itself because your ShadowMount version doesn’t list games installed from PKG files. For the most complete list, update ShadowMount to 1.7beta5 or newer.",
               )}
             </p>
           )}
@@ -547,9 +531,7 @@ function Inventory({
                   ? bytes(current.sizeBytes)
                   : current.sizeStatus === "unavailable"
                     ? t("Unavailable")
-                    : snapshot?.measuring
-                      ? t("Measuring…")
-                      : t("Not measured")}
+                    : t("Not measured")}
               </dd>
             </div>
             <div>

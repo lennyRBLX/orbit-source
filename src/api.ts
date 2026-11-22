@@ -1,4 +1,5 @@
 import { t } from "./i18n";
+import type { RemoteSources } from "./types";
 
 const tokenKey = "orbit.pairing.v1";
 let token = (() => {
@@ -33,12 +34,15 @@ export class ApiError extends Error {
   }
 }
 // A slow Wi-Fi phone needs longer than 12 s for the whole game list.
-export async function api<T>(path: string, body?: unknown, { timeoutMs = 12000 }: { timeoutMs?: number } = {}): Promise<T> {
+export async function api<T>(path: string, body?: unknown, { timeoutMs = 12000, method = body === undefined ? "GET" : "POST" }: {
+  timeoutMs?: number;
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
+} = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`/api/v1${path}`, {
-      method: body === undefined ? "GET" : "POST",
+      method,
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -59,3 +63,12 @@ export async function api<T>(path: string, body?: unknown, { timeoutMs = 12000 }
     clearTimeout(timeout);
   }
 }
+
+
+export const remoteSources = () => api<RemoteSources>("/remote-sources");
+export const addRemoteSource = (url: string) => api<RemoteSources>("/remote-sources", { url });
+export const enableRemoteSource = (id: string, enabled: boolean) =>
+  api<RemoteSources>(`/remote-sources/${encodeURIComponent(id)}`, { enabled }, { method: "PATCH" });
+export const removeRemoteSource = (id: string) =>
+  api<RemoteSources>(`/remote-sources/${encodeURIComponent(id)}`, undefined, { method: "DELETE" });
+export const refreshRemoteSources = () => api<RemoteSources>("/remote-sources/refresh", {});

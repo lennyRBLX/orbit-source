@@ -1,3 +1,4 @@
+import { releaseProvider } from "../types";
 // Crossbar's Downloads: the queue as a list (Active first, then Failed,
 // Finished and Cancelled as folders), the focused download's buttons on its
 // row and a summary beside it. Actions and dialogs are Downloads' own.
@@ -116,7 +117,7 @@ export function CrossbarDownloads({
         : job.status === "error"
           ? [status, job.error && t(job.error)].filter(Boolean).join(" · ")
           : [
-              release ? `${release.provider} · ${formatLabel(release)}` : "",
+              release ? `${releaseProvider(release)} · ${formatLabel(release)}` : "",
               job.delivery === "torbox" ? t("via TorBox") : "",
               drive ? placeName(drive.label) : job.storageId,
               lost ? t("Reconnect this drive") : "",
@@ -166,7 +167,7 @@ export function CrossbarDownloads({
               </span>
             )}
             {focused && downloadFirmwareNote(job) && <span className="xb-row-fine">{downloadFirmwareNote(job)}</span>}
-            {focused && job.installation && <span className="xb-row-fine">{chainMessage(job.installation) || t(job.installation.packages.find(p => ["installing", "unconfirmed", "error", "installed"].includes(p.state))?.message || job.installation.krakenMessage || job.installation.shadowMountMessage)}</span>}
+            {focused && job.installation && <span className="xb-row-fine">{chainMessage(job.installation) || t(job.installation.packages.find(p => ["installing", "unconfirmed", "error", "installed"].includes(p.state))?.message || job.installation.krakenMessage || job.installation.message)}</span>}
             {focused && job.deliveryPhase && ["queued", "downloading"].includes(job.status) && (
               <span className="xb-row-fine">{t(job.deliveryPhase)}</span>
             )}

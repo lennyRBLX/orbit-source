@@ -74,7 +74,7 @@ export function narrowed(f: BrowseFilters, defaultSort: string) {
     f.minimumScore || f.playtimeRange || (f.playStyle && f.playStyle !== "main") ||
     f.query.trim() ||
     f.source.length ||
-    f.format.length ||
+    downloadFormats(f.format).length ||
     f.tags.length ||
     f.genres?.length ||
     f.hideInstalled ||
@@ -131,29 +131,39 @@ export const TORBOX_SOURCE = "torbox";
 // A download option matches when it passes every filter that applies to options; a game shows
 // in Browse when one of its options does.
 export function releaseMatches(r: Release, filters: BrowseFilters, torbox: ReadonlySet<string> = new Set()) {
-  if (filters.platform && gamePlatform(r) !== filters.platform) return false;
+  if (filters.platform && (r.homebrew ? "homebrew" : gamePlatform(r)) !== filters.platform) return false;
   if (filters.source.length && !filters.source.includes(r.sourceId) &&
       !(filters.source.includes(TORBOX_SOURCE) && torbox.has(r.sourceId)))
     return false;
-  if (filters.format.length && !filters.format.some((f) => releaseFormat(r) === f || r.compression?.toUpperCase() === f.toUpperCase()))
-    return false;
+  const formats = downloadFormats(filters.format);
+  if (formats.length && !formats.includes(releaseFormat(r))) return false;
   if (filters.region && (r.region || "unknown") !== filters.region) return false;
   const gb = r.sizeBytes / 1e9;
   return (
     !filters.size ||
-    (filters.size === "small"
+    (r.sizeBytes > 0 && (filters.size === "small"
       ? gb < 10
       : filters.size === "medium"
         ? gb >= 10 && gb < 50
         : filters.size === "large"
           ? gb >= 50 && gb < 100
-          : gb >= 100)
+          : gb >= 100))
   );
 }
-export const releaseFormat = (r: Release) => (r.assetCompression === "ZSTD" ? "ZSTD" : r.contentFormat === "LZ4" ? "LZ4" : r.format);
+export const releaseFormat = (r: Release): string => r.format;
+// The only formats Orbit downloads, archived or not; the service leaves every other one out of
+// the catalogue. Format's choices, in order, with their labels.
+export const DOWNLOAD_FORMATS: Record<string, string> = {
+  PKG: "PKG",
+  FPKG: "FPKG",
+  "Game folder": /* i18n */ "Game folder",
+};
+// A saved filter can name a format or archive type Orbit no longer offers: ignore it.
+export const downloadFormats = (values: readonly string[] = []) =>
+  values.filter((value) => Object.keys(DOWNLOAD_FORMATS).includes(value));
 // Any filter that narrows the options, not just the games.
 export const filtersOptions = (filters: BrowseFilters) =>
-  !!(filters.platform || filters.source.length || filters.format.length || filters.region || filters.size);
+  !!(filters.platform || filters.source.length || downloadFormats(filters.format).length || filters.region || filters.size);
 
 // The filters a Browse dropdown can count: one value each, or several (any of them).
 export type CountedFilter = "platform" | "region" | "size" | "addonType" | "hideInstalled" | "source" | "format" | "tags" | "genres" | "minimumScore" | "playtimeRange";

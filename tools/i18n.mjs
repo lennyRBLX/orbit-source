@@ -5,7 +5,8 @@
 //
 // English text is the key. Sources: t(), tn() and rich() calls and /* i18n */
 // marked strings in src/; the fixed messages Orbit's service sends (backend/*.{c,cpp});
-// the catalogue's genre names; and tr() calls in the TV app (app/src/orbit).
+// and the catalogue's genre names.
+import { execFileSync } from "node:child_process";
 import { readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -125,21 +126,6 @@ function fromService(file, add) {
   }
 }
 
-// The TV app: tr("..."), tr("... {name}", {...}), trn(count, "one", "other")
-// and /* i18n */ marked literals.
-function fromApp(file, add) {
-  const runs = cRuns(readFileSync(file, "utf8"));
-  for (let r = 0; r < runs.length; r++) {
-    const run = runs[r];
-    if (/\/\* i18n \*\/\s*$/.test(run.before) || /\btr\(\s*$/.test(run.before)) add(run.value);
-    else if (/\btrn\([^;"]*,\s*$/.test(run.before) && r + 1 < runs.length &&
-             /^\s*,\s*$/.test(runs[r + 1].before)) {
-      add(runs[r + 1].value, { one: run.value, other: runs[r + 1].value });
-      r++;
-    }
-  }
-}
-
 export function extract() {
   const keys = new Map();
   const add = (key, plural) => {
@@ -150,10 +136,9 @@ export function extract() {
   for (const file of files(join(root, "src"), /\.tsx?$/)) fromScript(file, add);
   for (const file of files(join(root, "backend"), /\.(?:c|cpp)$/))
     if (!/\/main\.c$/.test(file)) fromService(file, add);
-  for (const file of files(join(root, "app/src/orbit"), /\.(cpp|hpp)$/)) fromApp(file, add);
-  const catalogue = JSON.parse(readFileSync(join(root, "catalog/catalog.json"), "utf8"));
-  for (const row of catalogue)
-    for (const genre of (row.genre || "").split(/ \/ |,/)) if (genre.trim()) add(genre.trim());
+  const genres = JSON.parse(execFileSync("python3", [join(root, "tools/catalog.py"), "genres"], { encoding: "utf8" }));
+  for (const group of genres)
+    for (const genre of group.split(/ \/ |,/)) if (genre.trim()) add(genre.trim());
   return Object.fromEntries([...keys].sort(([a], [b]) => a.localeCompare(b, "en")));
 }
 

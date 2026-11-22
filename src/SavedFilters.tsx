@@ -3,7 +3,7 @@ import { useState } from "react";
 import { addonTypes } from "./AddonInfo";
 import { Modal } from "./components";
 import { t } from "./i18n";
-import { TAGS, narrowed, type BrowseFilters, type SavedFilter } from "./browse";
+import { DOWNLOAD_FORMATS, TAGS, downloadFormats, narrowed, type BrowseFilters, type SavedFilter } from "./browse";
 
 const SIZES: Record<string, string> = {
   small: /* i18n */ "Under 10 GB",
@@ -28,9 +28,9 @@ export function filterSummary(f: BrowseFilters, defaultSort: string, sources: Ma
   const parts = [
     f.query.trim() && `“${f.query.trim()}”`,
     f.collection === "favorites" && t("Favourites"),
-    f.platform.toUpperCase(),
+    f.platform === "homebrew" ? t("Homebrew") : f.platform.toUpperCase(),
     ...f.source.map((id) => sources.get(id) || id),
-    ...f.format,
+    ...downloadFormats(f.format).map((format) => t(DOWNLOAD_FORMATS[format])),
     ...f.tags.map((tag) => (TAGS[tag] ? t(TAGS[tag]) : tag)),
     ...(f.genres || []).map((genre) => t(genre)),
     f.addonType && t(addonTypes[f.addonType as keyof typeof addonTypes] || f.addonType),

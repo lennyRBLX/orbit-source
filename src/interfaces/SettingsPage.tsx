@@ -9,7 +9,6 @@ import { Appearance } from "./Appearance";
 import { LanguageSetting } from "../LanguageSetting";
 import { CatalogueUpdates } from "../CatalogueUpdates";
 import { Updates } from "../Updates";
-import { TvApp } from "../TvApp";
 import { Debrid } from "../Debrid";
 import { ArchiveAccount } from "../ArchiveAccount";
 import { Diagnostics } from "../Diagnostics";
@@ -26,7 +25,6 @@ export type SettingsSection =
   | "pair"
   | "catalogue"
   | "updates"
-  | "tvapp"
   | "zero"
   | "torbox"
   | "archive"
@@ -51,7 +49,7 @@ export const settingsGroups: { label: string; sections: { id: SettingsSection; l
   ] },
 ];
 const aliases: Partial<Record<SettingsSection, SettingsSection>> = {
-  language: "appearance", tvapp: "updates", payload: "updates", autostart: "updates",
+  language: "appearance", payload: "updates", autostart: "updates",
   torbox: "sources", archive: "sources", viking: "sources", zero: "pair",
 };
 export const settingsSections = settingsGroups.flatMap((g) => g.sections);
@@ -135,7 +133,7 @@ export function SettingsPage({
   const startup = <><div data-setting="payload"><PayloadManagers system={system} auto={auto} /></div><div data-setting="autostart"><StartAutomatically auto={auto} /></div>
     {auto.error && <p className="form-error" role="alert">{auto.error}</p>}</>;
   const accounts = <>{sources}<div data-setting="torbox"><Debrid /></div><div data-setting="archive"><ArchiveAccount /></div><div data-setting="viking"><VikingAccount /></div></>;
-  const updatePanels = <><Updates onStopped={() => setStopped(true)} />{!stopped && <><div data-setting="tvapp"><TvApp /></div>{startup}</>}</>;
+  const updatePanels = <><Updates onStopped={() => setStopped(true)} />{!stopped && startup}</>;
   const content: Partial<Record<SettingsSection, ReactNode>> = {
     appearance: <><Appearance page /><div data-setting="language"><LanguageSetting /></div></>,
     sources: accounts,

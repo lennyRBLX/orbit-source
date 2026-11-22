@@ -1,3 +1,4 @@
+import { releaseProvider } from "../types";
 import { useRetainedSelection } from "../QueuePosition";
 import { InstallationSummary } from "../Installation";
 // Panorama's Downloads: Active, Failed, Finished and Cancelled side by side as
@@ -198,7 +199,7 @@ export function PanoramaDownloads({
         glyph={job.status === "error" ? "warn" : undefined}
         kicker={
           focused && size === "large"
-            ? [extracting ? t("Extracting") : status, release?.provider, release && formatLabel(release)].filter(Boolean).join(" · ")
+            ? [extracting ? t("Extracting") : status, release && releaseProvider(release), release && formatLabel(release)].filter(Boolean).join(" · ")
             : undefined
         }
         title={title}

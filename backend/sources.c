@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "remote_sources.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -11,6 +12,7 @@ unsigned source_flag(const char *id) {
     if (!strcmp(id, "akirabox")) return ORBIT_SOURCE_AKIRABOX;
     if (!strcmp(id, "datanodes")) return ORBIT_SOURCE_DATANODES;
     if (!strcmp(id, "1fichier")) return ORBIT_SOURCE_ONEFICHIER;
+    if (!strcmp(id, "remote")) return ORBIT_SOURCE_REMOTE;
     return 0;
 }
 
@@ -20,6 +22,7 @@ bool source_enabled_locked(const Release *r) {
     /* The pinned connection diagnostic is not a game source. */
     if (!strcmp(r->id, "orbit-network-check"))
         return true;
+    if (!strcmp(r->source, "remote")) return remote_source_enabled_locked(r);
     return orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&
            orbit.sources.acknowledged_at > 0 && (orbit.sources.enabled & source_flag(r->source));
 }
@@ -29,15 +32,17 @@ cJSON *sources_json_locked(void) {
         const char *id, *label;
         bool ready;
     } providers[] = {{"vikingfile", "Vikingfile", true}, {"archive", "Archive.org", true},
-                     {"akirabox", "AkiraBox", true}, {"datanodes", "DataNodes", true}};
+                     {"akirabox", "AkiraBox", true}, {"datanodes", "DataNodes", true},
+                     {"remote", "Community catalogues", true}};
     cJSON *o = cJSON_CreateObject(), *enabled = cJSON_AddArrayToObject(o, "enabled"),
           *options = cJSON_AddArrayToObject(o, "options");
     bool acknowledged = orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&
                         orbit.sources.acknowledged_at > 0;
     cJSON_AddBoolToObject(o, "acknowledged", acknowledged);
     cJSON_AddNumberToObject(o, "noticeVersion", ORBIT_SOURCE_NOTICE_VERSION);
+    cJSON_AddNumberToObject(o, "remoteGeneration", remote_sources_generation_locked());
     for (size_t i = 0; i < sizeof providers / sizeof providers[0]; i++) {
-        if (acknowledged && (orbit.sources.enabled & source_flag(providers[i].id)))
+        if (orbit.sources.enabled & source_flag(providers[i].id))
             cJSON_AddItemToArray(enabled, cJSON_CreateString(providers[i].id));
         unsigned count = 0, addon_count = 0;
         for (size_t j = 0; j < orbit.release_count; j++)
@@ -45,6 +50,7 @@ cJSON *sources_json_locked(void) {
                 if (orbit.releases[j].addon_id[0]) addon_count++;
                 else count++;
             }
+        if (!strcmp(providers[i].id, "remote")) count = (unsigned)remote_sources_entry_count_locked();
         cJSON *p = cJSON_CreateObject();
         cJSON_AddStringToObject(p, "id", providers[i].id);
         cJSON_AddStringToObject(p, "label", providers[i].label);
@@ -58,7 +64,7 @@ cJSON *sources_json_locked(void) {
 
 int sources_set_locked(const cJSON *input, char *err, size_t cap) {
     const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(input, "enabled"), *x;
-    if (!cJSON_IsArray(enabled) || cJSON_GetArraySize(enabled) > 5) {
+    if (!cJSON_IsArray(enabled) || cJSON_GetArraySize(enabled) > 6) {
         copy_text(err, cap, "Select the sources you want to enable.");
         return 400;
     }
@@ -126,6 +132,8 @@ int sources_set_locked(const cJSON *input, char *err, size_t cap) {
     }
     free(previous);
     browser_source_changed_locked();
+    if (old.acknowledged_at != orbit.sources.acknowledged_at)
+        remote_sources_changed_locked();
     pthread_cond_signal(&orbit.changed);
     return 200;
 }

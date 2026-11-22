@@ -2,7 +2,6 @@ import { SupportEntry } from "./Support";
 import { VikingAccount } from "./VikingAccount";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { CatalogueUpdates } from "./CatalogueUpdates";
-import { TvApp } from "./TvApp";
 import { Debrid } from "./Debrid";
 import { ArchiveAccount } from "./ArchiveAccount";
 import { Updates } from "./Updates";
@@ -314,7 +313,6 @@ export function AutoStart({
       <Updates onStopped={() => setStopped(true)} />
       {!stopped && (
         <>
-          <TvApp />
           {initialSection !== "debrid" && <Debrid />}
           <ArchiveAccount />
           <VikingAccount />

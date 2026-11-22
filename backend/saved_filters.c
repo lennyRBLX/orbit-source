@@ -41,7 +41,7 @@ static bool list_field(const cJSON *in, const char *key, cJSON *out) {
 }
 /* The filters as Browse keeps them (src/browse.ts BrowseFilters), complete, or NULL. */
 static cJSON *clean_filters(const cJSON *in) {
-    static const char *const platforms[] = {"", "ps4", "ps5", NULL};
+    static const char *const platforms[] = {"", "ps4", "ps5", "homebrew", NULL};
     static const char *const scores[] = {"", "60", "70", "80", "90", NULL};
     static const char *const times[] = {"", "under5", "5to10", "10to20", "20to40", "40plus", NULL};
     static const char *const styles[] = {"main", "extras", "completionist", NULL};

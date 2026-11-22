@@ -29,6 +29,29 @@ static void slow_storage(void) {
 }
 #endif
 
+static int replace(int directory, const char *name, const char *temporary,
+                   const char *data, size_t length) {
+    int fd = openat(directory, temporary, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    size_t p = 0;
+    while (p < length) {
+        ssize_t w = write(fd, data + p, length - p);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        p += (size_t)w;
+    }
+    int rc = p == length ? fsync(fd) : -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc == 0) rc = renameat(directory, temporary, directory, name);
+    return rc;
+}
+
+int state_file_replace(int directory, const char *name, const char *temporary,
+                       const char *data, size_t length) {
+    if (replace(directory, name, temporary, data, length)) return -1;
+    return fsync(directory);
+}
+
 int state_file_write(int directory, uint64_t generation, const char *data, size_t length) {
     int rc = -1;
     pthread_mutex_lock(&save_lock);
@@ -43,19 +66,7 @@ int state_file_write(int directory, uint64_t generation, const char *data, size_
 #ifdef ORBIT_TEST
         slow_storage();
 #endif
-        int fd = openat(directory, "state.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-        if (fd >= 0) {
-            size_t p = 0;
-            while (p < length) {
-                ssize_t w = write(fd, data + p, length - p);
-                if (w < 0 && errno == EINTR) continue;
-                if (w <= 0) break;
-                p += (size_t)w;
-            }
-            if (p == length && fsync(fd) == 0) rc = 0;
-            if (close(fd) != 0) rc = -1;
-        }
-        if (rc == 0) rc = renameat(directory, "state.tmp", directory, "state.json");
+        rc = replace(directory, "state.json", "state.tmp", data, length);
         if (rc == 0) {
             renamed = generation;
             rc = fsync(directory);

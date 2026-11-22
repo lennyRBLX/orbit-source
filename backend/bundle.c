@@ -7,6 +7,7 @@
 #include "bundle.h"
 #include "debrid.h"
 #include "packages.h"
+#include "remote_sources.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -147,7 +148,7 @@ static void next_item_locked(void) {
     }
     bool torbox = (orbit.always_use_torbox && debrid_covers_locked(r)) || !strcmp(it->delivery, "torbox") ||
                   (!it->delivery[0] && debrid_default_locked(r));
-    if (torbox || provider_supported(r) || !provider_browser_supported(r)) {
+    if (torbox || provider_supported(r) || (!remote_page_pending(r) && !provider_browser_supported(r))) {
         Job *job = NULL;
         int code = job_create_delivery_locked(r->id, b.storage_id, it->delivery[0] ? it->delivery : NULL,
                                               error, sizeof error, &job);

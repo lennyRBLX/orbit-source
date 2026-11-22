@@ -82,15 +82,16 @@ export function releaseState(
   jobs: Job[],
   games: LibraryGame[],
 ): CollectionState | undefined {
-  // A catalogue revision must not relabel a saved job as a different file.
+  // A page option has a stable ID before its filename and format are known.
+  const pageOption = release.sourceId === "remote" && !release.filename;
+  // Identify direct options by their file as well as their catalogue ID.
   const job = jobs
     .filter(
       (j) =>
         j.releaseId === release.id &&
         j.titleId === release.titleId &&
-        j.format === release.format &&
-        j.filename === release.filename &&
-        j.total === release.sizeBytes &&
+        (pageOption || (j.format === release.format && j.filename === release.filename)) &&
+        (j.total === release.sizeBytes || (release.sourceId === "remote" && !release.sizeBytes)) &&
         j.status !== "cancelled",
     )
     .sort((a, b) => rank[a.status] - rank[b.status])[0];
@@ -102,7 +103,7 @@ export function releaseState(
       g.platform === gamePlatform(release) &&
       (g.onDrive || g.installed),
   );
-  // ShadowMount does not expose a trustworthy version. Do not suppress a versioned
+  // Library doesn't carry a trustworthy installed version. Do not suppress a versioned
   // option on the strength of its title ID, a display name or an old download record.
   const exact = candidates.find(
     (g) =>

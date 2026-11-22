@@ -1,6 +1,6 @@
 """Maintain the embedded catalogue. Metadata and verification only; never save artwork/game bytes.
 
-Run with .venv/bin/python tools/catalog.py {metadata,verify,build,check}.
+Run with .venv/bin/python tools/catalog.py {metadata,verify,build,check,genres}.
 Network operations are explicit; normal builds use the reviewed JSON snapshot offline.
 """
 import argparse
@@ -747,9 +747,12 @@ def compile_catalog(games, releases, *, _addon=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("metadata", "verify", "build", "check"))
+    parser.add_argument("command", choices=("metadata", "verify", "build", "check", "genres"))
     parser.add_argument("--only", nargs="*", help="game IDs (metadata) or release IDs (verify)")
     args = parser.parse_args()
+    if args.command == "genres":
+        print(json.dumps(sorted({row["genre"] for row in read("catalog.json") if row.get("genre")})))
+        return
     games, releases = read("games.json"), read("releases.json")
     if args.command == "metadata":
         fetch_metadata(Client(), games, args.only)

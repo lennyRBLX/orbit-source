@@ -7,7 +7,7 @@ import { bytes, type LibraryGame, type Storage } from "../types";
 import type { LibraryModel } from "../useLibrary";
 import { formatDate, formatNumber, placeName, t } from "../i18n";
 import { Select } from "../Select";
-import { GameActions, LibraryFeedback, StorageProgress } from "../LibraryActions";
+import { GameActions, LibraryFeedback } from "../LibraryActions";
 import { Glyph } from "./Glyph";
 import { PnGroup, PnTile } from "./PanoramaParts";
 import { PanoramaFiles } from "./PanoramaFiles";
@@ -100,12 +100,12 @@ export function PanoramaLibrary({
       <section className="pn-library">
         {lookupNotice}
         <div className="pn-hero-empty">
-          <span className="pn-kicker">{busy ? t("Reading your library") : t("ShadowMount isn’t answering")}</span>
+          <span className="pn-kicker">{busy ? t("Reading your library") : t("Library isn’t ready")}</span>
           <h2>{busy ? t("Finding your games") : t("Connect your library")}</h2>
           <p>
             {busy
-              ? t("Reading installed titles and drive availability from ShadowMount.")
-              : t("Library uses ShadowMount’s local games API on your PS5. Start a version with that API enabled, then select Try again.")}
+              ? t("Reading Kraken Mount’s games and the games installed on your PS5.")
+              : t("Library lists the games Kraken Mount runs and the games installed on your PS5. Select Try again.")}
           </p>
           {!busy && <p>{t("Games are not inferred from download history. An unavailable library does not mean your games are missing.")}</p>}
           {error && <p className="warn">{error}</p>}
@@ -160,7 +160,6 @@ export function PanoramaLibrary({
       </div>
       {lookupNotice}
       <div className="pn-library-status">
-        <StorageProgress model={model} />
         <LibraryFeedback model={model} />
         {error && <p className="warn">{error}</p>}
       </div>
@@ -193,12 +192,7 @@ export function PanoramaLibrary({
         </PnGroup>
         {current && (
           <PnGroup title={current.title} className="pn-game-group">
-            <GameActions
-              game={current}
-              model={model}
-              driveCards
-              tiles={{ status: `${statusOf(current)} · ${current.onDrive ? placeName(current.location) : t("Drive disconnected")}` }}
-            />
+            <GameActions game={current} model={model} tiles />
             <div className="pn-tile large dark pn-details">
               <span className="pn-kicker">{t("Library game details")}</span>
               <dl>
@@ -239,9 +233,7 @@ export function PanoramaLibrary({
                       ? bytes(current.sizeBytes)
                       : current.sizeStatus === "unavailable"
                         ? t("Unavailable")
-                        : model.snapshot?.measuring
-                          ? t("Measuring…")
-                          : t("Not measured")}
+                        : t("Not measured")}
                   </dd>
                 </div>
                 <div>
@@ -249,13 +241,6 @@ export function PanoramaLibrary({
                   <dd>{current.installedSizeBytes === null ? t("Not reported") : bytes(current.installedSizeBytes)}</dd>
                 </div>
               </dl>
-              {current.foundByOrbit && (
-                <p className="pn-details-note">
-                  {t(
-                    "Orbit found this game itself because your ShadowMount version doesn’t list games installed from PKG files. For the most complete list, update ShadowMount to 1.7beta5 or newer.",
-                  )}
-                </p>
-              )}
               {/* What the statuses mean, at the end of the details (the group keeps three rows). */}
               <p className="pn-details-note">
                 {t(

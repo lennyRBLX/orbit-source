@@ -15,6 +15,7 @@ export function groupGames(releases: Release[]): Game[] {
         contents: release.contents,
 
         platform: gamePlatform(release),
+        homebrew: release.homebrew,
         title: release.title,
         genre: release.genre,
         tagline: release.tagline,

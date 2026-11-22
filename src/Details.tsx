@@ -8,6 +8,8 @@ import { useDebrid, torboxAvailable, preferredDelivery, alwaysTorbox } from "./D
 import {
   bytes,
   formatLabel,
+  releaseProvider,
+  releaseSize,
   type Game,
   type BrowserSession,
   type Job,
@@ -17,7 +19,7 @@ import {
   type LibraryTarget,
 } from "./types";
 import { defaultDrive, downloadSpacePlan, releaseState } from "./collection";
-import { gamePlatform } from "./platform";
+import { gamePlatformLabel } from "./platform";
 import type { BrowserSelection } from "./browserHandoff";
 import { formatDate, genreName, placeName, t } from "./i18n";
 import { firmwareLabel, firmwareWarning } from "./firmware";
@@ -178,6 +180,7 @@ export function Details({
   const torbox = delivery === "torbox";
   const canTorbox = torboxAvailable(debrid.status, release);
   const useBrowser = !!release.browserAvailable && !torbox;
+  const resolveCommunityOption = useBrowser && release.sourceId === "remote";
   // Get everything: this option with its DLC, on the drive Download uses.
   const everything = useEverything({ game, release, delivery, drive, jobs, library, system, debrid: debrid.status, catalog });
   const closeEverything = () => {
@@ -303,13 +306,13 @@ export function Details({
             : torbox
             ? t("Download via TorBox")
             : useBrowser
-              ? release.sourceId === "vikingfile" ? t("Download to PS5") : t("Open download page on PS5")
+              ? release.sourceId === "vikingfile" || resolveCommunityOption ? t("Download to PS5") : t("Open download page on PS5")
               : existing || downloadAgain
                 ? t("Download again")
                 : t("Download to PS5");
   const methodLabel = torbox
     ? "TorBox"
-    : t("{provider} directly", { provider: release.provider });
+    : t("{provider} directly", { provider: releaseProvider(release) });
   const methodNote = always
     ? t("Always use TorBox is on. Turn it off in TorBox settings to use the original source.")
     : torbox
@@ -333,9 +336,9 @@ export function Details({
       data-controller-scroll
       data-initial-focus
       role="region"
-      aria-label={t("{provider}: start here", { provider: release.provider })}
+      aria-label={t("{provider}: start here", { provider: releaseProvider(release) })}
     >
-      <strong>{t("{provider}: start here", { provider: release.provider })}</strong>
+      <strong>{t("{provider}: start here", { provider: releaseProvider(release) })}</strong>
       <ol>
         <li>
           {rich("First, choose your drive and select {button}.", {
@@ -343,7 +346,7 @@ export function Details({
               <strong>
                 {related && !downloadAgain
                   ? t("Download anyway")
-                  : release.sourceId === "vikingfile"
+                  : release.sourceId === "vikingfile" || resolveCommunityOption
                     ? t("Download to PS5")
                     : t("Open download page on PS5")}
               </strong>
@@ -351,11 +354,12 @@ export function Details({
           })}
         </li>
         <li>
-          {release.sourceId === "akirabox" || release.sourceId === "vikingfile" ? t("Complete verification if shown, then wait. Orbit will check the generated download link automatically.") :
+          {resolveCommunityOption ? t("If a provider page opens, complete verification and select Download when prompted.") :
+          release.sourceId === "akirabox" || release.sourceId === "vikingfile" ? t("Complete verification if shown, then wait. Orbit will check the generated download link automatically.") :
           release.sourceId === "datanodes" ? t("Scroll to the bottom, select Continue to Download, then Free Download. Wait for the countdown and select Start Download.") :
           rich(
             "On {provider}, complete any verification and select the site’s {button} button.",
-            { provider: release.provider, button: <strong>{t("Download")}</strong> },
+            { provider: releaseProvider(release), button: <strong>{t("Download")}</strong> },
           )}
         </li>
         <li>
@@ -411,12 +415,12 @@ export function Details({
         <span>
           <small>{t("Source")}</small>
           <strong>
-            {release.provider} · {formatLabel(release)}
+            {releaseProvider(release)} · {formatLabel(release)}
           </strong>
           <small>
             {release.version &&
               `${t("version {version}", { version: release.version })} · `}
-            {bytes(release.sizeBytes)}
+            {releaseSize(release)}
           </small>
         </span>
         <Icon name="chevron" />
@@ -504,7 +508,7 @@ export function Details({
         </div>
         <div>
           <dt>{t("Source")}</dt>
-          <dd>{release.provider}</dd>
+          <dd>{releaseProvider(release)}</dd>
         </div>
         {release.version && (
           <div>
@@ -514,7 +518,7 @@ export function Details({
         )}
         <div>
           <dt>{release.compression ? t("Compressed size") : t("Download size")}</dt>
-          <dd>{bytes(release.sizeBytes)}</dd>
+          <dd>{releaseSize(release)}</dd>
         </div>
         {release.compression && !!release.extractedBytes && (
           <div>
@@ -563,8 +567,8 @@ export function Details({
   // What the main button does, under its label: size and drive, or the handoff.
   const primaryDetail =
     showDownload && drive
-      ? t("{size} · to {drive}", { size: bytes(release.sizeBytes), drive: placeName(drive.label) })
-      : bytes(release.sizeBytes);
+      ? t("{size} · to {drive}", { size: releaseSize(release), drive: placeName(drive.label) })
+      : releaseSize(release);
   if (iface === "crossbar") {
     const notes = (
       <>
@@ -655,7 +659,7 @@ export function Details({
             },
           ]
         : []),
-      valueRow("version", "layers", t("Version"), `${release.provider} · ${formatLabel(release)}`, !pending && !browser?.active),
+      valueRow("version", "layers", t("Version"), `${releaseProvider(release)} · ${formatLabel(release)}`, !pending && !browser?.active),
       ...(showDownload ? [valueRow("using", "cloud", t("Download using"), methodLabel, !pending && !browser?.active)] : []),
       ...(showDownload && system?.paired
         ? [valueRow("save", "drive", t("Save to"), drive ? placeName(drive.label) : t("Select storage"), !pending && !browser?.active)]
@@ -697,9 +701,9 @@ export function Details({
         ? game.releases.map((option) => ({
             key: option.id,
             on: release.id === option.id,
-            title: `${option.provider} · ${formatLabel(option)}`,
+            title: `${releaseProvider(option)} · ${formatLabel(option)}`,
             sub: [
-              bytes(option.sizeBytes),
+              releaseSize(option),
               option.version && t("version {version}", { version: option.version }),
               option.region,
               releaseState(option, jobs, library)?.label && t(releaseState(option, jobs, library)!.label),
@@ -712,7 +716,7 @@ export function Details({
           }))
         : xbMenu === "using"
           ? [
-              { key: "direct", on: !torbox, title: t("{provider} directly", { provider: release.provider }), sub: "", choose: () => setDelivery("direct"), disabled: always },
+              { key: "direct", on: !torbox, title: t("{provider} directly", { provider: releaseProvider(release) }), sub: "", choose: () => setDelivery("direct"), disabled: always },
               !debrid.status?.connected && !torbox
                 ? { key: "setup", on: false, title: t("Set up TorBox"), sub: t("Connect your TorBox account in App settings."), choose: () => configureDebrid(() => void debrid.refresh()), disabled: false }
                 : { key: "torbox", on: torbox, title: "TorBox", sub: methodNote, choose: () => setDelivery("torbox"), disabled: !canTorbox },
@@ -853,7 +857,7 @@ export function Details({
                   ))
                 ) : (
                   <p className="pn-kicker pn-game-meta">
-                    {[genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatform(release).toUpperCase(), release.provider]
+                    {[genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatformLabel(release), releaseProvider(release)]
                       .filter(Boolean)
                       .join(" · ")}
                   </p>
@@ -922,7 +926,7 @@ export function Details({
                 size="wide"
                 tone="dark"
                 glyph="cloud"
-                title={t("{provider} directly", { provider: release.provider })}
+                title={t("{provider} directly", { provider: releaseProvider(release) })}
                 check={!torbox}
                 current={!torbox}
                 disabled={pending || browser?.active || always}
@@ -992,8 +996,8 @@ export function Details({
                   key={option.id}
                   size="wide"
                   tone="dark"
-                  kicker={option.provider}
-                  title={`${formatLabel(option)} · ${bytes(option.sizeBytes)}`}
+                  kicker={releaseProvider(option)}
+                  title={`${formatLabel(option)} · ${releaseSize(option)}`}
                   sub={[option.version && t("version {version}", { version: option.version }), option.region, presence && t(presence.label), firmwareLabel(option)]
                     .filter(Boolean)
                     .join(" · ")}
@@ -1033,14 +1037,14 @@ export function Details({
       ? t("Pair with your PS5")
       : showDownload
         ? release.sizeBytes
-          ? `${t("Download")} · ${bytes(release.sizeBytes)}`
+          ? `${t("Download")} · ${releaseSize(release)}`
           : t("Download")
         : actionLabel;
     return (
       <section ref={page} className={`product native-game cn-game${sheetUp ? " cn-sheet-up" : ""}`} aria-labelledby="product-title">
         <div className="cn-game-page" inert={sheetUp || undefined}>
           <CinemaStage
-            kicker={[game.addonId && game.baseGameTitle, genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatform(release).toUpperCase(), release.compression ? formatLabel(release).split(" · ")[0] : release.browserAvailable ? release.provider : ""]
+            kicker={[game.addonId && game.baseGameTitle, genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatformLabel(release), release.compression ? formatLabel(release).split(" · ")[0] : release.browserAvailable ? releaseProvider(release) : ""]
               .filter(Boolean)
               .join(" · ")}
             title={game.title}
@@ -1206,10 +1210,10 @@ export function Details({
                           disabled={pending || browser?.active}
                           onClick={() => setReleaseId(option.id)}
                         >
-                          <small>{option.provider}</small>
+                          <small>{releaseProvider(option)}</small>
                           <strong>{formatLabel(option)}</strong>
                           <small>
-                            {bytes(option.sizeBytes)}
+                            {releaseSize(option)}
                             {option.version && ` · ${t("version {version}", { version: option.version })}`}
                             {option.region && ` · ${option.region}`}
                           </small>
@@ -1242,7 +1246,7 @@ export function Details({
                           disabled={pending || browser?.active || always}
                           onClick={() => setDelivery("direct")}
                         >
-                          <strong>{t("{provider} directly", { provider: release.provider })}</strong>
+                          <strong>{t("{provider} directly", { provider: releaseProvider(release) })}</strong>
                           {!torbox && <Glyph name="check" size={16} stroke={2.4} />}
                         </button>
                         {!debrid.status?.connected && !torbox ? (
@@ -1341,13 +1345,13 @@ export function Details({
           {description && <p className="hub-description"><bdi>{description}</bdi></p>}
                 {addonAccess}<AddonInfo item={{...game, ...release}} library={library} contents />
           <p className="hub-release">
-            {release.provider}
+            {releaseProvider(release)}
             <span>·</span>
             {formatLabel(release)}
             <span>·</span>
-            {bytes(release.sizeBytes)}
+            {releaseSize(release)}
             <span>·</span>
-            <span>{gamePlatform(release).toUpperCase()}</span>
+            <span>{gamePlatformLabel(release)}</span>
             {game.genre && (
               <>
                 <span>·</span>
@@ -1501,7 +1505,7 @@ export function Details({
                       </span>
                       <span>
                         <strong>
-                          {option.provider} · {formatLabel(option)}
+                          {releaseProvider(option)} · {formatLabel(option)}
                         </strong>
                         <small>
                           {option.titleId}
@@ -1509,7 +1513,7 @@ export function Details({
                             ` · ${t("version {version}", { version: option.version })}`}
                         </small>
                         <small>
-                          {bytes(option.sizeBytes)}
+                          {releaseSize(option)}
                           {presence && ` · ${t(presence.label)}`}
                         </small>
                         {firmwareLabel(option) && (
@@ -1537,7 +1541,7 @@ export function Details({
                     {!torbox && <Icon name="check" />}
                   </span>
                   <strong>
-                    {t("{provider} directly", { provider: release.provider })}
+                    {t("{provider} directly", { provider: releaseProvider(release) })}
                   </strong>
                 </button>
                 {!debrid.status?.connected && !torbox ? (

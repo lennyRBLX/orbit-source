@@ -1,5 +1,6 @@
 #include "assets.h"
 #include "orbit.h"
+#include "remote_sources.h"
 #include "catalog_view.h"
 #include "packages.h"
 #include "archive_account.h"
@@ -434,7 +435,12 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
     if (!local_host(host))
         return error(c, 403, "Use the console IP address or a .local or .home.arpa hostname to access Orbit.");
     bool get = !strcmp(method, "GET"), post = !strcmp(method, "POST");
-    if (!get && !post)
+    const char remote_path[] = "/api/v1/remote-sources";
+    size_t remote_prefix = sizeof remote_path - 1;
+    bool remote_route = !strncmp(url, remote_path, remote_prefix) &&
+                        (!url[remote_prefix] || url[remote_prefix] == '/');
+    bool patch = remote_route && !strcmp(method, "PATCH"), remove = remote_route && !strcmp(method, "DELETE");
+    if (!get && !post && !patch && !remove)
         return error(c, 405, "Method not supported.");
     const char *origin = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Origin");
     char expected[270];
@@ -444,7 +450,7 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
     const char *site = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Sec-Fetch-Site");
     if (!strncmp(url, "/api/", 5) && site && strcmp(site, "same-origin") && strcmp(site, "none"))
         return error(c, 403, "Open Orbit directly on this console or your local network.");
-    if (post) {
+    if (post || patch) {
         const char *ct = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Content-Type");
         if (!ct || (strcmp(url, "/api/v1/receive/chunk") ? strncasecmp(ct, "application/json", 16) : strcmp(ct, "application/octet-stream")))
             return error(c, 415, "Use application/json.");
@@ -601,6 +607,35 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         cJSON *o = sources_json_locked();
         pthread_mutex_unlock(&orbit.mutex);
         return json_response(c, 200, o);
+    }
+    if (remote_route) {
+        const char *id = url[remote_prefix] ? url + remote_prefix + 1 : "";
+        bool list = !url[remote_prefix];
+        if ((get && !list) || (post && !list && strcmp(id, "refresh")) ||
+            ((patch || remove) && (list || !*id || strchr(id, '/'))))
+            return error(c, 404, "Community catalogue was not found.");
+        if (!authorized(c)) return error(c, 401, "Pair this device first.");
+        cJSON *input = post || patch ? cJSON_ParseWithLengthOpts((const char *)req->body,
+                                                                  req->length + 1, NULL, true) : NULL;
+        if ((post || patch) && (!cJSON_IsObject(input) || memchr(req->body, 0, req->length))) {
+            cJSON_Delete(input);
+            return error(c, 400, "Invalid catalogue settings.");
+        }
+        char message[256] = {0};
+        pthread_mutex_lock(&orbit.mutex);
+        int status = get ? 200 : remote_sources_change_locked(method, id, input, message, sizeof message);
+        cJSON *o = status < 400 ? remote_sources_json_locked() : NULL;
+        unsigned retry_after = status == 429 ? remote_sources_retry_after_locked() : 0;
+        pthread_mutex_unlock(&orbit.mutex);
+        cJSON_Delete(input);
+        if (status == 429) {
+            o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "error", message);
+            cJSON_AddNumberToObject(o, "retryAfter", retry_after);
+            return json_response(c, 429, o);
+        }
+        if (status >= 400) return error(c, (unsigned)status, message);
+        return o ? json_response(c, (unsigned)status, o) : error(c, 503, "Orbit is short of memory. Try again shortly.");
     }
     if (get && !strcmp(url, "/api/v1/session")) {
         if (!local_peer(c))
@@ -1137,15 +1172,6 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
             return code == 202 ? json_response(c, 202, updates_status())
                                : error(c, (unsigned)code, e);
         }
-        if (get && !strcmp(url, "/api/v1/tv-app"))
-            return json_response(c, 200, tvapp_status());
-        if (post && !strcmp(url, "/api/v1/tv-app")) {
-            char e[256] = {0};
-            int code = tvapp_action(input, e, sizeof e);
-            cJSON_Delete(input);
-            return code == 202 ? json_response(c, 202, tvapp_status())
-                               : error(c, (unsigned)code, e);
-        }
         if (get && !strcmp(url, "/api/v1/autoboot"))
             return json_response(c, 200, autoboot_status());
         if (post && (!strcmp(url, "/api/v1/autoboot") || !strcmp(url, "/api/v1/integrations"))) {
@@ -1251,7 +1277,7 @@ static enum MHD_Result handle(void *cls, struct MHD_Connection *c, const char *u
     }
     if (r->too_large)
         return error(c, 413, "Request body is too large.");
-    const bool mutation = !strcmp(method, "POST");
+    const bool mutation = !strcmp(method, "POST") || !strcmp(method, "PATCH") || !strcmp(method, "DELETE");
     if (mutation && !power_request_begin()) return error(c, 503, "Orbit is stopping.");
     enum MHD_Result result = route(c, url, method, r);
     if (mutation) power_request_end();

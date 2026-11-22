@@ -11,6 +11,27 @@ static bool suffix(const char *host, const char *ending) {
     return a > b && !strcmp(host + a - b, ending);
 }
 #endif
+bool remote_https_url(const char *url) {
+    if (!url || !*url || strpbrk(url, "\\#") || strlen(url) > 8192) return false;
+    for (const unsigned char *p = (const unsigned char *)url; *p; p++)
+        if (*p <= 32 || *p >= 127) return false;
+    CURLU *parsed = curl_url();
+    if (!parsed) return false;
+    char *host = NULL, *scheme = NULL;
+    bool ok = !curl_url_set(parsed, CURLUPART_URL, url, CURLU_DISALLOW_USER) &&
+              !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) &&
+              !curl_url_get(parsed, CURLUPART_HOST, &host, 0) && *host &&
+              (!strcmp(scheme, "https")
+#ifdef ORBIT_TEST
+               || (!strcmp(scheme, "http") && !strcmp(host, "127.0.0.1"))
+#endif
+              );
+    curl_free(host);
+    curl_free(scheme);
+    curl_url_cleanup(parsed);
+    return ok;
+}
+
 bool provider_transfer_url_allowed(const char *url) {
     if (!url || strlen(url) > 8192) return false;
     CURLU *parsed = curl_url();

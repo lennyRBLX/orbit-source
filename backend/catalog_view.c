@@ -1,3 +1,4 @@
+#include "remote_sources.h"
 /* Catalogue and add-on lists for the browser and TV app. Building one means
  * copying every visible entry and printing about 10 MB of JSON; doing that for
  * each request stalled the single HTTP thread (issue 185). Each body is built
@@ -79,6 +80,87 @@ static bool same_key(const ViewKey *a, const ViewKey *b) {
            a->notice_version == b->notice_version && a->acknowledged == b->acknowledged &&
            a->firmware == b->firmware;
 }
+/* Index the curated title identities once per view. Prefer the first curated
+ * entry when multiple options share a title ID. */
+typedef struct {
+    const cJSON *entry;
+    const char *title_id;
+    size_t order;
+} TitleEntry;
+
+static int compare_titles(const void *a, const void *b) {
+    const TitleEntry *x = a, *y = b;
+    int compare = strcmp(x->title_id, y->title_id);
+    if (compare) return compare;
+    return (x->order > y->order) - (x->order < y->order);
+}
+
+static const cJSON *match_title(const TitleEntry *titles, size_t count, const char *id) {
+    size_t lo = 0, hi = count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(titles[mid].title_id, id) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < count && !strcmp(titles[lo].title_id, id) ? titles[lo].entry : NULL;
+}
+
+static bool append_remote_locked(cJSON *out) {
+    if (!(orbit.sources.enabled & ORBIT_SOURCE_REMOTE) || !orbit.remote_release_count) return true;
+    size_t count = (size_t)cJSON_GetArraySize(orbit.catalog), i = 0;
+    TitleEntry *titles = malloc((count ? count : 1) * sizeof *titles);
+    if (!titles) return false;
+    const cJSON *curated;
+    cJSON_ArrayForEach(curated, orbit.catalog) {
+        titles[i] = (TitleEntry){curated, json_text(curated, "titleId"), i};
+        i++;
+    }
+    qsort(titles, count, sizeof *titles, compare_titles);
+    bool ok = true;
+    for (i = 0; i < orbit.remote_release_count && ok; i++) {
+        const Release *r = &orbit.remote_releases[i];
+        if (!source_enabled_locked(r)) continue;
+        cJSON *entry = release_json(r);
+        if (!entry) { ok = false; break; }
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "url");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteCatalogId");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteLabel");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "remotePage");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "sha256");
+        const cJSON *match = match_title(titles, count, r->title_id);
+        if (match) {
+            const char *const keys[] = {"gameId", "title", "genre", "tagline", "description", "cover", "hero",
+                "coverFallback", "heroFallback", "artworkLayout", "publisher", "releaseDate", "addedAt",
+                "newOnOrbitRank", "insights", "tags"};
+            for (size_t k = 0; k < sizeof keys / sizeof *keys; k++) {
+                const cJSON *value = cJSON_GetObjectItemCaseSensitive(match, keys[k]);
+                if (!value) continue;
+                cJSON *copy = cJSON_Duplicate(value, true);
+                cJSON_DeleteItemFromObjectCaseSensitive(entry, keys[k]);
+                if (!copy || !cJSON_AddItemToObject(entry, keys[k], copy)) {
+                    cJSON_Delete(copy);
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            ok = cJSON_AddBoolToObject(entry, "homebrew", true) &&
+                 cJSON_AddStringToObject(entry, "cover", "") &&
+                 cJSON_AddStringToObject(entry, "hero", "") &&
+                 cJSON_AddStringToObject(entry, "artworkLayout", "ambient");
+        }
+        ok = ok && cJSON_AddStringToObject(entry, "provider", r->remote_label[0] ? r->remote_label : "Community catalogues") &&
+             cJSON_AddBoolToObject(entry, "browserAvailable", remote_page_pending(r)) &&
+             cJSON_AddBoolToObject(entry, "directAvailable", !remote_page_pending(r));
+        firmware_describe(entry, orbit.firmware);
+        if (ok) ok = cJSON_AddItemToArray(out, entry);
+        if (!ok) cJSON_Delete(entry);
+    }
+    free(titles);
+    return ok;
+}
+
 /* The visible entries without their private links, with what Orbit's
  * providers and this console make of each. orbit.mutex held. */
 static cJSON *snapshot_locked(bool addons) {
@@ -106,6 +188,10 @@ static cJSON *snapshot_locked(bool addons) {
         cJSON_AddBoolToObject(entry, "directAvailable", provider_url_supported(r));
         firmware_describe(entry, orbit.firmware);
         cJSON_AddItemToArray(a, entry);
+    }
+    if (!addons && !append_remote_locked(a)) {
+        cJSON_Delete(a);
+        return NULL;
     }
     return a;
 }

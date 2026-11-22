@@ -16,7 +16,6 @@ import { Select } from "./Select";
 import { BrowserNotice } from "./BrowserNotice";
 import { UpdateNotice } from "./UpdateNotice";
 import { AnnouncementNotice } from "./AnnouncementNotice";
-import { NativeAppNotice } from "./NativeAppNotice";
 import { Loader } from "./Loader";
 import { DownloadRetrySettings } from "./DownloadRetrySettings";
 import { DownloadConnections, DownloadLimit } from "./DownloadLimit";
@@ -30,8 +29,7 @@ import { HistorySetting } from "./HistoryRemoval";
 import { Sources } from "./Sources";
 import { Pairing } from "./Pairing";
 import type { Game, LibraryTarget } from "./types";
-import { contentFormat } from "./types";
-import { browseGames, catalogueGenres, catalogueTags, choiceCounts, newOnOrbitPicks, newlyAddedGames, defaultFilters, CATALOG_STEP, TAGS, TORBOX_SOURCE, type BrowseFilters, type CountedFilter } from "./browse";
+import { browseGames, catalogueGenres, catalogueTags, choiceCounts, newOnOrbitPicks, newlyAddedGames, defaultFilters, downloadFormats, CATALOG_STEP, DOWNLOAD_FORMATS, TAGS, TORBOX_SOURCE, type BrowseFilters, type CountedFilter } from "./browse";
 import { torboxSources, useDebrid } from "./Debrid";
 import { SavedFilters } from "./SavedFilters";
 import { useInfiniteList } from "./infiniteList";
@@ -182,7 +180,7 @@ export default function App() {
   const gameTags = useMemo(() => catalogueTags(orbit.games), [orbit.games]);
   const gameGenres = useMemo(() => catalogueGenres(orbit.games), [orbit.games]);
   const sourceNames = useMemo(
-    () => new Map(catalogueGames.flatMap((g) => g.releases.map((r) => [r.sourceId, r.provider] as const))),
+    () => new Map(catalogueGames.flatMap((g) => g.releases.map((r) => [r.sourceId, r.sourceId === "remote" ? t("Community catalogues") : r.provider] as const))),
     [catalogueGames],
   );
   const savedCount = orbit.savedFilters.filter((s) => s.page === (addonsPage ? "addons" : "games")).length;
@@ -269,9 +267,10 @@ export default function App() {
     () => browseGames(pageGames, filters, favorites, installedGames, torbox),
     [pageGames, filters, favorites, installedGames, torbox],
   );
+  // PKG, FPKG and Game folder, the formats Orbit downloads, as far as the catalogue has them.
   const formatValues = useMemo(
-    () => Array.from(new Set(catalogueGames.flatMap((g) =>
-      g.releases.flatMap((r) => [contentFormat(r) !== "Unknown" ? contentFormat(r) : "", r.compression ? (r.compression === "7z" ? "7z" : r.compression.toUpperCase()) : ""].filter(Boolean))))),
+    () => Object.keys(DOWNLOAD_FORMATS).filter((format) =>
+      catalogueGames.some((g) => g.releases.some((r) => r.format === format))),
     [catalogueGames],
   );
   // Desktop filters remain visible even when the narrow-screen filter panel is closed.
@@ -282,7 +281,7 @@ export default function App() {
     return {
       minimumScore: count("minimumScore",scoreChoices),
       playtimeRange: count("playtimeRange",timeChoices),
-      platform: count("platform", ["", "ps5", "ps4"]),
+      platform: count("platform", ["", "ps5", "ps4", "homebrew"]),
       source: count("source", ["", ...sourceLabels.keys()]),
       format: count("format", ["", ...formatValues]),
       tags: count("tags", ["", ...gameTags]),
@@ -408,10 +407,6 @@ export default function App() {
   // controls. Each interface only arranges them.
   const noticesNode = (
     <>
-      <NativeAppNotice
-        version={orbit.system?.version}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
-      />
       <UpdateNotice
         enabled={!!orbit.system?.paired && orbit.system.platform !== "desktop"}
         hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
@@ -597,6 +592,8 @@ export default function App() {
             { value: "", label: t("All platforms") },
             { value: "ps5", label: "PS5" },
             { value: "ps4", label: "PS4" },
+            ...(catalogueGames.some((game) => game.homebrew) || filters.platform === "homebrew"
+              ? [{ value: "homebrew", label: t("Homebrew") }] : []),
           ])}
         />
         <Select
@@ -620,7 +617,7 @@ export default function App() {
           onChange={(value) => toggle("format", value)}
           options={counted("format", [
             { value: "", label: t("All formats") },
-            ...formatValues.map((value) => ({ value, label: value })),
+            ...formatValues.map((value) => ({ value, label: t(DOWNLOAD_FORMATS[value]) })),
           ])}
         />
         )}
@@ -1292,7 +1289,8 @@ export default function App() {
           sources={sourceLabels}
           change={orbit.changeSavedFilters}
           apply={(entry) => {
-            setFilters({ ...defaultFilters, ...entry.filters, addonType: entry.filters.addonType || undefined });
+            setFilters({ ...defaultFilters, ...entry.filters, format: downloadFormats(entry.filters.format),
+              addonType: entry.filters.addonType || undefined });
             setSavedOpen(false);
           }}
           close={() => setSavedOpen(false)}

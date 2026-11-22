@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "remote_sources.h"
 #include "browser_platform.h"
 #include "browser_match.h"
 #include "viking_session.h"
@@ -122,7 +123,17 @@ static bool native_active(void *context) {
     return active() && probe_target_active(context);
 }
 #endif
-static bool capture(Release *r, char *etag, char *modified, bool *validated, char *error, size_t cap) {
+static int verify_community_capture(Release *r, const Release *locator, const char *url,
+                                    char *error, size_t cap) {
+    Release file = *r;
+    copy_text(file.filename, sizeof file.filename, locator->filename);
+    copy_text(file.format, sizeof file.format, locator->format);
+    int result = remote_download_verify(&file, url, &session.cancel, error, cap);
+    if (!result) *r = file;
+    return result;
+}
+
+static bool capture(Release *r, Release *community, char *etag, char *modified, bool *validated, char *error, size_t cap) {
     *validated = false;
     /* Native owns the dialog. Do not scan an old browser before it confirms
      * opening this exact session. An abandoned prepare expires in 30 seconds. */
@@ -160,7 +171,7 @@ static bool capture(Release *r, char *etag, char *modified, bool *validated, cha
     session.link_ms = milliseconds() - session.started_ms;
     session.candidates++;
     pthread_mutex_unlock(&orbit.mutex);
-    return true;
+    return !community || !verify_community_capture(community, r, candidate, error, cap);
 #else
     if (!active()) return false;
     if (!session.native_dialog && probe_browser_open(r->browser_url)) {
@@ -235,7 +246,9 @@ static bool capture(Release *r, char *etag, char *modified, bool *validated, cha
                 if (!session.stop && !atomic_load(&session.cancel))
                     state_locked("validating", "Checking the selected file before adding it to Downloads…");
                 pthread_mutex_unlock(&orbit.mutex);
-                int invalid = validate_capture(&candidate, etag, modified, error, cap);
+                int invalid = community
+                    ? verify_community_capture(community, &candidate, candidate.url, error, cap)
+                    : validate_capture(&candidate, etag, modified, error, cap);
                 memset(&candidate, 0, sizeof candidate);
                 if (invalid) {
                     pthread_mutex_lock(&orbit.mutex);
@@ -325,7 +338,8 @@ static void *worker(void *unused) {
         if (atomic_load(&session.cancel)) {
             /* The owner may report failure before this worker is scheduled. */
         } else if (session.resolving)
-            state_locked("validating", "Checking sign-in…");
+            state_locked("validating", remote_page_pending(&resolved)
+                ? "Reading the community catalogue download option…" : "Checking sign-in…");
         else if (session.native_dialog && !session.dialog_opened)
             state_locked("opening", "Opening the download page in Orbit…");
         else if (!strcmp(resolved.source, "akirabox") || !strcmp(resolved.source, "vikingfile"))
@@ -335,23 +349,46 @@ static void *worker(void *unused) {
         pthread_mutex_unlock(&orbit.mutex);
         char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
         bool validated = false;
-        bool ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
-        if (ok) {
-            ok = !validate_capture(&resolved, etag, modified, error, sizeof error);
+        bool ok = false;
+        if (remote_page_pending(&resolved)) {
+            Release locator;
+            int result = active()
+                ? remote_download_resolve(&resolved, &locator, &session.cancel, error, sizeof error) : -1;
+            ok = result == 0;
+            if (result == 1 && active() && !strcmp(locator.source, "vikingfile") &&
+                viking_resolve_download(&locator, session.native_dialog, &session.cancel))
+                ok = !verify_community_capture(&resolved, &locator, locator.url, error, sizeof error);
             validated = ok;
+            pthread_mutex_lock(&orbit.mutex);
+            if (ok) session.return_to_browser = false;
+            else if (result == 1 && !atomic_load(&session.cancel)) {
+                session.resolving = false;
+                state_locked("opening", "Opening the download page on your PS5…");
+            }
+            pthread_mutex_unlock(&orbit.mutex);
+            if (!ok && result == 1 && active()) {
+                error[0] = 0;
+                ok = capture(&locator, &resolved, etag, modified, &validated, error, sizeof error);
+                validated = ok;
+            }
+        } else {
+            ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
+            if (ok) {
+                ok = !validate_capture(&resolved, etag, modified, error, sizeof error);
+                validated = ok;
+            }
+            pthread_mutex_lock(&orbit.mutex);
+            session.resolving = false;
+            if (!ok) {
+                resolved = session.release;
+                error[0] = etag[0] = modified[0] = 0;
+                if (!atomic_load(&session.cancel)) state_locked("opening", "Opening the download page on your PS5…");
+            }
+            if (ok) session.return_to_browser = false;
+            pthread_mutex_unlock(&orbit.mutex);
+            viking_download_context(&resolved, session.native_dialog);
+            if (!ok && active()) ok = capture(&resolved, NULL, etag, modified, &validated, error, sizeof error);
         }
-        pthread_mutex_lock(&orbit.mutex);
-        session.resolving = false;
-        if (!ok) {
-            resolved = session.release;
-            error[0] = etag[0] = modified[0] = 0;
-            if (!atomic_load(&session.cancel)) state_locked("opening", "Opening the download page on your PS5…");
-        }
-        /* A direct result never opened a window to return from. */
-        if (ok) session.return_to_browser = false;
-        pthread_mutex_unlock(&orbit.mutex);
-        viking_download_context(&resolved, session.native_dialog);
-        if (!ok && active()) ok = capture(&resolved, etag, modified, &validated, error, sizeof error);
         pthread_mutex_lock(&orbit.mutex);
         ok = ok && !session.stop && !atomic_load(&session.cancel) && selected_locked();
         if (ok) state_locked("validating", "Checking the selected file before adding it to Downloads…");
@@ -394,7 +431,7 @@ static void *worker(void *unused) {
         memset(&session.release, 0, sizeof session.release);
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
         session.finished_ms = milliseconds() - session.started_ms;
-        session.busy = false;
+        session.resolving = session.busy = false;
     }
     pthread_mutex_unlock(&orbit.mutex);
     return NULL;
@@ -612,13 +649,15 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
             copy_text(error, cap, "Always use TorBox is on. Turn it off in TorBox settings to use the original source."); code = 409;
         } else if (refreshing && (!job_can_refresh_link(job) || !source_enabled_locked(&job->release))) {
             copy_text(error, cap, "Pause the download and enable its source before refreshing its link."); code = 409;
-        } else if (!r || !provider_browser_supported(r)) {
+        } else if (!r || (!remote_page_pending(r) && !provider_browser_supported(r))) {
             copy_text(error, cap, "This option has no supported provider browser page."); code = 400;
+        } else if (!source_enabled_locked(r)) {
+            copy_text(error, cap, "Enable this source and acknowledge the download notice in Sources first."); code = 409;
         } else if (!s) {
             copy_text(error, cap, "Reconnect the selected drive first."); code = 409;
         } else if (refreshing && (strcmp(s->root, job->root) || s->device != job->device || s->inode != job->inode)) {
             copy_text(error, cap, "Reconnect the original drive first."); code = 409;
-        } else if ((code = refreshing ? 200 : job_check_capture_locked(r, s, error, cap)) == 200) {
+        } else if ((code = refreshing || remote_page_pending(r) ? 200 : job_check_capture_locked(r, s, error, cap)) == 200) {
             if (start_worker_locked()) {
                 copy_text(error, cap, "Provider verification could not start. Try again.");
                 state_locked("failed", error);
@@ -627,7 +666,7 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
             }
             session.account = false;
             session.check_account = false;
-            session.resolving = !strcmp(r->source, "vikingfile");
+            session.resolving = remote_page_pending(r) || !strcmp(r->source, "vikingfile");
             session.release = *r; session.storage = *s;
             session.native_dialog = cJSON_IsTrue(dialog);
             session.dialog_opened = false;
@@ -647,7 +686,9 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
             reset_diagnostics_locked(r->source, refreshing ? "link-refresh" : "download");
             session.busy = session.pending = true;
             atomic_store(&session.cancel, false);
-            state_locked(session.resolving ? "validating" : "opening", session.resolving ? "Checking sign-in…" : "Opening the download page on your PS5…");
+            state_locked(session.resolving ? "validating" : "opening", remote_page_pending(r)
+                ? "Reading the community catalogue download option…"
+                : session.resolving ? "Checking sign-in…" : "Opening the download page on your PS5…");
             pthread_cond_signal(&session.changed);
             code = 202;
         }

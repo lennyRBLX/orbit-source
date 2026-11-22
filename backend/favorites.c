@@ -29,6 +29,9 @@ int favorite_set_locked(const cJSON *input, char *error, size_t cap) {
         for (size_t i = 0; i < orbit.release_count; i++)
             if (!strcmp(id, orbit.releases[i].game_id))
                 known = true;
+        for (size_t i = 0; !known && i < orbit.remote_release_count; i++)
+            if (!strcmp(id, orbit.remote_releases[i].game_id) && source_enabled_locked(&orbit.remote_releases[i]))
+                known = true;
         if (!known) {
             copy_text(error, cap, "Game is not in this catalogue.");
             return 404;

@@ -11,6 +11,7 @@ import { CATALOG_STEP } from "../browse";
 import type { CollectionState } from "../collection";
 import { Backdrop, GameTile } from "../components";
 import { Artwork } from "../Artwork";
+import { gamePlatformLabel } from "../platform";
 import { formatDate, formatNumber, t, tn } from "../i18n";
 import { Glyph, type GlyphName } from "./Glyph";
 import { CinemaCollections, CinemaRows, CinemaStage, type CinemaFrame, type CinemaSection } from "./CinemaParts";
@@ -157,7 +158,7 @@ const collectionLabel = (p: ShellProps) => t(p.tab === "Add-ons" ? "All add-ons"
 const countLabel = (p: ShellProps) => tn(p.filtered.length, p.tab === "Add-ons" ? "{count} add-on" : "{count} game", p.tab === "Add-ons" ? "{count} add-ons" : "{count} games");
 function meta(game: Game) {
   if (game.addonId) return [game.baseGameTitle,t(addonTypes[game.addonType || "content-pack"]),game.platform?.toUpperCase()].filter(Boolean).join(" · ");
-  return [game.genre, game.releaseDate?.slice(0, 4), game.platform === "ps4" ? "PS4" : "PS5"]
+  return [game.genre, game.releaseDate?.slice(0, 4), gamePlatformLabel(game)]
     .filter(Boolean)
     .join(" · ");
 }
@@ -724,7 +725,7 @@ function CrossbarPreview({ props, game }: { props: ShellProps; game: Game }) {
       {game.tagline && <h2><bdi>{game.tagline}</bdi></h2>}
       {game.description && <p className="xb-preview-text"><bdi>{game.description}</bdi></p>}
       <div className="xb-chips">
-        {[game.genre, game.releaseDate?.slice(0, 4), game.platform === "ps4" ? "PS4" : "PS5", size ? bytes(size) : ""]
+        {[game.genre, game.releaseDate?.slice(0, 4), gamePlatformLabel(game), size ? bytes(size) : ""]
           .filter(Boolean)
           .map((c) => (
             <span key={c as string}>{c}</span>
@@ -738,7 +739,7 @@ function CrossbarPreview({ props, game }: { props: ShellProps; game: Game }) {
 function crossbarGameRow(props: ShellProps, game: Game, prefix: string, dated = false): XbRow {
   const state = props.collectionStates.get(game.id);
   const size = game.releases[0]?.sizeBytes;
-  const platform = game.platform === "ps4" ? "PS4" : "PS5";
+  const platform = gamePlatformLabel(game);
   // Latest releases: the platform and the date, as on the PS5 app.
   const line = game.addonId ? meta(game) :
     dated && game.releaseDate

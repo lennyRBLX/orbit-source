@@ -5,7 +5,6 @@ import { t } from "./i18n";
 import { NtfySetting } from "./NtfySetting";
 import type { NotificationEvent, System } from "./types";
 
-// The events Orbit can tell you about, in the order the TV app lists them.
 export const notificationEvents: { id: NotificationEvent; label: string }[] = [
   { id: "downloadFinished", label: /* i18n */ "Download finished" },
   { id: "downloadFailed", label: /* i18n */ "Download failed" },
@@ -25,7 +24,6 @@ export function NotificationSettings({
 }) {
   const [pending, setPending] = useState(""),
     [error, setError] = useState(""),
-    // As in the TV app: ntfy's state and a button, its form only when asked for.
     [ntfyOpen, setNtfyOpen] = useState(false);
   const onConsole = system.downloadNotifications !== false;
   const events = system.notificationEvents;

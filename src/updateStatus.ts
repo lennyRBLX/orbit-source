@@ -15,28 +15,9 @@ export interface UpdateStatus {
   retryAt: number;
   checkedAt: number;
   checkAfter: number;
-  /* Orbit restarts itself through the ELF loader and installs both parts in one step. */
+  /* Orbit restarts itself through the ELF loader and installs itself in one step. */
   selfRestart?: boolean;
   restartNotice?: string;
   activationState?: "running" | "saved" | "restarting";
   updateAll?: boolean;
-  tvAppUpdated?: string;
-}
-// The TV app's installer, as /tv-app reports it.
-export interface TvAppStatus {
-  available: boolean;
-  installed: "none" | "orbit" | "manual" | "folder" | "blocked";
-  installedVersion: string;
-  installedPath?: string;
-  latestVersion: string;
-  checksum: string;
-  size: number;
-  updateAvailable: boolean;
-  phase: string;
-  error: string;
-  busy: boolean;
-  received: number;
-  retryAt: number;
-  checkedAt: number;
-  checkAfter: number;
 }

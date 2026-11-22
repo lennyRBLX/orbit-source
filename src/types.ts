@@ -1,5 +1,5 @@
 import type { Installation } from "./Installation";
-import { formatNumber } from "./i18n";
+import { formatNumber, t } from "./i18n";
 export interface AddonRequirements {
   titleIds: string[];
   edition?: string | null;
@@ -17,6 +17,7 @@ export interface AddonIdentity {
 }
 export interface Release extends AddonIdentity {
   platform?: "ps4" | "ps5";
+  homebrew?: boolean;
   id: string;
   gameId: string;
   titleId: string;
@@ -27,16 +28,12 @@ export interface Release extends AddonIdentity {
   sizeBytes: number;
   provider: string;
   sourceId: SourceId;
-  format: "FFPFSC" | "exFAT" | "FPKG" | "PKG" | "Game folder" | "Unknown";
-  // Optional display subtype; retain the v8 format and archive inspection state.
-  contentFormat?: "LZ4";
-  // Additive v8 field: older readers keep the underlying Game folder identity.
-  assetCompression?: "ZSTD";
+  // The only formats the service offers (browse.ts DOWNLOAD_FORMATS); it leaves out the rest.
+  format: "FPKG" | "PKG" | "Game folder";
   // Downloaded as an archive and extracted on the drive; format is what's inside.
   compression?: "zip" | "7z" | "rar";
   archivePassword?: string;
   extractedBytes?: number;
-  archiveContents?: "unverified";
   notes?: string;
   region?: "EUR" | "USA" | "JPN" | "ASIA" | null;
   version: string | null;
@@ -79,6 +76,7 @@ export interface Bundle {
 }
 export interface Game extends AddonIdentity {
   platform?: "ps4" | "ps5";
+  homebrew?: boolean;
   id: string;
   title: string;
   genre: string | null;
@@ -96,11 +94,33 @@ export interface Game extends AddonIdentity {
   insights?: import("./insights").GameInsights;
   releases: Release[];
 }
-export type SourceId = "vikingfile" | "archive" | "akirabox" | "datanodes" | "1fichier";
+export type SourceId = "vikingfile" | "archive" | "akirabox" | "datanodes" | "1fichier" | "remote";
+export interface RemoteSource {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  builtIn: boolean;
+  lastFetchedAt: number;
+  lastError: string;
+  entryCount: number;
+  skippedEntries: number;
+}
+export interface RemoteSources {
+  sources: RemoteSource[];
+  refreshing: boolean;
+  retryAfter?: number;
+}
+export const releaseProvider = (release: Release) =>
+  release.sourceId === "remote" && release.provider === "Community catalogues"
+    ? t("Community catalogues") : release.provider;
+export const releaseSize = (release: Release) =>
+  release.sourceId === "remote" && !release.sizeBytes ? t("Unknown size") : bytes(release.sizeBytes);
 export interface SourceSettings {
   enabled: SourceId[];
   acknowledged: boolean;
   noticeVersion: number;
+  remoteGeneration?: number;
   options: {
     id: SourceId;
     label: string;
@@ -186,15 +206,11 @@ export interface LibraryGame {
   installed: boolean;
   mounted: boolean;
   onDrive: boolean;
-  managed: boolean;
-  canManageSource: boolean;
   installedSizeBytes: number | null;
   sizeBytes: number | null;
   sizeStatus: "ready" | "unknown" | "unavailable";
   cover?: string;
   coverFallback?: string | null;
-  /** Listed by Orbit because the running ShadowMount doesn't list installed PKGs. */
-  foundByOrbit?: boolean;
 }
 export interface LibraryAction {
   id: string;
@@ -202,22 +218,6 @@ export interface LibraryAction {
   titleId: string;
   state: "queued" | "running" | "complete" | "error";
   message: string;
-}
-export interface StorageJob {
-  id: number;
-  operation: string;
-  state: string;
-  titleId: string;
-  source: string;
-  destination: string;
-  error: string;
-  result: number;
-  totalBytes: number;
-  processedBytes: number;
-  speed: number;
-  active: boolean;
-  cancellable: boolean;
-  cancelRequested: boolean;
 }
 export interface LibrarySnapshot {
   status: "idle" | "ready" | "unavailable" | "unsupported" | "error";
@@ -232,26 +232,19 @@ export interface LibrarySnapshot {
   games: LibraryGame[];
   capabilities: string[];
   action: LibraryAction | null;
-  storageJob: StorageJob | null;
-  storageError: string;
-  storageBusy: boolean;
-  // Automatic work: a scan ShadowMount is running, game sizes being measured.
+  // A scan Orbit asked Kraken Mount for.
   scanning?: boolean;
-  measuring?: boolean;
 }
 export interface LibraryDrive {
   id: string;
   path: string;
-  mountPoint: string;
   label: string;
-  filesystem: string;
-  readOnly: boolean;
   totalBytes: number;
   freeBytes: number;
   usedBytes: number;
 }
 // Files: what is on the PS5's drives, by drive and path relative to its top.
-export type FileType = "folder" | "game" | "archive" | "package" | "image" | "file";
+export type FileType = "folder" | "game" | "archive" | "package" | "file";
 export interface FileEntry {
   name: string;
   folder: boolean;
@@ -259,7 +252,7 @@ export interface FileEntry {
   // Files only; a folder's size is measured on request.
   sizeBytes: number | null;
   modifiedAt: number;
-  // Why it can't be changed: "", or drive, orbit, download, game, install or busy.
+  // Why it can't be changed: "", or drive, orbit, download, install or busy.
   locked: string;
 }
 export interface FileListing {
@@ -289,11 +282,7 @@ export interface FileOperation {
 }
 export interface LibraryStorage {
   drives: LibraryDrive[];
-  destinations: LibraryDrive[];
-  busy: boolean;
-  stale: boolean;
   updatedAt: number;
-  error: string;
 }
 export interface LibraryTarget {
   titleId?: string;
@@ -303,6 +292,7 @@ export interface LibraryTarget {
 }
 export interface System {
   catalogueRevision: number;
+  instanceId?: string;
   name: string;
   version: string;
   platform: "desktop" | "ps5" | "fixture";
@@ -356,15 +346,11 @@ export interface AutoStart {
   homebrewLauncher?: { installed: boolean; listed: boolean; managed: boolean };
   etaHEN?: { installed: boolean };
 }
-// "7z · exFAT" for a compressed option, otherwise its format.
-export function contentFormat(r: Pick<Release, "format" | "contentFormat" | "assetCompression">) {
-  return r.assetCompression === "ZSTD" ? "ZSTD" : r.contentFormat === "LZ4" ? "LZ4" : r.format;
-}
-export function formatLabel(r: Pick<Release, "format" | "compression" | "contentFormat" | "assetCompression">) {
-  const format = contentFormat(r);
-  if (!r.compression) return format;
+// "RAR · PKG" for a compressed option, otherwise its format.
+export function formatLabel(r: Pick<Release, "format" | "compression">) {
+  if (!r.compression) return r.format;
   const kind = r.compression === "7z" ? "7z" : r.compression.toUpperCase();
-  return format === "Unknown" ? kind : `${kind} · ${format}`;
+  return `${kind} · ${r.format}`;
 }
 const tenths = { minimumFractionDigits: 1, maximumFractionDigits: 1 };
 // 49.4 GB in English, 49,4 GB in German, 49,4 ГБ in Russian, 49,4 Go in French.

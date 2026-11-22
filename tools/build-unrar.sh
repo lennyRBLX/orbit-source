@@ -10,7 +10,8 @@ mkdir -p "$root/.deps"
 if ! test -f "$archive"; then
   curl -fL --retry 3 "https://www.rarlab.com/rar/unrarsrc-$version.tar.gz" -o "$archive"
 fi
-printf '%s  %s\n' 01d903a7dcf413cb2925696d7796e48e38d471f79bfe7ef3ad2aebf6c12dbefd "$archive" | sha256sum -c -
+sha256_check() { if command -v sha256sum >/dev/null; then sha256sum -c -; else shasum -a 256 -c -; fi; }
+printf '%s  %s\n' 01d903a7dcf413cb2925696d7796e48e38d471f79bfe7ef3ad2aebf6c12dbefd "$archive" | sha256_check
 if ! test -f "$src/dll.cpp"; then
   tar -xzf "$archive" -C "$root/.deps"
 fi

@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "remote_sources.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -100,7 +101,7 @@ static Event job_event(const Job *j) {
     if (!j) return e;
     for (size_t i = 0; i < orbit.job_count; i++)
         if (j == &orbit.jobs[i]) e.download = (unsigned)i + 1;
-    e.provider = ALLOWED(j->release.source, "archive", "vikingfile", "akirabox", "datanodes", "1fichier");
+    e.provider = ALLOWED(j->release.source, "archive", "vikingfile", "akirabox", "datanodes", "1fichier", "remote");
     e.status = ALLOWED(j->status, "queued", "downloading", "verifying", "waiting-extraction", "inspecting", "extracting", "retrying", "paused", "cancelled", "complete", "error");
     e.reason = reason(j->error);
     e.attempts = j->attempts;
@@ -113,7 +114,7 @@ static Event job_event(const Job *j) {
 void diagnostics_event_locked(const char *phase, const Job *j, long http_status, int curl_code) {
     Event e = job_event(j);
     if (!started) started = e.at;
-    e.phase = ALLOWED(phase, "startup", "catalogue-cache", "https", "saved-state", "process-identity", "pairing", "firmware", "listener", "listener-recovery", "download-worker", "launcher", "integrations", "catalogue", "updates", "kraken", "library", "browser", "tv-app", "artwork", "notification", "ready", "shutdown", "browser-modules", "browser-user-service", "browser-launch", "browser-user-cleanup", "browser-native-identity", "browser-native-identity-cleanup", "browser-native-return", "queued", "pause", "resume", "retry", "cancel", "transfer-start", "transfer-end", "extract-start", "drive-recognised");
+    e.phase = ALLOWED(phase, "startup", "catalogue-cache", "https", "saved-state", "process-identity", "pairing", "firmware", "listener", "listener-recovery", "download-worker", "launcher", "integrations", "catalogue", "remote-sources", "remote-refresh", "updates", "kraken", "library", "browser", "artwork", "notification", "ready", "shutdown", "browser-modules", "browser-user-service", "browser-launch", "browser-user-cleanup", "browser-native-identity", "browser-native-identity-cleanup", "browser-native-return", "queued", "pause", "resume", "retry", "cancel", "transfer-start", "transfer-end", "extract-start", "drive-recognised");
     e.http_status = http_status >= 100 && http_status <= 599 ? http_status : 0;
     e.curl_code = curl_code >= 0 && curl_code <= 999 ? curl_code : 0;
     events[event_next] = e;
@@ -168,9 +169,10 @@ cJSON *diagnostics_snapshot(void) {
     cJSON_AddNumberToObject(o, "catalogueRevision", orbit.catalog_revision);
     cJSON *launcher = cJSON_AddObjectToObject(o, "launcher");
     cJSON_AddStringToObject(launcher, "status", ALLOWED(orbit.launcher_status, "ready", "error", "checking", "not-included"));
-    cJSON_AddStringToObject(launcher, "method", ALLOWED(orbit.launcher_registration_method, "title-directory", "unavailable", "not-needed"));
+    cJSON_AddStringToObject(launcher, "method", ALLOWED(orbit.launcher_registration_method, "title-directory", "system-refresh", "unavailable", "not-needed"));
     cJSON_AddBoolToObject(launcher, "hasError", !!*orbit.launcher_error);
     cJSON_AddItemToObject(o, "browser", browser_diagnostics_locked());
+    cJSON_AddItemToObject(o, "remoteSources", remote_sources_diagnostics_locked());
     cJSON *downloads = cJSON_AddArrayToObject(o, "downloads");
     for (size_t i = 0; i < orbit.job_count; i++) {
         if (!*orbit.jobs[i].id) continue;

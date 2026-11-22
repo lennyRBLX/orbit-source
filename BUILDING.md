@@ -1,8 +1,8 @@
 # Building Orbit Store 1.9.6
 
-Orbit 1.9.6 follows Vikingfile’s move of its file pages to a new address, so Vikingfile downloads open and start again. This source bundle builds the PS5 service and native TV app. Orbit Zero is maintained and packaged separately. See [release notes](https://github.com/saawant12/orbit-store-ps5/releases/tag/v1.9.6) for the user-facing changes.
+Orbit 1.9.6 follows Vikingfile’s move of its file pages to a new address, so Vikingfile downloads open and start again. This source bundle builds the PS5 service and browser interface. Orbit Zero is maintained and packaged separately. See [release notes](https://github.com/saawant12/orbit-store-ps5/releases/tag/v1.9.6) for the user-facing changes.
 
-This source builds the Orbit **1.9.6** service/browser payload and the native TV app **1.13.6** (`PPSA99177`, content version `01.013.006`). The TV app includes the payload built from this tree. Game metadata and external artwork URLs come from the included catalogue snapshot; builds do not fetch game artwork.
+This source builds the Orbit **1.9.6** service/browser payload. Game metadata and external artwork URLs come from the included catalogue snapshot; builds do not fetch game artwork.
 
 Requirements: Node.js 22+, Python 3, a host C compiler, OpenSSL development files and Docker. On macOS use the Command Line Tools and `brew install openssl@3`; the build container already supplies Clang and OpenSSL. Run host Python tools through a project virtual environment. Catalogue tools compile a small host helper against OpenSSL; no extra Python packages are required.
 
@@ -30,44 +30,18 @@ The source bundle includes the exact cJSON and CA files used for the published b
 
 To rebuild with modified libmicrohttpd, curl, OpenSSL, libarchive, liblzma, bzip2 or zlib, unpack the included source archive, adapt `tools/build-deps.sh` to use it, rebuild `orbit-build:0.1`, and rebuild the payload. Rebuild the image after pulling these archive-extraction changes too; host tests link the same libarchive through `tools/build-host-archive.sh`. The same source permits relinking the statically linked libmicrohttpd.
 
-## Native TV app
-
-Build the payload first, then:
-
-```sh
-docker build -t orbit-app-build:0.1 app
-docker run --rm --cpus 2 --memory 6g -v "$PWD:/work" -w /work/app -e BUILD_JOBS=2 orbit-app-build:0.1 make ffpkg
-docker run --rm --cpus 2 --memory 6g -v "$PWD:/work" -w /work/app orbit-app-build:0.1 bash tools/verify-package.sh
-```
-
-Outputs are `app/dist/PPSA99177.ffpkg`, the unpacked app folder and its ZIP. The verification command extracts the actual FFPKG and compares its bundled ELF, version, executable and metadata with the build inputs. In an unpacked source archive without Git metadata, verification uses the commit in the adjacent source bundle's `SOURCES.json` (or pass `ORBIT_SOURCE_COMMIT` explicitly).
-
-The app uses pinned ps5-opengl 1.0.0, PS5 SDK v0.42, PacBrew's libwebp 1.4.0 and the LLVM runtime libraries listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Build tooling, dependency hashes and runtime shim source are included. See [app/README.md](app/README.md) and [SOURCE-BUNDLE.md](SOURCE-BUNDLE.md) for component rebuild instructions.
-
 ## Interface languages
 
-The browser interface and the TV app share the catalogues in `i18n/`. English text is the key, so a string without a translation shows in English. After adding or changing interface text (`t()`, `tn()` or `rich()` in `src/`, `tr()` or `trn()` in `app/src/orbit/`, or a fixed message in `backend/`), refresh the list and see what each language is missing:
+The browser interface uses the catalogues in `i18n/`. English text is the key, so a string without a translation shows in English. After adding or changing interface text (`t()`, `tn()` or `rich()` in `src/`, or a fixed message in `backend/`), refresh the list and see what each language is missing:
 
 ```sh
 node tools/i18n.mjs extract   # rewrites i18n/en.json
 node tools/i18n.mjs check     # lists missing, unused and mismatched translations
 ```
 
-`npm test` fails until every language has every string with the same `{placeholders}`. The TV app follows the PS5's system language; the browser follows the browser's language unless one is chosen in App settings.
+`npm test` fails until every language has every string with the same `{placeholders}`. The browser follows the browser's language unless one is chosen in App settings.
 
-For a new language, register its code and native name in `src/i18n.ts`, include it in `tools/i18n.mjs`, and add its system-language mapping and number/date formats in `app/src/orbit/i18n.cpp`. The native build packages every non-English JSON catalogue automatically. Check the font atlas for every character the translation uses.
-
-### Native language fonts
-
-The package includes pre-baked Noto Arabic and CJK atlases; normal builds do not need FontTools. To rebuild fonts after changing translations or character sets:
-
-```sh
-python3 -m venv .font-tools
-.font-tools/bin/pip install fonttools==4.66.1
-PYTHON="$PWD/.font-tools/bin/python" bash app/tools/bake-fonts.sh
-```
-
-The baker converts Noto CJK’s CFF curves to quadratic outlines before generating SDFs. `charsets.py` includes the language’s standard character set plus translated UI characters. A small set of language-picker glyphs is added to each primary font; only the selected language’s full fallback atlas is loaded at runtime. The original fonts, conversion scripts and OFL licences are included in the source bundle. Arabic shaping and right-to-left layout are handled by the native renderer.
+For a new language, register its code and native name in `src/i18n.ts` and include it in `tools/i18n.mjs`.
 
 The Hungarian catalogue was contributed by [isty1974 in issue #13](https://github.com/saawant12/orbit-store-ps5/issues/13#issuecomment-6065940183), with newer interface messages filled in for this version.
 
@@ -76,12 +50,11 @@ The Hungarian catalogue was contributed by [isty1974 in issue #13](https://githu
 ```sh
 npm test
 npm run test:catalog
-docker run --rm --cpus 2 --memory 6g --network none -v "$PWD:/work" orbit-build:0.1 test-art test-tv-app test-updates
-docker run --rm --cpus 2 --memory 6g --network none -v "$PWD:/work" -w /work/app orbit-app-build:0.1 make test
+docker run --rm --cpus 2 --memory 6g --network none -v "$PWD:/work" orbit-build:0.1 test-art test-updates
 ```
 
-Run tests in a checkout; root development tests are omitted from the release source archive. Native app tests remain with its vendored source. None of these commands contact a console.
+Run tests in a checkout; root development tests are omitted from the release source archive. None of these commands contact a console.
 
-From a clean release commit, rebuild both binaries, run the package verification, then `npm run release:package`. The command checks release evidence, version agreement, artifact freshness, package identities and dependency source hashes. It stages both binaries, their checksums, exact source and licence bundle, release notes and both official feeds under `build/release-1.9.6/`. It never uploads or installs anything. Publish feed changes only after their binary URLs are live and their hashes verified.
+From a clean release commit, rebuild the payload, then `npm run release:package`. The command checks release evidence, version agreement, artifact freshness and dependency source hashes. It stages the payload, its checksum, exact source and licence bundle, release notes and the official payload feed under `build/release-1.9.6/`. It never uploads or installs anything. Publish feed changes only after their binary URLs are live and their hashes verified.
 
 For local preparation before the console smoke check, use `npm run release:package -- --review`. This creates `build/review-1.9.6/` with the remaining release gates recorded; it does not publish or waive them.

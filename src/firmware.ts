@@ -33,9 +33,10 @@ export function compatibleFirst<T extends Facts>(releases: T[]) {
 }
 
 export function downloadFirmwareNote(job: Facts & { firmwareSource?: string; consoleFirmware?: string; backport?: boolean; titleId?: string }) {
-  // ShadowMount+ applies a backport only from backports/<TITLE_ID>/, not from inside the game's folder.
+  // Kraken Mount applies a backport only from <scan folder>/backports/<TITLE_ID>/ (or /data/homebrew/backports/),
+  // not from inside the game's folder (kraken-mount src/scan.rs backport_for).
   if (job.backport && job.firmwareIssue === "newer-firmware")
-    return t("This download needs firmware {version} or later. This PS5 is on {current}. It includes a backport for older firmware. To use it with ShadowMount+, move the folder that contains fakelib to /data/homebrew/backports/ and name it {titleId}. You can do this in {place}.", {
+    return t("This download needs firmware {version} or later. This PS5 is on {current}. It includes a backport for older firmware. To use it with Kraken Mount, move the folder that contains fakelib to /data/homebrew/backports/ and name it {titleId}. You can do this in {place}.", {
       version: job.requiredFirmware || "", current: job.consoleFirmware || "", titleId: job.titleId || "",
       place: `${t("Library")} → ${t("Files")}`,
     });

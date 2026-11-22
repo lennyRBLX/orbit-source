@@ -8,9 +8,11 @@ mkdir -p "$src"
 if ! test -f "$archive"; then
   curl -fL --retry 3 https://github.com/ip7z/7zip/releases/download/26.03/7z2603-src.7z -o "$archive"
 fi
-printf '%s  %s\n' 41e2a7c0e9f838351c625e01f0f581a2188bb3dda10c8e0b4a852da26546ffe2 "$archive" | sha256sum -c -
+sha256_check() { if command -v sha256sum >/dev/null; then sha256sum -c -; else shasum -a 256 -c -; fi; }
+printf '%s  %s\n' 41e2a7c0e9f838351c625e01f0f581a2188bb3dda10c8e0b4a852da26546ffe2 "$archive" | sha256_check
 if ! test -f "$src/CPP/7zip/Bundles/Format7zF/makefile.gcc"; then
-  7z x -y -bso0 -bsp0 "-o$src" "$archive"
+  if command -v 7z >/dev/null; then 7z x -y -bso0 -bsp0 "-o$src" "$archive"
+  else bsdtar -xf "$archive" -C "$src"; fi # macOS: the system bsdtar reads 7z
 fi
 target=${1:-host}
 python3 "$root/tools/patch-7zip.py"

@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Icon } from "./components";
-import type { SourceId, SourceSettings } from "./types";
-import { formatNumber, t, tn } from "./i18n";
+import type { RemoteSource, RemoteSources, SourceId, SourceSettings } from "./types";
+import { ApiError, addRemoteSource, enableRemoteSource, refreshRemoteSources, remoteSources, removeRemoteSource } from "./api";
+import { formatDate, formatNumber, t, tn } from "./i18n";
 
 export function Sources({
   settings,
@@ -78,7 +79,7 @@ export function Sources({
                 }
               >
                 <span className="source-row-text">
-                  <strong>{source.label}</strong>
+                  <strong>{t(source.label)}</strong>
                   <small>
                     {tn(source.releaseCount, "{count} download option", "{count} download options", {
                       count: formatNumber(source.releaseCount),
@@ -107,7 +108,7 @@ export function Sources({
               type="button"
               role="checkbox"
               aria-checked={checked}
-              aria-label={source.label}
+              aria-label={t(source.label)}
               className={`source-card ${checked ? "selected" : ""}`}
               disabled={pending}
               onClick={() =>
@@ -121,7 +122,7 @@ export function Sources({
               <span className="choice-check" aria-hidden="true">
                 {checked && <Icon name="check" />}
               </span>
-              {source.label}
+              {t(source.label)}
             </button>
           );
         })}
@@ -183,6 +184,173 @@ export function Sources({
       <p className="fine">
         {t("Saved for this console and its paired devices.")}
       </p>
+      <CommunityCatalogues
+        paired={paired}
+        pair={pair}
+        canRefresh={settings.acknowledged}
+      />
     </form>
+  );
+}
+
+const noticeKey = "orbit.community-catalogue-notice.v1";
+
+function sourceError(source: RemoteSource) {
+  switch (source.lastError) {
+    case "": return "";
+    case "invalid-entries":
+      return t("Skipped catalogue entries: {count}", { count: formatNumber(source.skippedEntries) });
+    case "invalid-catalogue": return t("The response is not a Pegasus catalogue.");
+    case "too-large": return t("The catalogue exceeds 8 MB.");
+    case "storage": return t("Could not save community catalogues.");
+    case "limit": return t("The catalogue contains more options than Orbit can store.");
+    default: return t("Could not refresh this catalogue.");
+  }
+}
+
+function CommunityCatalogues({ paired, pair, canRefresh }: {
+  paired: boolean;
+  pair: () => void;
+  canRefresh: boolean;
+}) {
+  const [snapshot, setSnapshot] = useState<RemoteSources | null>(null);
+  const [url, setUrl] = useState("");
+  const [notice, setNotice] = useState(false);
+  const [noticeRead, setNoticeRead] = useState(() => {
+    try { return localStorage.getItem(noticeKey) === "1"; }
+    catch { return false; }
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const requestVersion = useRef(0);
+  const [refreshAfter, setRefreshAfter] = useState(0);
+  const retryAfter = Math.ceil(Math.max(0, refreshAfter - Date.now()) / 1000);
+
+  const update = useCallback((data: RemoteSources) => {
+    setSnapshot(data);
+    setRefreshAfter(data.retryAfter ? Date.now() + data.retryAfter * 1000 : 0);
+  }, []);
+  useEffect(() => {
+    if (!refreshAfter) return;
+    const timer = window.setTimeout(() => setRefreshAfter(0), Math.max(0, refreshAfter - Date.now()));
+    return () => window.clearTimeout(timer);
+  }, [refreshAfter]);
+
+  useEffect(() => {
+    if (!paired || busy) return;
+    let alive = true;
+    async function poll() {
+      const version = requestVersion.current;
+      try {
+        const data = await remoteSources();
+        if (alive && version === requestVersion.current) update(data);
+      } catch (e) {
+        if (alive && version === requestVersion.current)
+          setError((current) => current || (e as Error).message);
+      }
+    }
+    void poll();
+    const timer = window.setInterval(poll, 3000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [paired, busy, update]);
+
+  async function change(run: () => Promise<RemoteSources>, done?: () => void) {
+    requestVersion.current++;
+    setBusy(true);
+    setError("");
+    try {
+      update(await run());
+      done?.();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 429 && e.retryAfter)
+        setRefreshAfter(Date.now() + e.retryAfter * 1000);
+      else setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function add() {
+    if (!url.trim()) return;
+    if (!noticeRead && !notice) {
+      setNotice(true);
+      return;
+    }
+    void change(() => addRemoteSource(url.trim()), () => {
+      setUrl("");
+      setNotice(false);
+      setNoticeRead(true);
+      try { localStorage.setItem(noticeKey, "1"); } catch { /* Session-only preference. */ }
+    });
+  }
+
+  return (
+    <section className="community-catalogues" aria-label={t("Community catalogues")}>
+      <h2>{t("Community catalogues")}</h2>
+      {!paired ? <button type="button" onClick={pair}>{t("Pair to manage catalogues")}</button> : <>
+        {snapshot?.sources.map((source) => (
+          <div key={source.id} className="community-source">
+            <button
+              type="button"
+              className="source-row"
+              role="switch"
+              aria-checked={source.enabled}
+              disabled={busy}
+              onClick={() => void change(() => enableRemoteSource(source.id, !source.enabled))}
+            >
+              <span className="source-row-text">
+                <strong>{source.name === "Custom catalogue" ? t("Custom catalogue") : source.name}</strong>
+                <small>
+                  {tn(source.entryCount, "{count} download option", "{count} download options",
+                    { count: formatNumber(source.entryCount) })}
+                  {" · "}
+                  {source.lastFetchedAt
+                    ? formatDate(source.lastFetchedAt * 1000, { dateStyle: "short", timeStyle: "short" })
+                    : t("Never refreshed")}
+                </small>
+                {source.lastError && <small>{sourceError(source)}</small>}
+              </span>
+              <span className="source-switch" aria-hidden="true" />
+            </button>
+            {!source.builtIn && (
+              <button type="button" disabled={busy} onClick={() => void change(() => removeRemoteSource(source.id))}>
+                {t("Remove")}
+              </button>
+            )}
+          </div>
+        ))}
+        <div className="community-add">
+          <input
+            type="text"
+            inputMode="url"
+            maxLength={2048}
+            aria-label={t("Add catalogue URL")}
+            placeholder={t("Add catalogue URL")}
+            value={url}
+            disabled={busy}
+            onChange={(event) => { setUrl(event.target.value); setNotice(false); }}
+            onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add(); } }}
+          />
+          <button type="button" disabled={busy || !url.trim()} onClick={add}>
+            {notice ? t("Acknowledge and add") : t("Add catalogue")}
+          </button>
+        </div>
+        {notice && <p className="fine" role="status">
+          {t("This is a third-party catalogue. Orbit does not vet it. You are responsible for having permission to download the files it lists.")}
+        </p>}
+        <button
+          type="button"
+          disabled={busy || !canRefresh || !snapshot?.sources.some((source) => source.enabled) || retryAfter > 0}
+          onClick={() => void change(refreshRemoteSources)}
+        >
+          {t("Refresh now")}
+        </button>
+        {snapshot?.refreshing && <p className="fine" role="status">{t("Refreshing catalogues…")}</p>}
+        {retryAfter > 0 && (
+          <p className="fine">{t("Please wait {seconds} s before another request.", { seconds: retryAfter })}</p>
+        )}
+        {error && <p className="form-error" role="alert">{error}</p>}
+      </>}
+    </section>
   );
 }

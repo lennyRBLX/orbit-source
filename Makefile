@@ -13,7 +13,7 @@ PAYLOAD_SOURCES := $(SOURCES) launcher/install.c launcher/platform_ps5.c
 PAYLOAD_CC = $(PS5_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_INSTALL_LAUNCHER -Wno-unreachable-code-generic-assoc -I$(PS5_LIB)/include
 # The SDK opens DT_NEEDED libraries in order. AppInst uses Ipmi internally;
 # retain and load Ipmi first even though Orbit does not call its API directly.
-PS5_LAUNCHER_LIBS := -Wl,--push-state,--no-as-needed -lSceIpmi -Wl,--pop-state -lSceAppInstUtil
+PS5_LAUNCHER_LIBS := -Wl,--push-state,--no-as-needed -lSceIpmi -Wl,--pop-state -lSceUserService -lSceAppInstUtil
 PS5_ARCHIVE_DEPS := build/sqlite-ps5.o build/sevenzip-ps5.o .deps/7zip-ps5/liborbit7zip.a build/unrar-ps5.o .deps/unrar-ps5/liborbitunrar.a
 HOST_ARCHIVE_DEPS := build/sqlite-host.o build/sevenzip-host.o .deps/7zip-host/liborbit7zip.a build/unrar-host.o .deps/unrar-host/liborbitunrar.a
 ARCHIVE_LIBS := build/sqlite-ps5.o -larchive -llzma -lbz2 -lz build/sevenzip-ps5.o -Wl,--whole-archive .deps/7zip-ps5/liborbit7zip.a -Wl,--no-whole-archive build/unrar-ps5.o .deps/unrar-ps5/liborbitunrar.a -lc++ -lc++abi -lunwind
@@ -96,10 +96,6 @@ test-storage: build/orbit-storage-test
 .PHONY: test-art
 test-art: build/orbit-test
 	python3 tests/art_integration.py
-
-.PHONY: test-tv-app
-test-tv-app: build/orbit-test
-	python3 tests/tvapp_integration.py
 
 .PHONY: test-announcements
 test-announcements: build/orbit-test
@@ -191,18 +187,18 @@ test-transfer-benchmark: build/orbit-transfer-benchmark-test
 	python3 tests/console_benchmark_integration.py
 
 .PHONY: test-viking
-build/orbit-providers-test: backend/providers.c backend/orbit.h tests/providers_driver.c
-	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_DESKTOP backend/providers.c tests/providers_driver.c -o $@
+build/orbit-providers-test: backend/providers.c backend/provider_network.c backend/orbit.h tests/providers_driver.c
+	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_DESKTOP backend/providers.c backend/provider_network.c tests/providers_driver.c -o $@ -lcurl
 test-viking: build/orbit-test build/orbit-providers-test
 	./build/orbit-providers-test
 	python3 tests/viking_integration.py
 build/orbit-launcher-test: launcher/install.c launcher/install.h tests/launcher_driver.c build/generated/launcher.h
 	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) launcher/install.c tests/launcher_driver.c -o $@
 build/orbit-launcher-platform-test: launcher/platform_ps5.c launcher/install.h tests/launcher_platform_driver.c tests/stubs/ps5/kernel.h
-	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -Itests/stubs launcher/platform_ps5.c tests/launcher_platform_driver.c -Wl,--wrap=dlsym -o $@
+	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -Itests/stubs -DORBIT_LAUNCHER_PLATFORM_TEST -Ddlsym=orbit_test_dlsym -Dlstat=orbit_test_lstat -Dnanosleep=orbit_test_nanosleep launcher/platform_ps5.c tests/launcher_platform_driver.c -o $@
 test-launcher: build/orbit-launcher-test build/orbit-launcher-platform-test
 	python3 tests/launcher_integration.py
-	python3 tests/launcher_platform.py
+	./build/orbit-launcher-platform-test
 test-payload-imports: payload payload-core
 	python3 tests/payload_imports.py
 
@@ -279,3 +275,8 @@ test-browser-capture: build/orbit-test build/orbit-browser-capture-test
 .PHONY: test-concurrency
 test-concurrency: build/orbit-test
 	python3 tests/concurrency_integration.py
+
+REMOTE_TEST_SOURCES := backend/catalog.c backend/catalog_crypto.c backend/catalog_view.c backend/download_policy.c backend/favorites.c backend/providers.c backend/provider_network.c backend/remote_catalog.c backend/remote_download.c backend/remote_sources.c backend/saved_filters.c backend/sources.c backend/state.c backend/state_file.c .deps/cjson/cJSON.c tests/remote_catalog_driver.c
+build/orbit-remote-catalog-test: $(REMOTE_TEST_SOURCES) $(HEADERS) build/generated/catalog.h build/generated/ca.h build/generated/network.h
+	@mkdir -p build
+	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_DESKTOP -DORBIT_TEST -DORBIT_REMOTE_TEST_CLOCK $(REMOTE_TEST_SOURCES) -o $@ $(LDFLAGS) -lcurl -lcrypto -lz -lpthread -lm

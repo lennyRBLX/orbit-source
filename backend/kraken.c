@@ -9,6 +9,7 @@
 #include <curl/curl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #define KRAKEN_PORT 8097
@@ -17,12 +18,16 @@
 #define KRAKEN_CHECK_GAP 15
 #define KRAKEN_FOLLOW_GAP 3
 #define KRAKEN_FOLLOW_TIME 600
+/* Unanswered or unreadable reads in a row before Kraken Mount counts as stopped: one slow
+ * answer while it builds a game must not end what Orbit is following. */
+#define KRAKEN_FAILURES 3
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static pthread_t worker;
 static bool started, stopping, scan_wanted;
-static atomic_bool active, checked;
+static atomic_bool active, checked, waiting_state;
+static int failures;
 static cJSON *games;
 static char version[32];
 static time_t follow_until;
@@ -110,8 +115,9 @@ static bool title_id(const char *id) {
         if (i < 4 ? !(id[i] >= 'A' && id[i] <= 'Z') : !isdigit((unsigned char)id[i])) return false;
     return true;
 }
-/* Kraken Mount's game list in Orbit's names. Entries Orbit can't trust are left out;
- * duplicates (a second copy of a title it already runs) are not games of their own. */
+/* Kraken Mount's game list in Orbit's names. Entries Orbit can't trust are left out. A
+ * duplicate (a second copy of a title it already runs) stays, with that status, so a
+ * download that is one can say so; each path is listed once. */
 static cJSON *normalize(const cJSON *state) {
     const cJSON *list = cJSON_GetObjectItemCaseSensitive(state, "games"), *g;
     if (!cJSON_IsArray(list)) return NULL;
@@ -121,13 +127,13 @@ static cJSON *normalize(const cJSON *state) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(g, "title_id"), *path = cJSON_GetObjectItemCaseSensitive(g, "path");
         const char *kind = json_text(g, "kind"), *status = json_text(g, "status");
         if (!plain_text(id, 9) || !title_id(id->valuestring) || !plain_text(path, 4095) || path->valuestring[0] != '/' ||
-            (strcmp(kind, "pkg") && strcmp(kind, "folder")) || !strcmp(status, "duplicate") ||
+            (strcmp(kind, "pkg") && strcmp(kind, "folder")) ||
             (strcmp(status, "pending") && strcmp(status, "checking") && strcmp(status, "building") &&
-             strcmp(status, "ready") && strcmp(status, "error")))
+             strcmp(status, "ready") && strcmp(status, "error") && strcmp(status, "duplicate")))
             continue;
         bool listed = false;
         const cJSON *prior;
-        cJSON_ArrayForEach(prior, out) if (!strcmp(json_text(prior, "titleId"), id->valuestring)) listed = true;
+        cJSON_ArrayForEach(prior, out) if (!strcmp(json_text(prior, "path"), path->valuestring)) listed = true;
         if (listed) continue;
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "titleId", id->valuestring);
@@ -167,13 +173,19 @@ static void *run(void *unused) {
         cJSON *state = port ? request(port, "/api/state", false, NULL) : NULL;
         cJSON *list = state ? normalize(state) : NULL;
         const cJSON *waiting = cJSON_GetObjectItemCaseSensitive(state, "waiting");
-        bool next_active = list && (!waiting || cJSON_IsNull(waiting));
+        bool answered = list != NULL, held = answered && waiting && !cJSON_IsNull(waiting);
         const cJSON *v = cJSON_GetObjectItemCaseSensitive(state, "version");
         pthread_mutex_lock(&lock);
-        cJSON_Delete(games);
-        games = next_active ? list : NULL;
-        if (!next_active) cJSON_Delete(list);
-        copy_text(version, sizeof version, next_active && plain_text(v, 31) ? v->valuestring : "");
+        failures = answered ? 0 : failures + 1;
+        /* No answer: keep the last good list and state until KRAKEN_FAILURES in a row. */
+        bool next_active = answered ? !held : atomic_load(&active) && failures < KRAKEN_FAILURES;
+        if (answered || !next_active) {
+            cJSON_Delete(games);
+            games = answered && next_active ? list : NULL;
+            if (games != list) cJSON_Delete(list);
+            copy_text(version, sizeof version, next_active && plain_text(v, 31) ? v->valuestring : "");
+            atomic_store(&waiting_state, held);
+        }
         bool was = atomic_exchange(&active, next_active);
         atomic_store(&checked, true);
         next = now_seconds() + (follow_until > now_seconds() ? KRAKEN_FOLLOW_GAP : KRAKEN_CHECK_GAP);
@@ -202,6 +214,8 @@ int kraken_start(void) {
     int rc = pthread_create(&worker, &attr, run, NULL);
     pthread_attr_destroy(&attr);
     started = !rc;
+    /* Nothing will ever ask: say so, so nothing waits for Kraken Mount's first answer. */
+    if (rc) atomic_store(&checked, true);
     pthread_mutex_unlock(&lock);
     return rc;
 }
@@ -218,10 +232,13 @@ void kraken_stop(void) {
     games = NULL;
     atomic_store(&active, false);
     atomic_store(&checked, false);
+    atomic_store(&waiting_state, false);
+    failures = 0;
     pthread_mutex_unlock(&lock);
 }
 bool kraken_active(void) { return atomic_load(&active); }
 bool kraken_checked(void) { return atomic_load(&checked); }
+bool kraken_waiting(void) { return atomic_load(&waiting_state); }
 void kraken_version(char *out, size_t cap) {
     pthread_mutex_lock(&lock);
     copy_text(out, cap, version);
@@ -232,6 +249,23 @@ cJSON *kraken_games(void) {
     cJSON *out = games && atomic_load(&active) ? cJSON_Duplicate(games, true) : NULL;
     pthread_mutex_unlock(&lock);
     return out;
+}
+bool kraken_path_in_use(const char *abs_path, char *status, size_t cap) {
+    if (cap) *status = 0;
+    bool found = false;
+    pthread_mutex_lock(&lock);
+    const cJSON *g;
+    cJSON_ArrayForEach(g, games) {
+        const char *path = json_text(g, "path");
+        size_t n = strlen(path);
+        if (n && !strncmp(abs_path, path, n) && (!abs_path[n] || abs_path[n] == '/')) {
+            copy_text(status, cap, json_text(g, "status"));
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return found;
 }
 void kraken_scan_soon(void) {
     pthread_mutex_lock(&lock);
@@ -244,4 +278,15 @@ bool kraken_scan_folder(const char *root, const char *folder) {
     if (!strcmp(folder, "homebrew") || !strcmp(folder, "etaHEN/games")) return true;
     /* The top of an M.2/extended or USB drive, never the console's own storage. */
     return !*folder && (!strncmp(root, "/mnt/ext", 8) || !strncmp(root, "/mnt/usb", 8));
+}
+bool kraken_scan_place(const char *root, const char *folder) {
+    if (kraken_scan_folder(root, folder)) return true;
+    const char *leaf = strrchr(folder, '/');
+    char parent[1024];
+    if (!leaf || (size_t)(leaf - folder) >= sizeof parent) return false;
+    memcpy(parent, folder, (size_t)(leaf - folder));
+    parent[leaf - folder] = 0;
+    leaf++;
+    /* A drive's top is never descended; dot folders and backports (any case) are skipped. */
+    return *parent && kraken_scan_folder(root, parent) && *leaf && *leaf != '.' && strcasecmp(leaf, "backports");
 }

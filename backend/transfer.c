@@ -67,9 +67,13 @@ typedef struct Transfer {
 #endif
 } Transfer;
 static bool torbox(const Transfer *t) { return !strcmp(t->job->delivery, "torbox"); }
-static bool guarded(const Transfer *t) { return torbox(t) || provider_browser_source(t->release->source); }
+static bool remote_transfer(const Transfer *t) { return !strcmp(t->release->source, "remote"); }
+static bool guarded(const Transfer *t) {
+    return torbox(t) || remote_transfer(t) || provider_browser_source(t->release->source);
+}
 static bool address_allowed(const Transfer *t, const char *url) {
-    return torbox(t) ? debrid_transfer_url_allowed(url) : provider_transfer_url_allowed(url);
+    if (torbox(t)) return debrid_transfer_url_allowed(url);
+    return remote_transfer(t) ? remote_https_url(url) : provider_transfer_url_allowed(url);
 }
 static double seconds(void) {
     struct timespec t;
@@ -241,6 +245,7 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         if (!t->capture_probe && guarded(t) && (t->status == 401 || t->status == 403 || t->status == 404 || t->status == 410)) {
             copy_text(t->error, sizeof t->error, torbox(t)
                 ? "TorBox rejected the download link. Resume to request a fresh link. Your partial file is kept."
+                : remote_transfer(t) ? "The community catalogue download link was rejected."
                 : "The saved download link was rejected. Choose Refresh download link to verify with the provider again. Your partial file is kept.");
             return 0;
         }
@@ -277,7 +282,8 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         /* Vikingfile's signed route already identifies the exact filename.
          * Its storage server may return only a bare attachment disposition. */
         bool viking_route = t->capture_probe && !torbox(t) && !strcmp(t->release->source, "vikingfile");
-        if ((t->capture_probe || torbox(t)) && t->accepted && t->disposition[0] && (named || !viking_route)) {
+        if ((t->capture_probe || torbox(t) || (remote_transfer(t) && named)) && t->accepted &&
+            t->disposition[0] && (named || !viking_route)) {
             if (!disposition_matches(t->disposition, t->release->filename)) {
                 t->accepted = false;
                 copy_text(t->error, sizeof t->error, "Provider returned a different filename.");
@@ -998,6 +1004,7 @@ static unsigned retry_source(const Job *j) {
     if (!strcmp(j->release.source, "akirabox")) return 2;
     if (!strcmp(j->release.source, "datanodes")) return 3;
     if (!strcmp(j->release.source, "1fichier")) return 4;
+    if (!strcmp(j->release.source, "remote")) return 6;
     return 0;
 }
 static bool retryable(long status, CURLcode rc) {
@@ -1085,10 +1092,18 @@ static int extract_job(Job *j, int dir, const char *partial, char *note, size_t 
     diagnostics_event_locked("extract-start", j, 0, 0);
     pthread_mutex_unlock(&orbit.mutex);
     int rc = 0;
-    if (j->release.archive_unverified) {
+    bool remote = !strcmp(j->release.source, "remote");
+    if (j->release.archive_unverified || remote) {
         int64_t inspected = 0;
         char format[12];
         rc = inspect_archive(&x, &inspected, format, error, cap);
+        if (!rc && remote) {
+            const char *expected = !strcmp(j->release.format, "FPKG") ? "PKG" : j->release.format;
+            if (strcmp(format, expected) || (x.expected > 0 && x.expected != inspected)) {
+                copy_text(error, cap, "Archive contents do not match the community catalogue.");
+                rc = -1;
+            }
+        }
         if (!rc) {
             pthread_mutex_lock(&orbit.mutex);
             j->inspected_size = inspected;
@@ -1162,6 +1177,51 @@ static void run_job(Job *j) {
     /* A drive the console remounted is recognised; an unmarked one gets its mark. */
     if (storage_rebind_locked(j) && storage_mark_locked(j)) (void)state_save_locked();
     pthread_mutex_unlock(&orbit.mutex);
+    if (remote_transfer(&t) && !j->archive_ready) {
+        c = request(&t);
+        if (!c) {
+            copy_text(t.error, sizeof t.error, "Could not initialize HTTPS.");
+            goto finish;
+        }
+        curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+        rc = curl_easy_perform(c);
+        curl_easy_cleanup(c);
+        c = NULL;
+        if (rc != CURLE_OK || t.status != 200 || t.length <= 0 || t.length > 9007199254740991LL ||
+            strstr(t.type, "text/") || strstr(t.type, "json") || strstr(t.type, "xml")) {
+            copy_text(t.error, sizeof t.error, "Could not verify the community catalogue download.");
+            goto finish;
+        }
+        if (r->size && r->size != t.length) {
+            copy_text(t.error, sizeof t.error, "Source size changed. Catalogue needs verification.");
+            goto finish;
+        }
+        if (!r->size) {
+            pthread_mutex_lock(&orbit.mutex);
+            Storage drives[ORBIT_MAX_STORAGE];
+            size_t count = storage_list(drives);
+            const Storage *target = NULL;
+            for (size_t i = 0; i < count; i++)
+                if (!strcmp(drives[i].id, j->storage_id) && drives[i].device == j->device &&
+                    drives[i].inode == j->inode) { target = &drives[i]; break; }
+            if (!target || !job_space_fits_locked(target, (uint64_t)t.length)) {
+                pthread_mutex_unlock(&orbit.mutex);
+                copy_text(t.error, sizeof t.error, target ? "Not enough free space to finish this download."
+                    : "Destination is missing or not writable.");
+                goto finish;
+            }
+            j->total = j->release.size = r->size = t.limit = t.length;
+            int saved = state_save_locked();
+            if (saved) j->total = j->release.size = r->size = t.limit = 0;
+            pthread_mutex_unlock(&orbit.mutex);
+            if (saved) {
+                copy_text(t.error, sizeof t.error, "Could not persist source identity.");
+                goto finish;
+            }
+        }
+        if (controlled(&t)) goto finish;
+    }
     dir = storage_open(j);
     if (dir < 0 || storage_check_writable(dir)) {
         copy_text(t.error, sizeof t.error, "Destination is missing or not writable.");
@@ -1250,7 +1310,7 @@ static void run_job(Job *j) {
         copy_text(j->delivery_phase, sizeof j->delivery_phase, "Downloading via TorBox");
         pthread_mutex_unlock(&orbit.mutex);
     }
-    bool viking = guarded(&t);
+    bool viking = torbox(&t) || provider_browser_source(r->source);
     if (viking) {
         /* Test the saved captured URL with one byte first. No provider page is
          * opened by Resume; expired links get an explicit refresh action. */
@@ -1259,7 +1319,7 @@ static void run_job(Job *j) {
                 copy_text(t.error, sizeof t.error, "Source did not return a valid byte range.");
             goto finish;
         }
-    } else {
+    } else if (!remote_transfer(&t)) {
         c = request(&t);
         if (!c) {
             copy_text(t.error, sizeof t.error, "Could not initialize HTTPS.");

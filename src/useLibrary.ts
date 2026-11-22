@@ -133,10 +133,9 @@ export function useLibrary(paired: boolean, includeStorage: boolean) {
     storageError,
     refreshAt,
     read,
-    readStorage,
     run,
     actionBusy,
-    working: actionBusy || !!snapshot?.storageBusy,
+    working: actionBusy,
     stale: !!error || !!snapshot?.stale,
     can: (capability: string) =>
       !error &&

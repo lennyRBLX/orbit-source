@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "remote_sources.h"
 #include "bundle.h"
 #include "packages.h"
 #include "receive.h"
@@ -252,10 +253,13 @@ int main(int argc, char **argv) {
     if (busy) {
         int error = lock_error;
         close(lock);
-        close(orbit.state_fd);
         if (error == EWOULDBLOCK || error == EAGAIN) {
             /* A newer payload still replaces the saved copy for the next start. */
             int synced = autoboot_sync(runtime, runtime_size);
+#ifdef ORBIT_INSTALL_LAUNCHER
+            orbit_launcher_ensure(orbit.state_fd);
+#endif
+            close(orbit.state_fd);
             if (runtime && synced >= 0) {
                 char message[256];
                 snprintf(message, sizeof message,
@@ -274,6 +278,7 @@ int main(int argc, char **argv) {
             }
             return 0;
         }
+        close(orbit.state_fd);
         fputs("Orbit state cannot be locked.\n", stderr);
         return 1;
     }
@@ -288,6 +293,8 @@ int main(int argc, char **argv) {
     diagnostics_stage("https", startup_result ? "error" : "ok", startup_result);
     if (!startup_result) {
         diagnostics_stage("saved-state", "started", 0);
+        int remote_result = remote_sources_load();
+        diagnostics_stage("remote-sources", remote_result ? "error" : "ok", remote_result);
         startup_result = state_load();
         diagnostics_stage("saved-state", startup_result ? "error" : "ok", startup_result);
     }
@@ -403,6 +410,8 @@ int main(int argc, char **argv) {
     diagnostics_stage("catalogue", startup_result ? "error" : "ok", startup_result);
     if (startup_result)
         puts("Catalogue refresh could not start; the saved catalogue remains available.");
+    startup_result = remote_sources_start();
+    diagnostics_stage("remote-refresh", startup_result ? "error" : "ok", startup_result);
     diagnostics_stage("updates", "started", 0);
     startup_result = updates_start();
     diagnostics_stage("updates", startup_result ? "error" : "ok", startup_result);
@@ -421,16 +430,11 @@ int main(int argc, char **argv) {
         puts("Library worker could not start; the server remains available.");
     startup_result = packages_start();
     diagnostics_stage("packages", startup_result ? "error" : "ok", startup_result);
-    diagnostics_stage("tv-app", "started", 0);
-    startup_result = tvapp_start();
-    diagnostics_stage("tv-app", startup_result ? "error" : "ok", startup_result);
-    if (startup_result)
-        puts("TV app installer could not start; the server remains available.");
     diagnostics_stage("artwork", "started", 0);
     startup_result = art_start();
     diagnostics_stage("artwork", startup_result ? "error" : "ok", startup_result);
     if (startup_result)
-        puts("Artwork workers could not start; the TV app shows covers as placeholders.");
+        puts("Artwork workers could not start.");
     char address[64], endpoint[96], ready_message[256];
     orbit_lan_address(address, sizeof address);
     if (address[0])
@@ -449,6 +453,7 @@ int main(int argc, char **argv) {
     while (!stopping) {
         sleep(1);
         power_tick();
+        remote_sources_tick();
         if (atomic_load(&stop_requested)) {
             sleep(1); /* Let the stop acknowledgement reach the browser. */
             stopping = 1;
@@ -470,7 +475,6 @@ int main(int argc, char **argv) {
     debrid_stop();
     archive_account_clear();
     viking_pass_clear();
-    tvapp_stop();
     bundle_stop(); /* before the browser session it may be following */
     browser_stop();
     history_stop(); /* stop deletion before stopping Files/installer guards */
@@ -479,6 +483,7 @@ int main(int argc, char **argv) {
     library_stop();
     kraken_stop();
     updates_stop();
+    remote_sources_stop();
     catalog_stop();
     for (unsigned i = 0; i < orbit.worker_count; i++) pthread_join(orbit.workers[i], NULL);
     ntfy_stop(); /* after the workers, the last to queue a notification */

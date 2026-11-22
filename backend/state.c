@@ -1,5 +1,6 @@
 #include "network.h"
 #include "orbit.h"
+#include "remote_sources.h"
 #include "packages.h"
 #include "firmware.h"
 #include "state_file.h"
@@ -28,6 +29,7 @@ Orbit orbit = {.releases = releases,
                .changed = PTHREAD_COND_INITIALIZER,
                .port = ORBIT_HTTP_PORT,
                .state_fd = -1,
+               .sources = {.enabled = ORBIT_SOURCE_REMOTE},
                .delete_archives = true,
                .extract_archives = true,
                .download_notifications = true,
@@ -73,6 +75,9 @@ void random_hex(char *out, size_t n) {
         snprintf(out + 2 * i, 3, "%02x", b[i]);
 }
 Release *release_find(const char *id) {
+    if (!strncmp(id, "rs-", 3))
+        for (size_t i = 0; i < orbit.remote_release_count; i++)
+            if (!strcmp(orbit.remote_releases[i].id, id)) return &orbit.remote_releases[i];
     for (size_t i = 0; i < orbit.release_count; i++)
         if (!strcmp(orbit.releases[i].id, id))
             return &orbit.releases[i];
@@ -133,9 +138,11 @@ static cJSON *job_json(const Job *j, bool private_fields) {
     if (j->release.compression[0]) {
         cJSON_AddStringToObject(o, "compression", j->release.compression);
         cJSON_AddNumberToObject(o, "extracted", (double)j->extracted);
-        cJSON_AddNumberToObject(o, "extractTotal", (double)(j->release.archive_unverified ? j->inspected_size : j->release.extracted_size));
+        cJSON_AddNumberToObject(o, "extractTotal", (double)(j->inspected_size > 0 ? j->inspected_size : j->release.extracted_size));
         if (j->release.archive_unverified) {
             cJSON_AddStringToObject(o, "archiveContents", "unverified");
+        }
+        if (j->release.archive_unverified || j->inspected_size > 0) {
             cJSON_AddNumberToObject(o, "inspectedBytes", (double)j->inspected_size);
             S("detectedFormat", inspected_format);
         }
@@ -463,7 +470,8 @@ int state_load(void) {
         const cJSON *saved = cJSON_GetObjectItemCaseSensitive(x, "release");
         if (saved) {
             /* A bad saved identity must never silently switch to the current file. */
-            if (release_parse(saved, &snapshot, true) ||
+            bool remote = !strcmp(json_text(saved, "sourceId"), "remote");
+            if ((remote ? remote_release_parse(saved, &snapshot) : release_parse(saved, &snapshot, true)) ||
                 strcmp(snapshot.id, json_text(x, "releaseId"))) {
                 cJSON_Delete(o);
                 return -1;
@@ -472,6 +480,7 @@ int state_load(void) {
         }
         if (!r || orbit.job_count >= ORBIT_MAX_JOBS)
             continue;
+        bool remote_source_release = !strcmp(r->source, "remote");
         Job *j = &orbit.jobs[orbit.job_count++];
         j->release = *r;
         const cJSON *viking = cJSON_GetObjectItemCaseSensitive(x, "vikingContext");
@@ -518,7 +527,7 @@ int state_load(void) {
         const cJSON *inspected = cJSON_GetObjectItemCaseSensitive(x, "inspectedBytes");
         if (inspected) {
             const char *format = json_text(x, "detectedFormat");
-            if (!r->archive_unverified || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
+            if ((!r->archive_unverified && !(remote_source_release && r->compression[0])) || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
                 inspected->valuedouble < 0 || inspected->valuedouble > 9007199254740991.0 ||
                 floor(inspected->valuedouble) != inspected->valuedouble ||
                 (*format && strcmp(format, "PKG") && strcmp(format, "exFAT") && strcmp(format, "FFPFSC") &&

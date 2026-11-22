@@ -80,7 +80,7 @@ export function CrossbarLibrary({
     }
     return false;
   };
-  // Files works without ShadowMount, so it comes before Library's own state.
+  // Files works without Kraken Mount, so it comes before Library's own state.
   if (section === "files")
     return (
       <><div className="library-controls">{sections}</div><CrossbarFiles
@@ -103,8 +103,8 @@ export function CrossbarLibrary({
               <h2>{busy ? t("Finding your games") : t("Connect your library")}</h2>
               <p>
                 {busy
-                  ? t("Reading installed titles and drive availability from ShadowMount.")
-                  : t("Library uses ShadowMount’s local games API on your PS5. Start a version with that API enabled, then select Try again.")}
+                  ? t("Reading Kraken Mount’s games and the games installed on your PS5.")
+                  : t("Library lists the games Kraken Mount runs and the games installed on your PS5. Select Try again.")}
               </p>
               {error && <p className="warn">{error}</p>}
               {!busy && (
@@ -140,7 +140,7 @@ export function CrossbarLibrary({
         </span>
       </>
     ),
-    actions: <GameActions game={g} model={model} driveCards />,
+    actions: <GameActions game={g} model={model} />,
   }));
   const allRows: XbRow[] = [
     ...gameRows,
@@ -149,7 +149,7 @@ export function CrossbarLibrary({
                 folderRow(
                   "scan",
                   t("Scan for games"),
-                  model.snapshot?.scanning ? t("Looking for new games…") : t("Search your drives with ShadowMount"),
+                  model.snapshot?.scanning ? t("Looking for new games…") : t("Search your drives with Kraken Mount"),
                   "scan",
                   openScan,
                 ),
@@ -204,9 +204,7 @@ export function CrossbarLibrary({
                     ? bytes(focusedGame.sizeBytes)
                     : focusedGame.sizeStatus === "unavailable"
                       ? t("Unavailable")
-                      : model.snapshot?.measuring
-                        ? t("Measuring…")
-                        : t("Not measured")}
+                      : t("Not measured")}
                 </dd>
               </div>
               <div>
@@ -214,13 +212,6 @@ export function CrossbarLibrary({
                 <dd>{focusedGame.installedSizeBytes === null ? t("Not reported") : bytes(focusedGame.installedSizeBytes)}</dd>
               </div>
             </dl>
-            {focusedGame.foundByOrbit && (
-              <p className="xb-card-fine">
-                {t(
-                  "Orbit found this game itself because your ShadowMount version doesn’t list games installed from PKG files. For the most complete list, update ShadowMount to 1.7beta5 or newer.",
-                )}
-              </p>
-            )}
             {error && <p className="xb-card-error">{error}</p>}
           </aside>
         )}

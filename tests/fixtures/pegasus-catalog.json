@@ -1,0 +1,40 @@
+{
+  "name": "Evox-CoreOS Catalog",
+  "description": "Catalogue automatisé Pegasus-DL pour PKG et FFPFSC",
+  "packages": [
+    {
+      "titleId": "EVXS40000",
+      "title": "evoX Start Page",
+      "version": "Source-Fixe",
+      "author": "Unknown Author",
+      "category": "PKG",
+      "description": "evoX-CoreOS Start Page.",
+      "checksum": "3d3caaf9774c2ea31930f023ddd49d9f8e2862178dbf20ddf5fb2aeb90f88c6a",
+      "posterUrl": "https://example.org/poster.png",
+      "filename": "EVXS40000.pkg",
+      "downloadLinks": [
+        {
+          "name": "Mirror",
+          "url": "https://example.org/downloads/EVXS40000.pkg"
+        }
+      ]
+    },
+    {
+      "titleId": "CUSA00000",
+      "title": "Evoplayer-V0.13.7-Ppsa99039-Pro",
+      "version": "v0.13.7",
+      "author": "Unknown Author",
+      "category": "FFPFSC",
+      "description": "A media player for jailbroken PS5",
+      "checksum": "7ab31616d1fdd9a5e030a03c379159e28d5d3c4e236e8e3f3dcdee425caa2076",
+      "posterUrl": "https://example.org/poster.png",
+      "filename": "EVOPlayer-v0.13.7-PPSA99039-pro.ffpfsc",
+      "downloadLinks": [
+        {
+          "name": "Mirror",
+          "url": "https://example.org/downloads/EVOPlayer-v0.13.7-PPSA99039-pro.ffpfsc"
+        }
+      ]
+    }
+  ]
+}

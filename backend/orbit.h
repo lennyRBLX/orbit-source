@@ -27,7 +27,8 @@
 #define ORBIT_SOURCE_AKIRABOX 4U
 #define ORBIT_SOURCE_DATANODES 8U
 #define ORBIT_SOURCE_ONEFICHIER 16U
-#define ORBIT_SOURCE_ALL (ORBIT_SOURCE_ARCHIVE | ORBIT_SOURCE_VIKINGFILE | ORBIT_SOURCE_AKIRABOX | ORBIT_SOURCE_DATANODES | ORBIT_SOURCE_ONEFICHIER)
+#define ORBIT_SOURCE_REMOTE 32U
+#define ORBIT_SOURCE_ALL (ORBIT_SOURCE_ARCHIVE | ORBIT_SOURCE_VIKINGFILE | ORBIT_SOURCE_AKIRABOX | ORBIT_SOURCE_DATANODES | ORBIT_SOURCE_ONEFICHIER | ORBIT_SOURCE_REMOTE)
 typedef struct {
     unsigned enabled, notice_version;
     time_t acknowledged_at;
@@ -38,6 +39,9 @@ typedef struct {
     char addon_id[64], base_game_id[64], base_title[128], addon_type[24], content_id[64];
     char requirements[2048]; /* JSON snapshot of the selected DLC edition's requirements. */
     char browser_url[128];
+    char remote_catalog_id[25]; /* Empty for built-in download providers. */
+    char remote_label[128]; /* Download link label from a community catalogue. */
+    bool remote_page; /* Stable catalogue identity is the selected provider page. */
     char compression[8]; /* "zip", "7z" or "rar"; empty for a plain file. */
     char archive_password[129]; /* Public source password, optional. */
     int64_t size, extracted_size;
@@ -55,8 +59,7 @@ typedef struct {
     ino_t inode;
     bool external;
 } Storage;
-/* What a running Files action, Library copy or move, or Orbit Zero transfer
- * still writes. Downloads run alongside it: they leave its room on the same
+/* What a running Files action or Orbit Zero transfer still writes. Downloads run alongside it: they leave its room on the same
  * filesystem and never take a name it is writing or removing. */
 typedef struct {
     dev_t device;      /* The filesystem it writes to. */
@@ -64,7 +67,7 @@ typedef struct {
     char path[1100];   /* What it creates or changes, absolute. */
     char source[1100]; /* What a move or delete takes away, absolute; may be empty. */
 } StorageHold;
-enum { HOLD_FILES, HOLD_LIBRARY, HOLD_RECEIVE, HOLD_COUNT };
+enum { HOLD_FILES, HOLD_RECEIVE, HOLD_COUNT };
 typedef struct {
     Release release; /* Immutable download identity, independent of catalogue refreshes. */
     char id[24], release_id[24], storage_id[24], root[512], filename[256];
@@ -102,7 +105,7 @@ typedef struct {
     int64_t extracted, inspected_size;
     char inspected_format[12]; /* Local result, never changes the release identity. */
     uint32_t extracted_firmware; /* Declared by extracted PS5 param.json; zero means unknown. */
-    bool extracted_backport; /* The extracted folder holds a ShadowMount+ backport (fakelib). */
+    bool extracted_backport; /* The extracted folder holds a backport (fakelib) for Kraken Mount's backports folder. */
     bool archive_ready, archive_kept;
     bool keep_packed; /* Queued while extraction was off: the archive is the download. */
     /* Added by Get everything: install once checked, after install_after's download is in
@@ -122,6 +125,8 @@ typedef struct {
     DownloadPolicy download_policy;
     Release *releases; /* Fixed backing array, including the connection diagnostic. */
     size_t release_count;
+    Release *remote_releases; /* Replaced under mutex, independently of the bundled feed. */
+    size_t remote_release_count;
     cJSON *catalog, *addons; /* Base-game and add-on APIs remain separate. */
     unsigned catalog_revision;
     SourceSettings sources;
@@ -162,11 +167,10 @@ typedef struct {
     bool queue_backup_created;
     atomic_bool stop;
     bool receiver_active; /* Local file receiver owns destination I/O. */
-    bool library_storage_busy; /* Serializes Zero transfers and Files with ShadowMount storage jobs. */
     bool files_storage_busy; /* Files mutations reserve drives against other storage operations. */
     StorageHold holds[HOLD_COUNT]; /* Space and names the running storage operation uses. */
     int state_fd;
-    time_t source_retry_at[6]; /* Provider throttling must not block unrelated sources. */
+    time_t source_retry_at[7]; /* Provider throttling must not block unrelated sources. */
     time_t debrid_next_create; /* Persisted TorBox submission pacing, including rejected requests. */
 } Orbit;
 extern Orbit orbit;
@@ -195,6 +199,8 @@ int state_load(void);
 Release *release_find(const char *id);
 int release_parse(const cJSON *entry, Release *release, bool diagnostic);
 int release_context_parse(const cJSON *x, Release *r);
+/* PKG, FPKG or game folder (archived or not): the only downloads Orbit offers or queues. */
+bool orbit_format_allowed(const Release *release);
 cJSON *release_context_json(const Release *r);
 cJSON *release_json(const Release *release);
 void release_download_title(const Release *release, char *out, size_t cap);
@@ -209,6 +215,7 @@ bool provider_url_supported(const Release *release);
 bool provider_browser_supported(const Release *release);
 bool provider_capture_url(const Release *release, const char *candidate);
 bool provider_browser_source(const char *source);
+bool provider_header_filename(const char *value, char *out, size_t cap);
 bool provider_disposition_name(const char *url, char *out, size_t cap);
 bool provider_viking_file_server(const char *host, size_t n);
 int browser_start(void);
@@ -307,7 +314,7 @@ void library_stop(void);
 cJSON *library_snapshot(bool refresh);
 cJSON *library_storage_snapshot(bool refresh);
 int library_action(const cJSON *input, char *error, size_t cap);
-/* Ask ShadowMount to scan soon: Files put a game image or folder in homebrew. */
+/* Ask Kraken Mount to scan soon: Files put a game folder where it looks for games. */
 void library_auto_scan(void);
 int pairing_notify(void);
 int notify_console(const char *text);
@@ -335,11 +342,6 @@ void notify_update(const char *version);
 const char *notify_ntfy_test(void); /* the test notification's text, in the console's language */
 void notify_restart_failed(void);
 void notify_shutdown(bool failed);
-int tvapp_start(void);
-void tvapp_stop(void);
-cJSON *tvapp_status(void);
-int tvapp_action(const cJSON *input, char *error, size_t cap);
-int tvapp_wait(char *error, size_t cap);
 int art_start(void);
 void art_stop(void);
 int art_get_urls(const char *source, const char *fallback, const char *kind, unsigned char **data,

@@ -1,5 +1,5 @@
 /* Paired-device release checks from the fixed feed. Installation and restart stay explicit:
- * "update-all" installs the releases the owner was shown, the TV app first, then restarts Orbit
+ * "update-all" installs the release the owner was shown, then restarts Orbit
  * through the jailbreak's ELF loader when the download service changed. */
 #include "ca.h"
 #include "orbit.h"
@@ -35,8 +35,7 @@ static struct {
     bool restart_unavailable;
     char restart_notice[256];
     /* update-all: what the owner was shown, and how far it got. */
-    bool all, all_service, tv_updated;
-    char tv_version[40], tv_checksum[65];
+    bool all, all_service;
 } update = {.mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER};
 
 typedef struct {
@@ -425,30 +424,12 @@ static int stop_locked(bool resume, char *error, size_t cap) {
     pthread_mutex_unlock(&orbit.mutex);
     return code;
 }
-/* The TV app, then the download service, then a restart when the service changed. */
+/* The download service, then a restart when the service changed. */
 static int update_all(char *error, size_t cap) {
-    pthread_mutex_lock(&update.mutex);
-    bool tv = *update.tv_version, service = update.all_service;
-    cJSON *request = cJSON_CreateObject();
-    cJSON_AddStringToObject(request, "action", "install");
-    cJSON_AddStringToObject(request, "version", update.tv_version);
-    cJSON_AddStringToObject(request, "checksum", update.tv_checksum);
-    if (tv)
-        copy_text(update.phase, sizeof update.phase, "tv-app");
-    pthread_mutex_unlock(&update.mutex);
-    int rc = 0;
-    if (tv) {
-        /* An automatic check may be running: let it finish, then install. */
-        char ignored[8];
-        tvapp_wait(ignored, sizeof ignored);
-        int code = tvapp_action(request, error, cap);
-        rc = code != 202 ? -1 : tvapp_wait(error, cap);
-    }
-    cJSON_Delete(request);
-    if (rc || interrupted())
+    if (interrupted())
         return -1;
     pthread_mutex_lock(&update.mutex);
-    update.tv_updated = tv;
+    bool service = update.all_service;
     if (service)
         copy_text(update.phase, sizeof update.phase, "downloading");
     pthread_mutex_unlock(&update.mutex);
@@ -602,7 +583,7 @@ cJSON *updates_status(void) {
     cJSON_AddNumberToObject(o, "retryAt", (double)update.retry_at);
     cJSON_AddNumberToObject(o, "checkedAt", (double)update.checked);
     cJSON_AddNumberToObject(o, "checkAfter", (double)update.check_after);
-    /* Orbit restarts itself through the ELF loader ("restart"), and installs the TV app and
+    /* Orbit restarts itself through the ELF loader ("restart"), and installs and restarts
      * itself in one step ("update-all"). */
     /* Capability, not a reachability probe: opening/closing a loader connection just to poll
      * status can consume a one-shot loader. A failed real attempt disables the promise. */
@@ -611,7 +592,6 @@ cJSON *updates_status(void) {
     cJSON_AddStringToObject(o, "activationState", !strcmp(update.phase, "restarting") ? "restarting" :
                            update.saved || (*saved && strcmp(saved, ORBIT_VERSION)) ? "saved" : "running");
     cJSON_AddBoolToObject(o, "updateAll", update.all);
-    cJSON_AddStringToObject(o, "tvAppUpdated", update.tv_updated ? update.tv_version : "");
     pthread_mutex_unlock(&update.mutex);
     return o;
 }
@@ -620,8 +600,7 @@ int updates_action(const cJSON *input, char *error, size_t cap) {
     bool checking = !strcmp(action, "check"), installing = !strcmp(action, "install"),
          stopping = !strcmp(action, "stop"), restarting = !strcmp(action, "restart"),
          all = !strcmp(action, "update-all");
-    const char *tv_version = json_text(input, "tvAppVersion"), *tv_checksum = json_text(input, "tvAppChecksum"),
-               *service_version = json_text(input, "serviceVersion");
+    const char *service_version = json_text(input, "serviceVersion");
     const cJSON *automatic_input = cJSON_GetObjectItemCaseSensitive(input, "automatic");
     bool automatic = checking && cJSON_IsTrue(automatic_input);
     int code = 202;
@@ -632,7 +611,7 @@ int updates_action(const cJSON *input, char *error, size_t cap) {
     } else if (!checking && !installing && !stopping && !restarting && !all) {
         code = 400;
         copy_text(error, cap, "Unknown update action.");
-    } else if (all && !*tv_version && !*service_version) {
+    } else if (all && !*service_version) {
         code = 400;
         copy_text(error, cap, "Choose the releases to install.");
     } else if (!available() || !update.started) {
@@ -660,13 +639,9 @@ int updates_action(const cJSON *input, char *error, size_t cap) {
                 strcmp(json_text(input, installing ? "checksum" : "serviceChecksum"), update.checksum))) {
         code = 409;
         copy_text(error, cap, "Check for updates again before installing this release.");
-    } else if (all && *tv_version && (strlen(tv_version) >= sizeof update.tv_version ||
-                                      strlen(tv_checksum) != 64)) {
-        code = 400;
-        copy_text(error, cap, "Check for the TV app again before installing it.");
     } else if (stopping) {
-        /* Persist the paused queue before acknowledging shutdown. With resume (the TV app
-         * starting the newer service in its package), downloads continue once it's up. */
+        /* Persist the paused queue before acknowledging shutdown. With resume (a client
+         * starting a newer service itself), downloads continue once it's up. */
         code = stop_locked(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "resume")), error, cap);
     } else if (restarting) {
         int loader = loader_connect();
@@ -700,15 +675,10 @@ int updates_action(const cJSON *input, char *error, size_t cap) {
         } else
             update.retry_at = time(NULL) + 60;
         update.all = all;
-        if (all) {
+        if (all)
             update.all_service = *service_version;
-            update.tv_updated = false;
-            copy_text(update.tv_version, sizeof update.tv_version, tv_version);
-            copy_text(update.tv_checksum, sizeof update.tv_checksum, tv_checksum);
-        }
         copy_text(update.action, sizeof update.action, action);
-        copy_text(update.phase, sizeof update.phase,
-                  checking ? "checking" : all && *tv_version ? "tv-app" : "downloading");
+        copy_text(update.phase, sizeof update.phase, checking ? "checking" : "downloading");
         pthread_cond_signal(&update.changed);
     }
     pthread_mutex_unlock(&update.mutex);

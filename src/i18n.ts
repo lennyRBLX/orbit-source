@@ -222,7 +222,7 @@ export function genreName(genre: string) {
     .join(" / ");
 }
 
-// Drive and location names from Orbit and ShadowMount, some numbered.
+// Drive and location names from Orbit and Library, some numbered.
 export function placeName(name: string) {
   const usb = /^USB storage (\d+)$/.exec(name) || /^USB (\d+)$/.exec(name);
   if (usb) return t("USB storage {number}", { number: usb[1] });

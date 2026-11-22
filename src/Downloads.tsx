@@ -1,3 +1,4 @@
+import { releaseProvider } from "./types";
 import { InstallationDialog, InstallationSummary, installationLabel } from "./Installation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon, Modal } from "./components";
@@ -449,7 +450,7 @@ export function Downloads({
                     </span>
                   </div>
                   <p>
-                    {r && `${r.provider} · ${formatLabel(r)} · `}
+                    {r && `${releaseProvider(r)} · ${formatLabel(r)} · `}
                     {j.delivery === "torbox" && `${t("via TorBox")} · `}
                     {drive ? placeName(drive.label) : j.storageId}
                     {!drive && j.status !== "complete"

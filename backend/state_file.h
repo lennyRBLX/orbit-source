@@ -11,4 +11,7 @@
  * Never takes orbit.mutex; callers may hold it, but nothing may take orbit.mutex
  * while inside (lock order: orbit.mutex, then this file's lock). */
 int state_file_write(int directory, uint64_t generation, const char *data, size_t length);
+/* Atomic replacement for an independently serialized file in a directory. */
+int state_file_replace(int directory, const char *name, const char *temporary,
+                       const char *data, size_t length);
 #endif

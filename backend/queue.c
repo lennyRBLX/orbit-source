@@ -33,7 +33,7 @@ uint64_t job_space_needed(const Release *r) {
 }
 /* What unpacking a downloaded archive writes, once its size is known. */
 static uint64_t unpack_size(const Job *j) {
-    int64_t expected = j->release.archive_unverified ? j->inspected_size : j->release.extracted_size;
+    int64_t expected = j->inspected_size > 0 ? j->inspected_size : j->release.extracted_size;
     return expected > 0 ? (uint64_t)expected : 0;
 }
 static uint64_t download_remaining(const Job *j) {
@@ -279,6 +279,11 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         copy_text(err, cap, "Unknown curated release.");
         return 404;
     }
+    /* The catalogue already leaves other formats out; refuse any that reaches here anyway. */
+    if (!orbit_format_allowed(r)) {
+        copy_text(err, cap, "Orbit downloads PKG, FPKG and game-folder options only.");
+        return 400;
+    }
     if (!source_enabled_locked(r)) {
         copy_text(err, cap,
                   "Enable this source and acknowledge the download notice in Sources first.");
@@ -482,7 +487,9 @@ int job_check_capture_locked(const Release *r, const Storage *s, char *err, size
 }
 int job_create_captured_locked(const Release *r, const Storage *s, const char *etag,
                                const char *modified, char *err, size_t cap, Job **result) {
-    if (!provider_capture_url(r, r->url) || (!etag[0] && !modified[0])) {
+    bool community = r->remote_page && !strcmp(r->source, "remote");
+    if (community ? (!provider_supported(r) || !r->filename[0] || r->size <= 0)
+                  : (!provider_capture_url(r, r->url) || (!etag[0] && !modified[0]))) {
         copy_text(err, cap, "The provider file has not been validated.");
         return 409;
     }
