@@ -12,8 +12,9 @@ int debrid_prepare_locked(const Release *release, Job *job, char *error, size_t 
 bool debrid_default_locked(const Release *release);
 /* Always use TorBox applies to the options TorBox can take now. Others keep the original source. */
 bool debrid_covers_locked(const Release *release);
+bool debrid_link_covered_locked(const Release *release);
 /* Runs on the download worker. 1 = ready, 0 = waiting, -1 = failed/stopped. */
-int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at,
+int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at,
                    char *error, size_t cap);
 bool debrid_transfer_url_allowed(const char *url);
 #endif

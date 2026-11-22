@@ -26,8 +26,14 @@ export interface Release extends AddonIdentity {
   tagline: string | null;
   description: string | null;
   sizeBytes: number;
+  sizeEstimateBytes?: number;
+  sizeEstimateExact?: boolean;
   provider: string;
   sourceId: SourceId;
+  torboxHost?: string;
+  torboxHosts?: string[];
+  mirrorCount?: number;
+  providerMetadata?: boolean;
   // The only formats the service offers (browse.ts DOWNLOAD_FORMATS); it leaves out the rest.
   format: "FPKG" | "PKG" | "Game folder";
   // Downloaded as an archive and extracted on the drive; format is what's inside.
@@ -111,11 +117,19 @@ export interface RemoteSources {
   refreshing: boolean;
   retryAfter?: number;
 }
-export const releaseProvider = (release: Release) =>
-  release.sourceId === "remote" && release.provider === "Community catalogues"
+export const releaseProvider = (release: Release) => {
+  const name = release.sourceId === "remote" && release.provider === "Community catalogues"
     ? t("Community catalogues") : release.provider;
+  return release.mirrorCount && release.mirrorCount > 1
+    ? name + " · " + t("{count} mirrors", { count: release.mirrorCount })
+    : name;
+};
 export const releaseSize = (release: Release) =>
-  release.sourceId === "remote" && !release.sizeBytes ? t("Unknown size") : bytes(release.sizeBytes);
+  release.sizeBytes || release.sourceId !== "remote"
+    ? bytes(release.sizeBytes)
+    : release.sizeEstimateBytes
+      ? `${release.sizeEstimateExact ? "" : "≈"}${bytes(release.sizeEstimateBytes)}`
+      : t("Unknown size");
 export interface SourceSettings {
   enabled: SourceId[];
   acknowledged: boolean;
@@ -372,6 +386,7 @@ export const bytes = (n: number) => {
 
 export interface BrowserSession {
   accountPage?: boolean;
+  directDownload?: boolean;
   vikingAccountAvailable?: boolean;
   vikingBrowserState?: "signed-in" | "signed-out" | "unknown";
   vikingNativeState?: "signed-in" | "signed-out" | "unknown";

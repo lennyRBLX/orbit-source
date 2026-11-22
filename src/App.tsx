@@ -8,6 +8,7 @@ import { GameRail, type RailMemory } from "./GameRail";
 import { placeOf, restorePlace, type Place } from "./returnPlace";
 import { Details } from "./Details";
 import { Downloads } from "./Downloads";
+import { DirectDownload } from "./DirectDownload";
 import { Library } from "./Library";
 import { useLibrary } from "./useLibrary";
 import { StorageOverview } from "./LibraryActions";
@@ -131,6 +132,7 @@ export default function App() {
   const [storageOpen, setStorageOpen] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [zeroOpen, setZeroOpen] = useState(false),
+    [downloadUrlOpen, setDownloadUrlOpen] = useState(false),
     [sourcesOpen, setSourcesOpen] = useState(false),
     [autoOpen, setAutoOpen] = useState(false),
     [pairOpen, setPairOpen] = useState(false),
@@ -231,6 +233,7 @@ export default function App() {
     else if (storageOpen) setStorageOpen(false);
     else if (notificationsOpen) setNotificationsOpen(false);
     else if (zeroOpen) setZeroOpen(false);
+    else if (downloadUrlOpen) setDownloadUrlOpen(false);
     else if (autoOpen || settingsPage) closeSettings();
     else if (game) setGameId(null);
     else if (tab === "Add-ons" && addonBase) { setGameId(addonBase); setTab("Browse"); setAddonBase(""); }
@@ -241,7 +244,7 @@ export default function App() {
         first?.focus({ preventScroll: true });
       });
     }
-  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, autoOpen, settingsPage, pairOpen, savedOpen, sourcesOpen, closeSettings]);
+  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, downloadUrlOpen, autoOpen, settingsPage, pairOpen, savedOpen, sourcesOpen, closeSettings]);
   const consoleBrowser =
     orbit.system?.platform === "ps5" && !!orbit.system.localSessionAvailable;
   useController(back, consoleBrowser);
@@ -434,7 +437,7 @@ export default function App() {
         session={orbit.browser}
         cancel={orbit.cancelProvider}
         openQueue={openDownload}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
+        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen || (downloadUrlOpen && !!orbit.browser?.directDownload)}
       />
     </>
   );
@@ -939,6 +942,7 @@ export default function App() {
           active={active}
           paired={paired}
           openSettings={paired(() => setSettingsPage("downloads"))}
+          openDownloadUrl={paired(() => setDownloadUrlOpen(true))}
           settings={autoOpen ? null : settingsNode}
           updateAvailable={updateAvailable}
           openSearch={showSearch}
@@ -1015,6 +1019,14 @@ export default function App() {
                 onClick={showSearch}
               >
                 <Icon name="search" />
+              </button>
+              <button
+                className="top-icon"
+                data-label={t("Download from URL")}
+                aria-label={t("Download from URL")}
+                onClick={paired(() => setDownloadUrlOpen(true))}
+              >
+                <Glyph name="link" size={26} />
               </button>
               <button
                 className="top-icon"
@@ -1242,6 +1254,17 @@ export default function App() {
         <Modal title="Orbit Zero" close={() => setZeroOpen(false)} className="storage-modal orbit-zero-modal">
           {zeroPanel}
         </Modal>
+      )}
+      {downloadUrlOpen && (
+        <DirectDownload
+          browser={orbit.browser}
+          storage={orbit.storage}
+          preferredStorage={orbit.system?.preferredStorage || ""}
+          download={orbit.downloadUrl}
+          cancel={orbit.cancelProvider}
+          close={() => setDownloadUrlOpen(false)}
+          view={(id) => { setDownloadUrlOpen(false); openDownload(id); }}
+        />
       )}
       {notificationsOpen && (
         <Modal

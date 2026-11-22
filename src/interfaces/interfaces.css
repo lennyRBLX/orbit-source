@@ -465,6 +465,8 @@ html:not(.pointer) .pn-nav button:focus {
   color: var(--pn-acc);
 }
 .pn-tools {
+  display: flex;
+  gap: 0.6rem;
   margin-inline-start: auto;
 }
 .pn-tools .icon-button {

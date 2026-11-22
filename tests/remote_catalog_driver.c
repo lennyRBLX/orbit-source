@@ -155,6 +155,8 @@ int main(int argc, char **argv) {
                 print_json(remote_sources_json_locked());
             } else if (!strcmp(op, "jobs")) {
                 print_json(jobs_json_locked());
+            } else if (!strcmp(op, "metadata")) {
+                print_json(remote_metadata_json_locked(json_text(request, "ids")));
             } else if (!strcmp(op, "diagnostics")) {
                 print_json(remote_sources_diagnostics_locked());
             } else {

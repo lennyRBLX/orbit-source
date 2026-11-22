@@ -407,8 +407,10 @@ bool provider_supported(const Release *release) {
 #ifdef ORBIT_TEST
     /* Test binaries may parse the catalogue, but may only transfer fixtures. */
     return !strncmp(release->url, "http://127.0.0.1:", 17) &&
-           (!strcmp(release->source, "archive") || !strcmp(release->source, "remote") || provider_browser_source(release->source));
+           (!strcmp(release->source, "archive") || !strcmp(release->source, "remote") ||
+            !strcmp(release->source, ORBIT_DIRECT_SOURCE) || provider_browser_source(release->source));
 #else
+    if (!strcmp(release->source, ORBIT_DIRECT_SOURCE)) return direct_http_url(release->url);
     return provider_url_supported(release);
 #endif
 }

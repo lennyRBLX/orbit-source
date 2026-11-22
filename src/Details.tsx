@@ -1,6 +1,7 @@
 import { Artwork } from "./Artwork";
 import { GameInsights } from "./GameInsights";
 import { AddonInfo } from "./AddonInfo";
+import { api } from "./api";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./components";
 import { GameSheet, PadSymbol, type SheetView } from "./GameSheet";
@@ -161,9 +162,36 @@ export function Details({
     if (xbMenu === null && (document.activeElement === document.body || !document.activeElement))
       document.querySelector<HTMLElement>(".xb-game .xb-row.on .xb-row-main")?.focus({ preventScroll: true });
   }, [xbMenu]);
+  const [providerSizes, setProviderSizes] = useState<Record<string, { sizeBytes: number; exact: boolean }>>({});
+  const metadataIds = game.releases
+    .filter((r) => r.providerMetadata && !r.sizeBytes)
+    .map((r) => r.id)
+    .slice(0, 32)
+    .join(",");
+  useEffect(() => {
+    if (!system?.paired || !metadataIds) return;
+    let cancelled = false, timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = Date.now() + 60_000;
+    async function poll() {
+      try {
+        const info = await api<{ pending: boolean; files: { id: string; sizeBytes: number; exact: boolean }[] }>(
+          `/community-metadata?ids=${encodeURIComponent(metadataIds)}`,
+        );
+        if (cancelled) return;
+        setProviderSizes(Object.fromEntries(info.files.map(({ id, sizeBytes, exact }) => [id, { sizeBytes, exact }])));
+        if (info.pending && Date.now() < deadline) timer = setTimeout(poll, 1200);
+      } catch { /* Keep the catalogue estimate if a provider cannot be reached. */ }
+    }
+    void poll();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [metadataIds, system?.paired]);
+  const releases = game.releases.map((r) => {
+    const size = providerSizes[r.id];
+    return size ? { ...r, sizeEstimateBytes: size.sizeBytes, sizeEstimateExact: size.exact } : r;
+  });
   // A source can be switched off by another paired device while this page is open.
   const release =
-      game.releases.find((r) => r.id === releaseId) || game.releases[0],
+      releases.find((r) => r.id === releaseId) || releases[0],
     drive = destination
       ? drives.find((d) => d.id === destination)
       : defaultDrive(drives, system?.preferredStorage, release, jobs),
@@ -698,7 +726,7 @@ export function Details({
     ].filter(row => !game.addonId || row.key !== "favourite");
     const menuItems =
       xbMenu === "version"
-        ? game.releases.map((option) => ({
+        ? releases.map((option) => ({
             key: option.id,
             on: release.id === option.id,
             title: `${releaseProvider(option)} · ${formatLabel(option)}`,
@@ -989,7 +1017,7 @@ export function Details({
             </PnGroup>
           )}
           <PnGroup title={t("Versions")} foot={<p className="pn-group-fine">{t("Available from your enabled sources.")}</p>}>
-            {game.releases.map((option) => {
+            {releases.map((option) => {
               const presence = releaseState(option, jobs, library);
               return (
                 <PnTile
@@ -1036,7 +1064,7 @@ export function Details({
     const firstAction = !system?.paired
       ? t("Pair with your PS5")
       : showDownload
-        ? release.sizeBytes
+        ? release.sizeBytes || release.sizeEstimateBytes
           ? `${t("Download")} · ${releaseSize(release)}`
           : t("Download")
         : actionLabel;
@@ -1199,7 +1227,7 @@ export function Details({
                 <div className="cn-sheet-right">
                   <p className="cn-section-label">{t("Version")}</p>
                   <div className="cn-cards cn-choices">
-                    {game.releases.map((option) => {
+                    {releases.map((option) => {
                       const presence = releaseState(option, jobs, library);
                       const on = release.id === option.id;
                       return (
@@ -1489,7 +1517,7 @@ export function Details({
                     ? t("Choose a source and format for this game.")
                     : t("Available from your enabled sources.")}
                 </p>
-                {game.releases.map((option) => {
+                {releases.map((option) => {
                   const presence = releaseState(option, jobs, library);
                   return (
                     <button

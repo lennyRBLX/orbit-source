@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <curl/curl.h>
 bool remote_https_url(const char *url);
+bool direct_http_url(const char *url);
 bool provider_transfer_url_allowed(const char *url);
 curl_socket_t provider_open_socket(void *context, curlsocktype purpose, struct curl_sockaddr *address);
 #endif

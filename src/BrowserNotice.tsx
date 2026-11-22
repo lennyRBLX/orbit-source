@@ -54,7 +54,7 @@ export function BrowserNotice({
   return (
     <aside
       className="update-notice provider-browser-notice"
-      aria-label={t("Provider verification")}
+      aria-label={session.directDownload ? t("Download from URL") : t("Provider verification")}
     >
       <div role="status">
         <strong>

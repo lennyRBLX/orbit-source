@@ -10,6 +10,8 @@
 #include <strings.h>
 
 #define REMOTE_PACKAGE_LIMIT 2048
+#define REMOTE_MIRROR_RESERVE 2048
+#define REMOTE_SCAN_LIMIT (3 * REMOTE_PACKAGE_LIMIT)
 #define MAX_SAFE_BYTES 9007199254740991.0
 
 static bool identifier(const char *id) {
@@ -65,8 +67,14 @@ static bool valid(const Release *r) {
         (!strcmp(r->platform, "ps4") && !strncmp(r->title_id, "PPSA", 4)) ||
         (!strcmp(r->platform, "ps5") && !strncmp(r->title_id, "CUSA", 4)) ||
         (strcmp(r->platform, "ps4") && strcmp(r->platform, "ps5")) ||
-        !filename_valid(r->filename) || !remote_https_url(r->url) ||
-        (r->browser_url[0] && !remote_https_url(r->browser_url)) || !orbit_format_allowed(r)) return false;
+        ((r->browser_url[0] || r->remote_page) && !remote_https_url(r->browser_url)) ||
+        ((!r->remote_page || r->url[0]) && !remote_https_url(r->url))) return false;
+    if (remote_page_pending(r) && !r->filename[0])
+        return (!r->compression[0] || !strcmp(r->compression, "zip") || !strcmp(r->compression, "rar")) &&
+            !r->extracted_size && !r->sha256[0] &&
+            (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
+             !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG"));
+    if (!filename_valid(r->filename) || !orbit_format_allowed(r)) return false;
     const char *suffix = strrchr(r->filename, '.');
     if (!suffix || strcmp(compression(suffix), r->compression) ||
         (!r->compression[0] && (strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg"))) ||
@@ -84,11 +92,14 @@ int remote_release_parse(const cJSON *entry, Release *r) {
     r->remote_page = cJSON_IsTrue(page);
     if (!FIELD("sourceId", source) || strcmp(r->source, "remote") ||
         !FIELD("remoteCatalogId", remote_catalog_id) || !FIELD("title", title) ||
+        !FIELD("mirrorKey", mirror_key) || (r->mirror_key[0] &&
+            (strlen(r->mirror_key) != 64 || strspn(r->mirror_key, "0123456789abcdef") != 64)) ||
         !FIELD("titleId", title_id) || !FIELD("platform", platform) ||
         !FIELD("format", format) || !FIELD("filename", filename) || !FIELD("url", url) ||
         !FIELD("browserUrl", browser_url) || !FIELD("remoteLabel", remote_label) ||
         (r->remote_page && !*r->browser_url) || !FIELD("sha256", sha256) || !FIELD("compression", compression) ||
         !bytes(entry, "sizeBytes", &r->size) || !bytes(entry, "extractedBytes", &r->extracted_size) ||
+        !bytes(entry, "sizeEstimateBytes", &r->display_size) ||
         !valid(r)) return -1;
 #undef FIELD
     identify(r);
@@ -118,6 +129,45 @@ bool remote_page_pending(const Release *r) {
     return r->remote_page && !r->url[0];
 }
 
+/* Expose the provider domain without returning the private catalogue URL. */
+static bool url_host(const char *url, char *host, size_t cap) {
+    CURLU *parts = curl_url();
+    char *value = NULL;
+    bool ok = parts && !curl_url_set(parts, CURLUPART_URL, url, CURLU_DISALLOW_USER) &&
+        !curl_url_get(parts, CURLUPART_HOST, &value, 0);
+    if (ok) {
+        const char *name = !strncasecmp(value, "www.", 4) ? value + 4 : value;
+        ok = *name && strlen(name) < cap;
+        if (ok) {
+            copy_text(host, cap, name);
+            for (char *p = host; *p; p++) *p = (char)tolower((unsigned char)*p);
+        }
+    }
+    curl_free(value);
+    curl_url_cleanup(parts);
+    return ok;
+}
+
+bool remote_link_host(const Release *r, char *host, size_t cap) {
+    return url_host(r->remote_page ? r->browser_url : r->url, host, cap);
+}
+
+bool remote_metadata_url(const char *url) {
+#ifdef ORBIT_TEST
+    if (!strncmp(url, "http://127.0.0.1:", 17)) {
+        const char *path = strchr(url + 17, '/');
+        if (path && !strncmp(path, "/metadata/", 10)) return true;
+    }
+#endif
+    const char *hosts[] = {"akirabox.com", "akirabox.to", "rootz.so", "vikingfile.com",
+        "vik1ngfile.site", "vik1ngf1le.online", "gofile.io", "datanodes.to", "datanodes.co", "filekeeper.net"};
+    char host[254];
+    if (!url_host(url, host, sizeof host)) return false;
+    for (size_t i = 0; i < sizeof hosts / sizeof *hosts; i++)
+        if (!strcmp(host, hosts[i])) return true;
+    return false;
+}
+
 static bool token(const char *label, const char *word) {
     size_t length = strlen(word);
     for (const char *p = label; *p; p++)
@@ -141,9 +191,9 @@ static const char *label_format(const char *label) {
 
 /* The payload filename determines the container. A link's PKG/FPKG label
  * describes what is inside a supported archive. Unlabeled archives are folders. */
-int remote_file_format(Release *r, const char *name) {
+static int file_format(Release *r, const char *name, bool community) {
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
-    if (unsupported_label(name)) return 1;
+    if (community && unsupported_label(name)) return 1;
     const char *suffix = strrchr(name, '.');
     if (!suffix) return -1;
     const char *archive = compression(suffix);
@@ -166,6 +216,39 @@ int remote_file_format(Release *r, const char *name) {
     memset(r->compression, 0, sizeof r->compression);
     copy_text(r->compression, sizeof r->compression, archive);
     copy_text(r->filename, sizeof r->filename, name);
+    return 0;
+}
+
+int remote_file_format(Release *r, const char *name) { return file_format(r, name, true); }
+
+int direct_file_format(Release *r, const char *name) {
+    int result = file_format(r, name, false);
+    if (!result) {
+        copy_text(r->title, sizeof r->title, name);
+        for (size_t n = strlen(r->title); n && !utf8_text(r->title);) r->title[--n] = 0;
+    }
+    return result;
+}
+
+bool direct_release_init(Release *r, const char *url) {
+    memset(r, 0, sizeof *r);
+    if (!url || strlen(url) >= sizeof r->url || !direct_http_url(url)) return false;
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)url, strlen(url), hash);
+    snprintf(r->id, sizeof r->id, "url-%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8]);
+    copy_text(r->source, sizeof r->source, ORBIT_DIRECT_SOURCE);
+    copy_text(r->platform, sizeof r->platform, "ps5");
+    copy_text(r->url, sizeof r->url, url);
+    return true;
+}
+
+int direct_release_parse(const cJSON *entry, Release *r) {
+    if (!direct_release_init(r, json_text(entry, "url")) ||
+        direct_file_format(r, json_text(entry, "filename")) ||
+        !bytes(entry, "sizeBytes", &r->size) || r->size < 8 ||
+        strcmp(r->id, json_text(entry, "id")) || strcmp(r->format, json_text(entry, "format")) ||
+        strcmp(r->compression, json_text(entry, "compression"))) return -1;
     return 0;
 }
 
@@ -236,7 +319,7 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     bool has_path = remote_url_filename(r->url, path_name, sizeof path_name);
     if (has_path && unsupported_label(path_name)) return 1;
     if (!strcmp(r->url, "https://datanodes.to/download")) return 1;
-    bool hosted = *remote_browser_provider(r->url) ||
+    bool hosted = remote_metadata_url(r->url) || *remote_browser_provider(r->url) ||
                   !strncmp(r->url, "https://www.mediafire.com/file/", 31);
     int result = remote_file_format(r, *filename ? filename : has_path ? path_name : "");
     if (result > 0) return result;
@@ -247,6 +330,8 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         memset(r->url, 0, sizeof r->url);
         memset(r->filename, 0, sizeof r->filename);
         r->remote_page = true;
+        if (!bytes(link, "sizeBytes", &r->display_size) ||
+            (!r->display_size && !bytes(entry, "sizeBytes", &r->display_size))) return -1;
         if (!r->format[0]) copy_text(r->format, sizeof r->format, "Unknown");
     } else {
         const cJSON *file = *filename ? entry : link;
@@ -254,6 +339,7 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
             (!r->sha256[0] && !field(file, "sha256", r->sha256, sizeof r->sha256)) ||
             !bytes(file, "sizeBytes", &r->size) || !bytes(file, "extractedBytes", &r->extracted_size))
             return -1;
+        if (!r->size && !bytes(entry, "sizeBytes", &r->display_size)) return -1;
         const char *page = json_text(entry, "downloadSource");
         if (*page && strlen(page) < sizeof r->browser_url && remote_https_url(page))
             copy_text(r->browser_url, sizeof r->browser_url, page);
@@ -281,6 +367,206 @@ static int compare_releases(const void *a, const void *b) {
     return strcmp(((const Release *)a)->id, ((const Release *)b)->id);
 }
 
+static void mirror_hash(Release *r, const char *identity) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)identity, strlen(identity), hash);
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof hash; i++) {
+        r->mirror_key[2 * i] = hex[hash[i] >> 4];
+        r->mirror_key[2 * i + 1] = hex[hash[i] & 15];
+    }
+    r->mirror_key[2 * sizeof hash] = 0;
+}
+
+/* Only remove a provider name that agrees with the actual URL. Preserve
+ * edition, region, version, DLC, and explicitly combined variants. */
+static const struct {
+    const char *domains[4], *labels[6];
+} mirror_providers[] = {
+    {{"akirabox.com", "akirabox.to"}, {"akirabox com", "akirabox to", "akira box", "akirabox"}},
+    {{"vikingfile.com", "vik1ngfile.site", "vik1ngf1le.online"},
+        {"vikingfile com", "vik1ngfile site", "vik1ngf1le online", "vikingfile", "viking", "viki"}},
+    {{"datanodes.to", "datanodes.co"}, {"datanodes to", "datanodes co", "data nodes", "datanodes", "data"}},
+    {{"rootz.so"}, {"rootz so", "rootz"}},
+    {{"gofile.io"}, {"gofile io", "gofile"}},
+    {{"filekeeper.net"}, {"filekeeper net", "file keeper", "filekeeper"}},
+    {{"1fichier.com"}, {"1fichier com", "1fichier"}},
+    {{"archive.org"}, {"archive org", "archive"}},
+    {{"mediafire.com"}, {"mediafire com", "mediafire"}},
+};
+
+static int mirror_variant(const Release *r, char *out, size_t cap) {
+    char host[254];
+    if (!remote_link_host(r, host, sizeof host)) return -1;
+    size_t provider = 0;
+    for (; provider < sizeof mirror_providers / sizeof *mirror_providers; provider++) {
+        const char *const *domains = mirror_providers[provider].domains;
+        size_t i = 0;
+        while (i < sizeof mirror_providers[provider].domains / sizeof *domains && domains[i] &&
+               strcmp(host, domains[i])) i++;
+        if (i < sizeof mirror_providers[provider].domains / sizeof *domains && domains[i]) break;
+    }
+    if (provider == sizeof mirror_providers / sizeof *mirror_providers) return -1;
+
+    size_t used = 0;
+    bool space = false;
+    for (const unsigned char *p = (const unsigned char *)r->remote_label; *p; p++) {
+        if (!strncmp((const char *)p, "·", 2)) { p++; space = true; continue; }
+        if (!strncmp((const char *)p, "—", 3) || !strncmp((const char *)p, "–", 3)) {
+            p += 2;
+            space = true;
+            continue;
+        }
+        if (*p < 128 && !isalnum(*p) && *p != '+') { space = true; continue; }
+        if (used + (space && used ? 2 : 1) >= cap) return -1;
+        if (space && used) out[used++] = ' ';
+        out[used++] = (char)tolower(*p);
+        space = false;
+    }
+    out[used] = 0;
+    const char *const *labels = mirror_providers[provider].labels;
+    for (size_t i = 0; i < sizeof mirror_providers[provider].labels / sizeof *labels && labels[i]; i++) {
+        size_t n = strlen(labels[i]);
+        for (char *p = out; (p = strstr(p, labels[i])); p += n) {
+            if ((p != out && p[-1] != ' ') || (p[n] && p[n] != ' ')) continue;
+            char *end = p + n;
+            if (*end == ' ') end++;
+            else if (p != out) p--;
+            memmove(p, end, strlen(end) + 1);
+            return (int)provider;
+        }
+    }
+    return -1;
+}
+
+typedef struct { size_t package; const cJSON *link; } OptionOrigin;
+typedef struct {
+    Release *release;
+    OptionOrigin origin;
+    char variant[128];
+    unsigned provider;
+} MirrorOption;
+
+static int compare_mirror_options(const void *a, const void *b) {
+    const MirrorOption *x = a, *y = b;
+    if (x->origin.package != y->origin.package)
+        return x->origin.package < y->origin.package ? -1 : 1;
+    int variant = strcmp(x->variant, y->variant);
+    return variant ? variant : strcmp(x->release->id, y->release->id);
+}
+
+static void group_package_mirrors(MirrorOption *rows, size_t count) {
+    char identity[sizeof mirror_providers / sizeof *mirror_providers * 24 + 16] = "package/";
+    size_t used = strlen(identity);
+    const Release *first = rows[0].release;
+    unsigned providers = 0;
+    int64_t size = 0;
+    const char *name = "", *compression = "";
+    for (size_t i = 0; i < count; i++) {
+        const Release *r = rows[i].release;
+        if (i && !strcmp(rows[i - 1].release->id, r->id)) continue;
+        unsigned provider = 1u << rows[i].provider;
+        const char *filename = json_text(rows[i].origin.link, "filename");
+        if ((providers & provider) || strcmp(first->format, r->format) ||
+            (size && r->display_size && size != r->display_size) ||
+            (*compression && r->compression[0] && strcmp(compression, r->compression)) ||
+            (*name && *filename && strcmp(name, filename))) return;
+        if (r->display_size) size = r->display_size;
+        if (r->compression[0]) compression = r->compression;
+        if (*filename) name = filename;
+        providers |= provider;
+        used += (size_t)snprintf(identity + used, sizeof identity - used, "%s/", r->id);
+    }
+    if (!(providers & (providers - 1))) return;
+    for (size_t i = 0; i < count; i++) mirror_hash(rows[i].release, identity);
+}
+
+static void identify_mirrors(Release *releases, const OptionOrigin *origin, size_t count) {
+    MirrorOption *opaque = calloc(count, sizeof *opaque);
+    size_t pending = 0;
+    for (size_t i = 0; i < count; i++) {
+        Release *r = &releases[i];
+        if (r->sha256[0]) {
+            char identity[160];
+            snprintf(identity, sizeof identity, "file/%s/%s/%s/%s/%lld",
+                r->title_id, r->format, r->compression, r->sha256, (long long)r->size);
+            mirror_hash(r, identity);
+            continue;
+        }
+        const cJSON *link = origin[i].link;
+        if (!opaque || !remote_page_pending(r) || cJSON_GetObjectItemCaseSensitive(link, "part") ||
+            *json_text(link, "checksum") || *json_text(link, "sha256") || token(r->remote_label, "part")) continue;
+        int provider = mirror_variant(r, opaque[pending].variant, sizeof opaque[pending].variant);
+        if (provider < 0) continue;
+        opaque[pending].release = r;
+        opaque[pending].origin = origin[i];
+        opaque[pending].provider = (unsigned)provider;
+        pending++;
+    }
+    if (pending > 1) {
+        qsort(opaque, pending, sizeof *opaque, compare_mirror_options);
+        for (size_t i = 0; i < pending;) {
+            size_t next = i + 1;
+            while (next < pending && opaque[i].origin.package == opaque[next].origin.package &&
+                   !strcmp(opaque[i].variant, opaque[next].variant)) next++;
+            if (next - i > 1) group_package_mirrors(opaque + i, next - i);
+            i = next;
+        }
+    }
+    free(opaque);
+}
+
+typedef struct {
+    const char *key;
+    size_t option;
+} RetainedMirror;
+
+static int compare_retained_mirrors(const void *a, const void *b) {
+    const RetainedMirror *x = a, *y = b;
+    int order = strcmp(x->key, y->key);
+    if (order || x->option == y->option) return order;
+    return x->option < y->option ? -1 : 1;
+}
+
+/* The original cap still covers visible choices. A separate reserve keeps
+ * one alternate per group across the catalogue before retaining second ones. */
+static size_t retain_choices(Release *releases, size_t count) {
+    if (count <= REMOTE_PACKAGE_LIMIT) return count;
+    RetainedMirror *mirrors = malloc(count * sizeof *mirrors);
+    struct Selection { size_t first, rank; bool keep; } *selection = calloc(count, sizeof *selection);
+    if (!mirrors || !selection) {
+        free(mirrors);
+        free(selection);
+        return REMOTE_PACKAGE_LIMIT;
+    }
+    size_t grouped = 0;
+    for (size_t i = 0; i < count; i++) {
+        selection[i].first = i;
+        if (releases[i].mirror_key[0]) mirrors[grouped++] = (RetainedMirror){releases[i].mirror_key, i};
+    }
+    qsort(mirrors, grouped, sizeof *mirrors, compare_retained_mirrors);
+    for (size_t i = 0, first = 0; i < grouped; i++) {
+        if (i && strcmp(mirrors[first].key, mirrors[i].key)) first = i;
+        selection[mirrors[i].option].first = mirrors[first].option;
+        selection[mirrors[i].option].rank = i - first;
+    }
+    size_t visible = 0, alternate = 0;
+    for (size_t i = 0; i < count && visible < REMOTE_PACKAGE_LIMIT; i++)
+        if (!selection[i].rank) { selection[i].keep = true; visible++; }
+    for (size_t rank = 1; rank <= 2 && alternate < REMOTE_MIRROR_RESERVE; rank++)
+        for (size_t i = 0; i < count && alternate < REMOTE_MIRROR_RESERVE; i++)
+            if (selection[i].rank == rank && selection[selection[i].first].keep) {
+                selection[i].keep = true;
+                alternate++;
+            }
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++)
+        if (selection[i].keep) releases[kept++] = releases[i];
+    free(selection);
+    free(mirrors);
+    return kept;
+}
+
 static int append_option(Release **releases, size_t *count, size_t *capacity, const Release *r) {
     if (*count == *capacity) {
         *capacity = *capacity ? *capacity * 2 : 16;
@@ -305,7 +591,8 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
     size_t capacity = 0, package_count = (size_t)cJSON_GetArraySize(packages);
     struct { const cJSON *next, *first; } *remaining =
         calloc(package_count ? package_count : 1, sizeof *remaining);
-    if (!remaining) goto failed;
+    OptionOrigin *origins = calloc(REMOTE_SCAN_LIMIT, sizeof *origins);
+    if (!remaining || !origins) goto failed;
     size_t i = 0;
     cJSON_ArrayForEach(entry, packages) {
         const cJSON *links = cJSON_GetObjectItemCaseSensitive(entry, "downloadLinks"), *link;
@@ -327,6 +614,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
                 if (rank == 2) break;
             }
             if (best >= 0) {
+                origins[*count] = (OptionOrigin){i, remaining[i].first};
                 if (append_option(releases, count, &capacity, &first)) goto failed;
                 remaining[i].next = links->child;
             } else if (!unsupported) (*skipped)++;
@@ -335,7 +623,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
     }
     /* Visit the mirrors in rounds, so the largest entries cannot use the
      * source limit before the other titles get a second choice. */
-    while (*count < REMOTE_PACKAGE_LIMIT) {
+    while (*count < REMOTE_SCAN_LIMIT) {
         bool more = false;
         i = 0;
         cJSON_ArrayForEach(entry, packages) {
@@ -343,16 +631,20 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
             for (; link; link = link->next) {
                 Release r;
                 if (link == remaining[i].first || map_link(entry, link, source_id, &r)) continue;
+                origins[*count] = (OptionOrigin){i, link};
                 if (append_option(releases, count, &capacity, &r)) goto failed;
                 link = link->next;
                 break;
             }
             remaining[i++].next = link;
             more |= link != NULL;
-            if (*count == REMOTE_PACKAGE_LIMIT) break;
+            if (*count == REMOTE_SCAN_LIMIT) break;
         }
         if (!more) break;
     }
+    identify_mirrors(*releases, origins, *count);
+    *count = retain_choices(*releases, *count);
+    free(origins);
     free(remaining);
     cJSON_Delete(root);
     if (*count > 1) qsort(*releases, *count, sizeof **releases, compare_releases);
@@ -364,6 +656,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
     *count = unique;
     return 0;
 failed:
+    free(origins);
     free(remaining);
     free(*releases);
     *releases = NULL;

@@ -133,7 +133,8 @@ export const TORBOX_SOURCE = "torbox";
 export function releaseMatches(r: Release, filters: BrowseFilters, torbox: ReadonlySet<string> = new Set()) {
   if (filters.platform && (r.homebrew ? "homebrew" : gamePlatform(r)) !== filters.platform) return false;
   if (filters.source.length && !filters.source.includes(r.sourceId) &&
-      !(filters.source.includes(TORBOX_SOURCE) && torbox.has(r.sourceId)))
+      !(filters.source.includes(TORBOX_SOURCE) &&
+        (r.torboxHosts ?? [r.torboxHost || r.sourceId]).some((host) => torbox.has(host))))
     return false;
   const formats = downloadFormats(filters.format);
   if (formats.length && !formats.includes(releaseFormat(r))) return false;

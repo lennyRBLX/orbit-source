@@ -22,12 +22,28 @@ int remote_sources_change_locked(const char *method, const char *id, const cJSON
 int pegasus_entry_to_release(const cJSON *entry, const char *source_id, Release *release);
 bool remote_page_pending(const Release *release);
 const char *remote_browser_provider(const char *url);
+bool remote_link_host(const Release *release, char *host, size_t cap);
+bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror);
+bool remote_mirror_locked(const Release *release, const char *id, Release *mirror);
+bool remote_mirror_file(const Release *selected, const Release *file);
+bool remote_metadata_url(const char *url);
 bool remote_url_filename(const char *url, char *name, size_t cap);
 int remote_file_format(Release *release, const char *name);
+int direct_file_format(Release *release, const char *name);
+bool direct_release_init(Release *release, const char *url);
+int direct_release_parse(const cJSON *entry, Release *release);
+bool download_file_magic(const Release *release, const unsigned char *sample, size_t length);
 int remote_download_resolve(Release *release, Release *locator, atomic_bool *cancel,
                             char *error, size_t cap);
 int remote_download_verify(Release *release, const char *url, atomic_bool *cancel,
                            char *error, size_t cap);
+typedef struct {
+    char filename[160];
+    int64_t size;
+    bool exact;
+} RemoteFileMetadata;
+bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, atomic_bool *cancel);
+cJSON *remote_metadata_json_locked(const char *ids);
 int remote_release_parse(const cJSON *entry, Release *release);
 int remote_catalog_parse(const char *body, size_t length, const char *source_id,
                          Release **releases, size_t *count, size_t *skipped);

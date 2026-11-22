@@ -1,6 +1,7 @@
 #include "orbit.h"
 #include "debrid.h"
 #include "extract.h"
+#include "remote_sources.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -11,7 +12,8 @@
 #include <unistd.h>
 /* Case-insensitive comparisons also protect exFAT destinations. */
 bool job_paths_overlap(const Job *a, const Job *b) {
-    if (a->device != b->device || a->inode != b->inode || strcmp(a->root, b->root)) return false;
+    if (!a->filename[0] || !b->filename[0] || a->device != b->device ||
+        a->inode != b->inode || strcmp(a->root, b->root)) return false;
     char ap[300], bp[300];
     snprintf(ap, sizeof ap, "%s.part", a->filename);
     snprintf(bp, sizeof bp, "%s.part", b->filename);
@@ -128,6 +130,7 @@ static bool related(const char *a, const char *b) {
 }
 /* The names a download writes: its file, its partial and what it unpacks to. */
 static size_t job_names(const Job *j, char names[3][1100]) {
+    if (!j->filename[0]) return 0;
     snprintf(names[0], 1100, "%s/homebrew/%s", j->root, j->filename);
     snprintf(names[1], 1100, "%s/homebrew/%s.part", j->root, j->filename);
     if (!j->output[0]) return 2;
@@ -161,6 +164,62 @@ static bool fits(const Storage *s, uint64_t size, const Job *exclude) {
     return pending <= s->free_bytes && size <= s->free_bytes - pending &&
            margin <= s->free_bytes - pending - size;
 }
+
+/* A queued community page only claims a path once the selected file is known. */
+bool job_assign_remote_file_locked(Job *j, const Release *file, char *err, size_t cap) {
+    if (j->cancel || j->pause || orbit.stop || !source_enabled_locked(&j->release)) return false;
+    Storage drives[ORBIT_MAX_STORAGE], *drive = NULL;
+    size_t count = storage_list(drives);
+    for (size_t i = 0; i < count; i++)
+        if (!strcmp(drives[i].id, j->storage_id) && !strcmp(drives[i].root, j->root) &&
+            drives[i].device == j->device && drives[i].inode == j->inode) { drive = &drives[i]; break; }
+    if (!drive || !fits(drive, (uint64_t)file->size, j)) {
+        copy_text(err, cap, drive ? "Not enough free space to finish this download."
+                                  : "Destination is missing or not writable.");
+        return false;
+    }
+    Job destination = {.device = j->device, .inode = j->inode};
+    copy_text(destination.root, sizeof destination.root, j->root);
+    copy_text(destination.filename, sizeof destination.filename, file->filename);
+    bool conflict = storage_hold_conflict_locked(&destination);
+    for (size_t i = 0; i < orbit.job_count && !conflict; i++) {
+        const Job *other = &orbit.jobs[i];
+        conflict = other != j && other->id[0] && strcmp(other->status, "complete") &&
+            strcmp(other->status, "cancelled") && job_paths_overlap(other, &destination);
+    }
+    if (conflict) {
+        copy_text(err, cap, "Another operation uses this filename on that drive.");
+        return false;
+    }
+    int dir = storage_open(j);
+    if (dir < 0) {
+        copy_text(err, cap, "Destination is missing or not writable.");
+        return false;
+    }
+    struct stat st;
+    char partial[sizeof file->filename + 5];
+    snprintf(partial, sizeof partial, "%s.part", file->filename);
+    bool absent = fstatat(dir, file->filename, &st, AT_SYMLINK_NOFOLLOW) && errno == ENOENT &&
+                  fstatat(dir, partial, &st, AT_SYMLINK_NOFOLLOW) && errno == ENOENT;
+    close(dir);
+    if (!absent) {
+        copy_text(err, cap, "A destination or partial file already exists. Orbit will not overwrite it.");
+        return false;
+    }
+    Release previous = j->release;
+    bool packed = j->keep_packed;
+    j->release = *file;
+    j->total = file->size;
+    j->keep_packed = packed && file->compression[0];
+    copy_text(j->filename, sizeof j->filename, file->filename);
+    if (state_save_locked() == 0) return true;
+    j->release = previous;
+    j->total = previous.size;
+    j->keep_packed = packed;
+    copy_text(j->filename, sizeof j->filename, previous.filename);
+    copy_text(err, cap, "Could not persist source identity.");
+    return false;
+}
 /* Never orphan a kept partial file. Removing a history record deletes no disk files. */
 static bool removable(const Job *j) {
     if (j->history_removing) return false;
@@ -168,6 +227,7 @@ static bool removable(const Job *j) {
         return true;
     if (strcmp(j->status, "cancelled"))
         return false;
+    if (!j->filename[0]) return true;
     int dir = storage_open(j);
     if (dir < 0)
         return false;
@@ -203,6 +263,7 @@ bool job_resumable_cancel_locked(const Job *j) {
 /* Call only after the writer stops. An absent file is already cleaned up;
  * other errors must not discard the saved resume map, even at zero progress. */
 int job_delete_partial_locked(Job *j, char *err, size_t cap) {
+    if (!j->filename[0]) return 0;
     (void)storage_rebind_locked(j);
     int dir = storage_open(j);
     if (dir < 0) {
@@ -279,8 +340,10 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         copy_text(err, cap, "Unknown curated release.");
         return 404;
     }
+    bool torbox = delivery && !strcmp(delivery, "torbox");
+    bool pending_file = torbox && !strcmp(r->source, "remote") && remote_page_pending(r);
     /* The catalogue already leaves other formats out; refuse any that reaches here anyway. */
-    if (!orbit_format_allowed(r)) {
+    if (!pending_file && !orbit_format_allowed(r)) {
         copy_text(err, cap, "Orbit downloads PKG, FPKG and game-folder options only.");
         return 400;
     }
@@ -290,12 +353,26 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         return 409;
     }
     Job delivery_job = {0};
-    bool torbox = delivery && !strcmp(delivery, "torbox");
     if (delivery && *delivery && strcmp(delivery, "direct") && !torbox) {
         copy_text(err, cap, "Choose direct or torbox delivery."); return 400;
     }
     if (torbox) {
-        int code = debrid_prepare_locked(r, &delivery_job, err, cap);
+        const Release *route = r;
+        Release mirror;
+        if (!debrid_link_covered_locked(r)) {
+            char after[sizeof mirror.id] = "";
+            while (remote_next_mirror_locked(r, after, &mirror)) {
+                if (debrid_link_covered_locked(&mirror)) {
+                    route = &mirror;
+                    copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, mirror.id);
+                    copy_text(delivery_job.mirror_first, sizeof delivery_job.mirror_first, mirror.id);
+                    delivery_job.mirror_torbox = true;
+                    break;
+                }
+                copy_text(after, sizeof after, mirror.id);
+            }
+        }
+        int code = debrid_prepare_locked(route, &delivery_job, err, cap);
         if (code != 200) return code;
     }
     if (!torbox && !provider_supported(r) && !(dry_run && provider_browser_supported(r))) {
@@ -383,7 +460,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         copy_text(err, cap, "Queue is full. Clear finished or cancelled history to make room.");
         return 409;
     }
-    const bool packed = r->compression[0] && !orbit.extract_archives;
+    const bool packed = (pending_file || r->compression[0]) && !orbit.extract_archives;
     if (!fits(s, job_space_needed(r), NULL)) {
         copy_text(
             err, cap,
@@ -393,6 +470,8 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     Job j = delivery_job;
     j.release = *r;
     j.keep_packed = packed;
+    bool direct_url = !strcmp(r->source, ORBIT_DIRECT_SOURCE);
+    j.auto_install = direct_url;
     copy_text(j.etag, sizeof j.etag, etag ? etag : "");
     copy_text(j.modified, sizeof j.modified, modified ? modified : "");
     j.order = last_order + 1;
@@ -413,9 +492,9 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     char partial[192];
     snprintf(partial, sizeof partial, "%s.part", j.filename);
     struct stat st;
-    bool absent = fstatat(dir, j.filename, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT;
+    bool absent = !j.filename[0] || (fstatat(dir, j.filename, &st, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT);
     bool leftover = false;
-    if (absent && fstatat(dir, partial, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    if (j.filename[0] && absent && fstatat(dir, partial, &st, AT_SYMLINK_NOFOLLOW) == 0) {
         /* A download that failed before its first byte (TorBox couldn't prepare the
          * file, say) leaves an empty .part, and removing that download from the list
          * keeps it. A new download may take over an empty one that no download in the
@@ -426,7 +505,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
                 job_paths_overlap(&orbit.jobs[i], &destination))
                 leftover = false;
         absent = leftover;
-    } else if (absent) {
+    } else if (j.filename[0] && absent) {
         absent = errno == ENOENT;
     }
     if (absent && leftover && !dry_run && unlinkat(dir, partial, 0) && errno != ENOENT)
@@ -454,7 +533,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     copy_text(orbit.preferred_storage, sizeof orbit.preferred_storage, sid);
     char previous_delivery[sizeof orbit.last_delivery];
     copy_text(previous_delivery, sizeof previous_delivery, orbit.last_delivery);
-    if (!orbit.always_use_torbox)
+    if (!orbit.always_use_torbox && !direct_url)
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, torbox ? "torbox" : "direct");
     if (state_save_locked()) {
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, previous_delivery);
@@ -487,8 +566,9 @@ int job_check_capture_locked(const Release *r, const Storage *s, char *err, size
 }
 int job_create_captured_locked(const Release *r, const Storage *s, const char *etag,
                                const char *modified, char *err, size_t cap, Job **result) {
-    bool community = r->remote_page && !strcmp(r->source, "remote");
-    if (community ? (!provider_supported(r) || !r->filename[0] || r->size <= 0)
+    bool file_verified = (r->remote_page && !strcmp(r->source, "remote")) ||
+                         !strcmp(r->source, ORBIT_DIRECT_SOURCE);
+    if (file_verified ? (!provider_supported(r) || !r->filename[0] || r->size <= 0)
                   : (!provider_capture_url(r, r->url) || (!etag[0] && !modified[0]))) {
         copy_text(err, cap, "The provider file has not been validated.");
         return 409;

@@ -20,7 +20,7 @@ bool source_enabled_locked(const Release *r) {
     if (!r)
         return false;
     /* The pinned connection diagnostic is not a game source. */
-    if (!strcmp(r->id, "orbit-network-check"))
+    if (!strcmp(r->id, "orbit-network-check") || !strcmp(r->source, ORBIT_DIRECT_SOURCE))
         return true;
     if (!strcmp(r->source, "remote")) return remote_source_enabled_locked(r);
     return orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&

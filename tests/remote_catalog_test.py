@@ -228,7 +228,113 @@ class RemoteCatalogueTests(unittest.TestCase):
                 rows = service.command("view")["remote"]
                 self.assertCountEqual([row["provider"] for row in rows], ["Folder · Viki", "FPKG · Data"])
                 self.assertTrue(all(row["browserAvailable"] and not row["directAvailable"] for row in rows))
+                self.assertTrue(all(row["torboxHost"] == "127.0.0.1" for row in rows))
                 self.assertEqual(len({row["gameId"] for row in rows}), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_provider_sizes_are_available_without_changing_transfer_length(self):
+        server = FixtureServer()
+        address = server.url.removesuffix("/catalogue.json")
+        html = {"Content-Type": "text/html"}
+        server.downloads.update({
+            "/metadata/akira": (200, html, b'<meta property="og:title" content="game.rar">'
+                                b'<meta property="og:description" content="RAR file &nbsp; 1.48 GB">'),
+            "/metadata/viking": (200, html, b'<img src="' + b'a' * 660_000 +
+                                 b'"><h2 id="filename">game.pkg</h2><p id="size">42.25 GiB</p>'),
+            "/metadata/data": (200, html, b'<h1>game.pkg</h1>'
+                               b'<span data-size-bytes="43123456789">43.1 GB</span>'),
+            "/metadata/unavailable": (404, html, b'Unavailable'),
+        })
+        server.feed = {"packages": [{"title": "Game", "titleId": "PPSA12345", "sizeBytes": 1000000,
+                        "downloadLinks": [{"name": label, "url": address + "/metadata/" + label}
+                                          for label in ("akira", "viking", "data", "unavailable")]}]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name in DEFAULTS:
+                    service.command("PATCH", id=name, enabled=False)
+                service.command("POST", url=server.url)
+                self.assertEqual(service.command("start"), 0)
+                service.command("policy", remote=True, notice=True)
+                service.idle()
+                rows = service.command("view")["remote"]
+                self.assertEqual(len(rows), 4)
+                for row in rows:
+                    self.assertTrue(row["providerMetadata"])
+                    self.assertEqual(row["sizeBytes"], 0)
+                    self.assertEqual(row["sizeEstimateBytes"], 1000000)
+                ids = ",".join(row["id"] for row in rows)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    result = service.command("metadata", ids=ids)
+                    if not result["pending"]:
+                        break
+                    time.sleep(0.02)
+                self.assertFalse(result["pending"])
+                self.assertCountEqual(
+                    [(row["sizeBytes"], row["exact"]) for row in result["files"]],
+                    [(1480000000, False), (int(42.25 * 1024 ** 3), False), (43123456789, True)],
+                )
+                self.assertEqual(service.command("metadata", ids=ids), result)
+                self.assertEqual(sum(path.startswith("/metadata/") for path in server.paths), 4)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_duplicate_mirrors_keep_variants_and_reserve_alternates(self):
+        def link(label, url, **fields):
+            return {"name": label, "url": url, **fields}
+
+        def package(title_id, *links):
+            return {"title": title_id, "titleId": title_id, "downloadLinks": links}
+
+        def akira(i, label="EUR 12.xx Base", **fields):
+            return link(f"{label} - AkiraBox", f"https://akirabox.to/{i:012d}/file", **fields)
+
+        def viki(i, label="EUR 12.xx Base", **fields):
+            return link(f"{label} · Viki", f"https://vikingfile.com/f/{i:010d}", **fields)
+
+        hash_value = "a" * 64
+        fixtures = [
+            package("PPSA00001", akira(1), viki(1), akira(2, "EUR 12.xx DLC")),
+            package("PPSA00002", viki(2), viki(3), akira(3)),
+            package("PPSA00003", akira(4, sizeBytes=100), viki(4, sizeBytes=200)),
+            package("PPSA00004", akira(5, "Game + DLC"), viki(5, "Game - DLC")),
+            package("PPSA00005", akira(6, part=1), viki(6, part=1)),
+            package("PPSA00006", akira(7)),
+            package("PPSA00006", viki(7)),
+            package("PPSA00007", link("FPKG", "https://one.example/app.pkg", sha256=hash_value, sizeBytes=100),
+                    link("FPKG", "https://two.example/app.pkg", sha256=hash_value, sizeBytes=100),
+                    link("FPKG", "https://three.example/app.pkg", sha256=hash_value, sizeBytes=200)),
+        ]
+        fixtures.extend(package(f"PPSA{i:05d}", akira(i), viki(i)) for i in range(10000, 11025))
+        server = FixtureServer()
+        server.feed = {"packages": fixtures}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name in DEFAULTS:
+                    service.command("PATCH", id=name, enabled=False)
+                service.command("POST", url=server.url)
+                self.assertEqual(service.command("start"), 0)
+                service.command("policy", remote=True, notice=True)
+                service.idle()
+                rows = service.command("view")["remote"]
+                by_title = {}
+                for row in rows:
+                    self.assertNotIn("mirrorKey", row)
+                    by_title.setdefault(row["titleId"], []).append(row)
+                self.assertEqual([len(by_title[f"PPSA{i:05d}"]) for i in range(1, 8)], [2, 3, 2, 2, 2, 2, 2])
+                base = next(row for row in by_title["PPSA00001"] if row.get("mirrorCount"))
+                self.assertEqual(base["mirrorCount"], 2)
+                self.assertCountEqual(base["torboxHosts"], ["akirabox.to", "vikingfile.com"])
+                self.assertTrue(all(by_title[f"PPSA{i:05d}"][0]["mirrorCount"] == 2 for i in range(10000, 11025)))
         finally:
             server.shutdown()
             server.server_close()

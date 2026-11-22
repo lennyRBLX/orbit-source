@@ -179,6 +179,9 @@ static cJSON *job_json(const Job *j, bool private_fields) {
         if (j->archive_locked) cJSON_AddBoolToObject(o, "archiveLocked", true);
         if (j->resume_after_restart) cJSON_AddBoolToObject(o, "resumeAfterRestart", true);
         if (j->archive_password[0]) { S("archivePassword", archive_password); }
+        if (j->mirror_id[0]) { S("mirrorId", mirror_id); }
+        if (j->mirror_first[0]) { S("mirrorFirst", mirror_first); }
+        if (j->mirror_torbox) cJSON_AddTrueToObject(o, "mirrorTorBox");
         cJSON_AddItemToObject(o, "release", release_json(&j->release));
         if (j->release.viking_context) {
             cJSON_AddNumberToObject(o, "vikingContext", j->release.viking_context);
@@ -470,8 +473,10 @@ int state_load(void) {
         const cJSON *saved = cJSON_GetObjectItemCaseSensitive(x, "release");
         if (saved) {
             /* A bad saved identity must never silently switch to the current file. */
-            bool remote = !strcmp(json_text(saved, "sourceId"), "remote");
-            if ((remote ? remote_release_parse(saved, &snapshot) : release_parse(saved, &snapshot, true)) ||
+            const char *source = json_text(saved, "sourceId");
+            int parsed = !strcmp(source, ORBIT_DIRECT_SOURCE) ? direct_release_parse(saved, &snapshot)
+                : !strcmp(source, "remote") ? remote_release_parse(saved, &snapshot) : release_parse(saved, &snapshot, true);
+            if (parsed ||
                 strcmp(snapshot.id, json_text(x, "releaseId"))) {
                 cJSON_Delete(o);
                 return -1;
@@ -480,7 +485,7 @@ int state_load(void) {
         }
         if (!r || orbit.job_count >= ORBIT_MAX_JOBS)
             continue;
-        bool remote_source_release = !strcmp(r->source, "remote");
+        bool inspected_source = !strcmp(r->source, "remote") || !strcmp(r->source, ORBIT_DIRECT_SOURCE);
         Job *j = &orbit.jobs[orbit.job_count++];
         j->release = *r;
         const cJSON *viking = cJSON_GetObjectItemCaseSensitive(x, "vikingContext");
@@ -497,6 +502,20 @@ int state_load(void) {
 #define R(k, f) copy_text(j->f, sizeof j->f, json_text(x, k))
         R("id", id);
         R("releaseId", release_id);
+        const char *mirror_ids[] = {json_text(x, "mirrorId"), json_text(x, "mirrorFirst")};
+        for (size_t i = 0; i < sizeof mirror_ids / sizeof *mirror_ids; i++) {
+            const char *id = mirror_ids[i];
+            if (*id && (strcmp(r->source, "remote") || !r->mirror_key[0] ||
+                strlen(id) >= sizeof j->mirror_id || strncmp(id, "rs-", 3) ||
+                strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(id) ||
+                !strcmp(id, r->id))) {
+                cJSON_Delete(o); return -1;
+            }
+        }
+        R("mirrorId", mirror_id);
+        R("mirrorFirst", mirror_first);
+        j->mirror_torbox = (j->mirror_id[0] || j->mirror_first[0]) &&
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "mirrorTorBox"));
         R("storageId", storage_id);
         R("root", root);
         R("status", status);
@@ -527,7 +546,7 @@ int state_load(void) {
         const cJSON *inspected = cJSON_GetObjectItemCaseSensitive(x, "inspectedBytes");
         if (inspected) {
             const char *format = json_text(x, "detectedFormat");
-            if ((!r->archive_unverified && !(remote_source_release && r->compression[0])) || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
+            if ((!r->archive_unverified && !(inspected_source && r->compression[0])) || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
                 inspected->valuedouble < 0 || inspected->valuedouble > 9007199254740991.0 ||
                 floor(inspected->valuedouble) != inspected->valuedouble ||
                 (*format && strcmp(format, "PKG") && strcmp(format, "exFAT") && strcmp(format, "FFPFSC") &&
@@ -538,7 +557,8 @@ int state_load(void) {
             copy_text(j->inspected_format, sizeof j->inspected_format, format);
         }
         j->archive_kept = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "archiveKept"));
-        j->keep_packed = r->compression[0] && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "keepPacked"));
+        j->keep_packed = (r->compression[0] || remote_page_pending(r)) &&
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "keepPacked"));
         /* Optional (1.9.5): Get everything's install order. */
         j->auto_install = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "autoInstall"));
         const char *after = json_text(x, "installAfter");
@@ -576,6 +596,11 @@ int state_load(void) {
             copy_text(j->drive_mark, sizeof j->drive_mark, mark);
         j->received = json_int(x, "received");
         const cJSON *ranges = cJSON_GetObjectItemCaseSensitive(x, "rangeReceived");
+        if (remote_page_pending(r) && ((!j->mirror_id[0] && !j->mirror_first[0] && strcmp(j->delivery, "torbox")) ||
+            (!r->filename[0] && (j->received || ranges || !strcmp(j->status, "complete"))))) {
+            cJSON_Delete(o);
+            return -1;
+        }
         if (ranges) {
             int count = cJSON_GetArraySize(ranges);
             if (!cJSON_IsArray(ranges) ||

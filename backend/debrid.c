@@ -2,6 +2,7 @@
 #include "debrid.h"
 #include "ca.h"
 #include "provider_network.h"
+#include "remote_sources.h"
 #include <curl/curl.h>
 #include <ctype.h>
 #include <errno.h>
@@ -19,6 +20,7 @@
 #define RESPONSE_MAX (1024 * 1024)
 #define HOST_TTL 600
 #define HOST_COUNT 4
+#define COMMUNITY_HOST_COUNT 256
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
@@ -39,9 +41,21 @@ static int domain_host(const char *domain) {
 /* Prefer DataNodes' permanent file page over an expiring browser-captured URL.
  * Existing Archive.org/Vikingfile queue identities remain unchanged. */
 static const char *source_url(const Release *release) {
+    if (!strcmp(release->source, "remote") && release->remote_page)
+        return release->browser_url;
     return (!strcmp(release->source, "datanodes") || !strcmp(release->source, "1fichier")) && provider_browser_supported(release)
         ? release->browser_url : release->url;
 }
+typedef struct {
+    char name[254];
+    bool available;
+    int64_t limit;
+} DebridHost;
+
+static const char *bare_domain(const char *domain) {
+    return !strncasecmp(domain, "www.", 4) ? domain + 4 : domain;
+}
+
 static struct {
     pthread_t thread;
     bool started, stop, busy, connected, check;
@@ -49,6 +63,8 @@ static struct {
     time_t checked, retry_at, next_check;
     unsigned revision;
     struct { bool available; int64_t limit; } hosts[HOST_COUNT];
+    DebridHost community_hosts[COMMUNITY_HOST_COUNT];
+    size_t community_host_count;
 } debrid;
 typedef struct {
     char *body;
@@ -297,6 +313,8 @@ static void pause_jobs_locked(void) {
 static void check_account(const char *key) {
     char err[256] = {0}, account[65] = {0}; time_t retry = 0;
     bool available[HOST_COUNT] = {0}; int64_t limits[HOST_COUNT] = {0};
+    DebridHost community_hosts[COMMUNITY_HOST_COUNT] = {0};
+    size_t community_count = 0;
     cJSON *user = call(key, "/user/me?settings=false", NULL, true, NULL, &retry, err, sizeof err, NULL);
     bool ok = user && account_hash(cJSON_GetObjectItemCaseSensitive(user, "data"), account);
     cJSON_Delete(user);
@@ -305,20 +323,33 @@ static void check_account(const char *key) {
     const cJSON *hosts = cJSON_GetObjectItemCaseSensitive(hosters, "data"), *host;
     ok = ok && cJSON_IsArray(hosts);
     cJSON_ArrayForEach(host, hosts) {
+        int64_t limit = 0, daily = 0, used = 0, links = 0, link_used = 0;
+        /* Host size metadata is advisory. Let createwebdownload decide for this account. */
+        identifier(host, "per_link_size_limit", &limit);
+        bool bandwidth = !identifier(host, "daily_bandwidth_limit", &daily) || !daily ||
+                         (identifier(host, "daily_bandwidth_used", &used) && used < daily);
+        bool count = !identifier(host, "daily_link_limit", &links) || !links ||
+                     (identifier(host, "daily_link_used", &link_used) && link_used < links);
+        bool up = bandwidth && count && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(host, "status"));
+        int64_t ceiling = daily > used && (!limit || daily - used < limit) ? daily - used : limit;
         const cJSON *domain;
         cJSON_ArrayForEach(domain, cJSON_GetObjectItemCaseSensitive(host, "domains")) {
             if (!cJSON_IsString(domain)) continue;
-            int index = domain_host(domain->valuestring);
-            if (index < 0) continue;
-            int64_t limit = 0, daily = 0, used = 0, links = 0, link_used = 0;
-            /* Host size metadata is advisory. Let createwebdownload decide for this account. */
-            identifier(host, "per_link_size_limit", &limit);
-            bool bandwidth = !identifier(host, "daily_bandwidth_limit", &daily) || !daily ||
-                             (identifier(host, "daily_bandwidth_used", &used) && used < daily);
-            bool count = !identifier(host, "daily_link_limit", &links) || !links ||
-                         (identifier(host, "daily_link_used", &link_used) && link_used < links);
-            available[index] = bandwidth && count && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(host, "status"));
-            limits[index] = daily > used && (!limit || daily - used < limit) ? daily - used : limit;
+            const char *name = bare_domain(domain->valuestring);
+            int index = domain_host(name);
+            if (index >= 0) { available[index] = up; limits[index] = ceiling; }
+            if (!*name || strlen(name) >= sizeof community_hosts[0].name ||
+                strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-") != strlen(name))
+                continue;
+            size_t i = 0;
+            while (i < community_count && strcasecmp(name, community_hosts[i].name)) i++;
+            if (i == COMMUNITY_HOST_COUNT) continue;
+            if (i == community_count) community_count++;
+            DebridHost *entry = &community_hosts[i];
+            copy_text(entry->name, sizeof entry->name, name);
+            for (char *c = entry->name; *c; c++) *c = (char)tolower((unsigned char)*c);
+            entry->available = up;
+            entry->limit = ceiling;
         }
     }
     cJSON_Delete(hosters);
@@ -337,6 +368,8 @@ static void check_account(const char *key) {
             copy_text(debrid.key, sizeof debrid.key, key); copy_text(debrid.account, sizeof debrid.account, account);
             debrid.connected = true; debrid.checked = time(NULL);
             for (int i = 0; i < HOST_COUNT; i++) { debrid.hosts[i].available = available[i]; debrid.hosts[i].limit = limits[i]; }
+            memcpy(debrid.community_hosts, community_hosts, community_count * sizeof community_hosts[0]);
+            debrid.community_host_count = community_count;
             debrid.revision++;
         }
     }
@@ -426,6 +459,16 @@ cJSON *debrid_status(void) {
         cJSON_AddBoolToObject(h, "available", debrid.connected && debrid.hosts[i].available && time(NULL) < debrid.checked + HOST_TTL);
         cJSON_AddNumberToObject(h, "maxFileSize", (double)debrid.hosts[i].limit); cJSON_AddItemToArray(hosts, h);
     }
+    cJSON *domains = cJSON_AddArrayToObject(o, "domains");
+    if (debrid.connected && time(NULL) < debrid.checked + HOST_TTL)
+        for (size_t i = 0; i < debrid.community_host_count; i++) {
+            const DebridHost *host = &debrid.community_hosts[i];
+            if (!host->available) continue;
+            cJSON *item = cJSON_CreateObject();
+            if (!cJSON_AddStringToObject(item, "host", host->name) ||
+                !cJSON_AddNumberToObject(item, "maxFileSize", (double)host->limit) ||
+                !cJSON_AddItemToArray(domains, item)) cJSON_Delete(item);
+        }
     pthread_mutex_unlock(&orbit.mutex); return o;
 }
 int debrid_action(const cJSON *input, char *err, size_t cap) {
@@ -465,43 +508,72 @@ int debrid_action(const cJSON *input, char *err, size_t cap) {
     }
     pthread_mutex_unlock(&orbit.mutex); return code;
 }
+/* -1 means no currently usable host. Zero is an unreported size limit. */
+static int64_t covered_limit(const Release *r) {
+    if (!r || !strcmp(r->id, "orbit-network-check")) return -1;
+    if (!strcmp(r->source, "remote")) {
+        char host[sizeof debrid.community_hosts[0].name];
+        if (!remote_link_host(r, host, sizeof host)) return -1;
+        for (size_t i = 0; i < debrid.community_host_count; i++) {
+            const DebridHost *entry = &debrid.community_hosts[i];
+            if (entry->available && !strcmp(host, entry->name)) return entry->limit;
+        }
+        return -1;
+    }
+    int host = source_host(r->source);
+    return host >= 0 && debrid.hosts[host].available && (provider_supported(r) || provider_browser_supported(r))
+        ? debrid.hosts[host].limit : -1;
+}
+static bool current_account(void) {
+    return debrid.connected && debrid.key[0] && time(NULL) < debrid.checked + HOST_TTL;
+}
+bool debrid_link_covered_locked(const Release *r) {
+    return current_account() && covered_limit(r) >= 0;
+}
+static bool covered_option(const Release *r, bool check_size) {
+    if (!r || !current_account()) return false;
+    int64_t limit = covered_limit(r);
+    if (limit >= 0 && (!check_size || !limit || r->size <= limit)) return true;
+    Release mirror;
+    char after[sizeof mirror.id] = "";
+    while (remote_next_mirror_locked(r, after, &mirror)) {
+        limit = covered_limit(&mirror);
+        if (limit >= 0 && (!check_size || !limit || r->size <= limit)) return true;
+        copy_text(after, sizeof after, mirror.id);
+    }
+    return false;
+}
 bool debrid_covers_locked(const Release *r) {
-    int host = source_host(r ? r->source : NULL);
-    return host >= 0 && strcmp(r->id, "orbit-network-check") && (provider_supported(r) || provider_browser_supported(r)) &&
-           debrid.connected && debrid.key[0] && time(NULL) < debrid.checked + HOST_TTL && debrid.hosts[host].available;
+    return covered_option(r, false);
 }
 bool debrid_default_locked(const Release *r) {
     if (orbit.always_use_torbox && debrid_covers_locked(r)) return true;
-    int host = source_host(r ? r->source : NULL);
-    if (strcmp(orbit.last_delivery, "torbox") || host < 0 || !debrid.connected ||
-        debrid.busy || time(NULL) >= debrid.checked + HOST_TTL || !debrid.hosts[host].available) return false;
-    return !debrid.hosts[host].limit || r->size <= debrid.hosts[host].limit;
+    return !strcmp(orbit.last_delivery, "torbox") && !debrid.busy && covered_option(r, true);
 }
 int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
-    int host = source_host(r ? r->source : NULL);
     if (!debrid.connected || !debrid.key[0]) { copy_text(err, cap, "Connect TorBox in App settings first."); return 409; }
     if (debrid.busy || time(NULL) >= debrid.checked + HOST_TTL) { copy_text(err, cap, "Refresh TorBox in App settings before starting this download."); return 409; }
-    if (!r || host < 0 || !strcmp(r->id, "orbit-network-check") ||
-        (!provider_supported(r) && !provider_browser_supported(r))) { copy_text(err, cap, "This option is not supported by TorBox."); return 409; }
-    if (!debrid.hosts[host].available) {
+    if (covered_limit(r) < 0) {
         copy_text(err, cap, "TorBox is unavailable for this option. Choose the original source or check App settings."); return 409;
     }
     copy_text(job->delivery, sizeof job->delivery, "torbox");
     copy_text(job->debrid_account, sizeof job->debrid_account, debrid.account);
     job->debrid_id = job->debrid_file = -1; return 200;
 }
-static cJSON *find_item(cJSON *reply, Job *job) {
+static cJSON *find_item(cJSON *reply, Job *job, const char *original_url) {
     cJSON *data = cJSON_GetObjectItemCaseSensitive(reply, "data");
     if (!cJSON_IsArray(data)) return cJSON_IsObject(data) ? data : NULL;
     cJSON *item;
     cJSON_ArrayForEach(item, data) {
         int64_t id;
         if (!identifier(item, "id", &id)) continue;
-        if (job->debrid_id >= 0 ? id == job->debrid_id : !strcmp(json_text(item, "original_url"), source_url(&job->release))) return item;
+        if (job->debrid_id >= 0 ? id == job->debrid_id : !strcmp(json_text(item, "original_url"), original_url)) return item;
     }
     return NULL;
 }
-int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *err, size_t cap) {
+int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at, char *err, size_t cap) {
+    const char *original_url = source_url(route);
+    const bool using_mirror = route != &job->release;
     char key[KEY_CAP], path[2048]; int result = -1;
     pthread_mutex_lock(&orbit.mutex);
     bool account = debrid.connected && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
@@ -514,7 +586,7 @@ int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *
     snprintf(path, sizeof path, job->debrid_id >= 0 ? "/webdl/mylist?id=%lld&bypass_cache=true" : "/webdl/mylist?limit=1000&bypass_cache=true", (long long)job->debrid_id);
     cJSON *list = call(key, path, NULL, true, job, retry_at, err, cap, NULL);
     if (!list) { if (*retry_at > time(NULL)) result = 0; goto end; }
-    cJSON *item = find_item(list, job);
+    cJSON *item = find_item(list, job, original_url);
     if (job->debrid_id < 0 && item) {
         int64_t id;
         if (identifier(item, "id", &id)) {
@@ -550,7 +622,7 @@ int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *
         if (listing) { *retry_at = listed_by; result = 0; goto end; }
         if (!saved) { copy_text(err, cap, "Could not save the TorBox submission state."); goto end; }
         if (time(NULL) < next) { *retry_at = next; result = 0; goto end; }
-        char *escaped = curl_easy_escape(NULL, source_url(&job->release), 0);
+        char *escaped = curl_easy_escape(NULL, original_url, 0);
         char form[8192];
         if (!escaped) {
             pthread_mutex_lock(&orbit.mutex); job->debrid_submitted = false; state_save_locked(); pthread_mutex_unlock(&orbit.mutex);
@@ -581,7 +653,7 @@ int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *
     }
     int64_t item_id = -1;
     if (!item || !identifier(item, "id", &item_id) || item_id != job->debrid_id ||
-        strcmp(json_text(item, "original_url"), source_url(&job->release))) {
+        strcmp(json_text(item, "original_url"), original_url)) {
         cJSON_Delete(list); copy_text(err, cap, "TorBox returned a different download identity."); goto end;
     }
     const char *state = json_text(item, "download_state");
@@ -602,15 +674,38 @@ int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *
     const cJSON *file = cJSON_GetArrayItem(files, 0); int64_t file_id = -1, size = 0;
     const char *name = json_text(file, "short_name");
     if (!*name) name = json_text(file, "name");
+    bool needs_metadata = !strcmp(resolved->source, "remote") && (!resolved->filename[0] || !resolved->size);
+    Release selected = *resolved;
     bool match = cJSON_IsArray(files) && cJSON_GetArraySize(files) == 1 &&
-        identifier(file, "id", &file_id) && identifier(file, "size", &size) && size == job->release.size &&
-        !strcmp(name, job->filename) && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "infected")) &&
+        identifier(file, "id", &file_id) && identifier(file, "size", &size) && size > 0 &&
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "infected")) &&
         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "zipped")) &&
         (job->debrid_file < 0 || job->debrid_file == file_id);
+    if (match && using_mirror) {
+        Release file_from_mirror = *route;
+        file_from_mirror.size = size;
+        match = !remote_file_format(&file_from_mirror, name) && remote_mirror_file(resolved, &file_from_mirror) &&
+            (!needs_metadata || !remote_file_format(&selected, resolved->filename[0] ? resolved->filename : name));
+    } else if (match) {
+        match = (!resolved->size || resolved->size == size) &&
+            (!resolved->filename[0] || !strcmp(name, resolved->filename)) &&
+            (!needs_metadata || !remote_file_format(&selected, name));
+    }
     cJSON_Delete(list);
     if (!match) { copy_text(err, cap, "TorBox's file does not match the selected single-file download. Nothing was transferred."); goto end; }
-    pthread_mutex_lock(&orbit.mutex); job->debrid_file = file_id; int saved = state_save_locked(); pthread_mutex_unlock(&orbit.mutex);
-    if (saved) { copy_text(err, cap, "Could not save the TorBox file identity."); goto end; }
+    pthread_mutex_lock(&orbit.mutex);
+    int64_t previous_file = job->debrid_file;
+    job->debrid_file = file_id;
+    selected.size = size;
+    bool saved = needs_metadata ? job_assign_remote_file_locked(job, &selected, err, cap) :
+                                 state_save_locked() == 0;
+    if (!saved) job->debrid_file = previous_file;
+    pthread_mutex_unlock(&orbit.mutex);
+    if (!saved) {
+        if (!err[0]) copy_text(err, cap, "Could not save the TorBox file identity.");
+        goto end;
+    }
+    *resolved = selected;
     char *escaped = curl_easy_escape(NULL, key, 0);
     if (!escaped) goto end;
     /* Appending the filename can produce literal spaces in TorBox's URL.
@@ -621,8 +716,8 @@ int debrid_resolve(Job *job, char *url, size_t url_cap, time_t *retry_at, char *
     cJSON *download = call(key, path, NULL, false, job, retry_at, err, cap, NULL);
     OPENSSL_cleanse(path, sizeof path);
     const char *address = json_text(download, "data");
-    if (download && strlen(address) < url_cap && debrid_transfer_url_allowed(address)) {
-        copy_text(url, url_cap, address); result = 1;
+    if (download && strlen(address) < sizeof resolved->url && debrid_transfer_url_allowed(address)) {
+        copy_text(resolved->url, sizeof resolved->url, address); result = 1;
     } else if (download) copy_text(err, cap, "TorBox returned an unsupported download address.");
     else if (*retry_at > time(NULL)) result = 0;
     cJSON *secret = cJSON_GetObjectItemCaseSensitive(download, "data");

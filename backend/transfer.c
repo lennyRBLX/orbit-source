@@ -9,6 +9,7 @@
 #include "extract.h"
 #include <openssl/crypto.h>
 #include "provider_network.h"
+#include "remote_sources.h"
 #include "transfer_writer.h"
 #include <curl/curl.h>
 #include <ctype.h>
@@ -68,11 +69,13 @@ typedef struct Transfer {
 } Transfer;
 static bool torbox(const Transfer *t) { return !strcmp(t->job->delivery, "torbox"); }
 static bool remote_transfer(const Transfer *t) { return !strcmp(t->release->source, "remote"); }
+static bool direct_transfer(const Transfer *t) { return !strcmp(t->release->source, ORBIT_DIRECT_SOURCE); }
 static bool guarded(const Transfer *t) {
-    return torbox(t) || remote_transfer(t) || provider_browser_source(t->release->source);
+    return torbox(t) || remote_transfer(t) || direct_transfer(t) || provider_browser_source(t->release->source);
 }
 static bool address_allowed(const Transfer *t, const char *url) {
     if (torbox(t)) return debrid_transfer_url_allowed(url);
+    if (direct_transfer(t)) return direct_http_url(url);
     return remote_transfer(t) ? remote_https_url(url) : provider_transfer_url_allowed(url);
 }
 static double seconds(void) {
@@ -246,6 +249,7 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
             copy_text(t->error, sizeof t->error, torbox(t)
                 ? "TorBox rejected the download link. Resume to request a fresh link. Your partial file is kept."
                 : remote_transfer(t) ? "The community catalogue download link was rejected."
+                : direct_transfer(t) ? "The download URL was rejected. Check that the link is still valid."
                 : "The saved download link was rejected. Choose Refresh download link to verify with the provider again. Your partial file is kept.");
             return 0;
         }
@@ -282,8 +286,9 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         /* Vikingfile's signed route already identifies the exact filename.
          * Its storage server may return only a bare attachment disposition. */
         bool viking_route = t->capture_probe && !torbox(t) && !strcmp(t->release->source, "vikingfile");
-        if ((t->capture_probe || torbox(t) || (remote_transfer(t) && named)) && t->accepted &&
-            t->disposition[0] && (named || !viking_route)) {
+        bool direct_full_probe = direct_transfer(t) && t->range_probe && t->status == 200;
+        if ((t->capture_probe || torbox(t) || ((remote_transfer(t) || direct_transfer(t)) && named)) &&
+            (t->accepted || direct_full_probe) && t->disposition[0] && (named || !viking_route)) {
             if (!disposition_matches(t->disposition, t->release->filename)) {
                 t->accepted = false;
                 copy_text(t->error, sizeof t->error, "Provider returned a different filename.");
@@ -422,8 +427,9 @@ static CURL *request(Transfer *t) {
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 #else
-    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    const char *protocols = direct_transfer(t) && !strncasecmp(t->release->url, "http://", 7) ? "http,https" : "https";
+    curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, protocols);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, protocols);
 #endif
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
@@ -498,6 +504,12 @@ static int range_support(Transfer *owner, struct curl_slist *conditions, CURLcod
     *result = curl_easy_perform(c);
     curl_easy_cleanup(c);
     if (probe.unsupported_range) {
+        if (owner->probe && direct_transfer(owner)) {
+            owner->status = probe.status;
+            owner->length = probe.length;
+            copy_text(owner->etag, sizeof owner->etag, probe.etag);
+            copy_text(owner->modified, sizeof owner->modified, probe.modified);
+        }
         *result = CURLE_OK;
         return 0;
     }
@@ -962,6 +974,11 @@ finish_benchmark:
     return out;
 }
 #endif
+static bool file_type_matches(const Transfer *t) {
+    unsigned char sample[8];
+    ssize_t size = pread(t->fd, sample, sizeof sample, 0);
+    return size == (ssize_t)sizeof sample && download_file_magic(t->release, sample, (size_t)size);
+}
 static bool checksum(Transfer *t) {
     if (!t->release->sha256[0])
         return true;
@@ -1093,7 +1110,7 @@ static int extract_job(Job *j, int dir, const char *partial, char *note, size_t 
     pthread_mutex_unlock(&orbit.mutex);
     int rc = 0;
     bool remote = !strcmp(j->release.source, "remote");
-    if (j->release.archive_unverified || remote) {
+    if (j->release.archive_unverified || remote || !strcmp(j->release.source, ORBIT_DIRECT_SOURCE)) {
         int64_t inspected = 0;
         char format[12];
         rc = inspect_archive(&x, &inspected, format, error, cap);
@@ -1148,6 +1165,91 @@ static int extract_job(Job *j, int dir, const char *partial, char *note, size_t 
     pthread_mutex_unlock(&orbit.mutex);
     return 0;
 }
+static int prepare_torbox(Transfer *t, const Release *route) {
+    Job *j = t->job;
+    pthread_mutex_lock(&orbit.mutex);
+    copy_text(j->delivery_phase, sizeof j->delivery_phase, "Preparing with TorBox");
+    pthread_mutex_unlock(&orbit.mutex);
+    int prepared = debrid_resolve(j, route, t->release, &t->retry_at, t->error, sizeof t->error);
+    if (prepared == 1) {
+        t->limit = t->release->size;
+        pthread_mutex_lock(&orbit.mutex);
+        copy_text(j->delivery_phase, sizeof j->delivery_phase, "Downloading via TorBox");
+        pthread_mutex_unlock(&orbit.mutex);
+    }
+    return prepared;
+}
+
+/* The queued release keeps its original identity and output path. Only the
+ * request URL changes, after rechecking the alternate against that file. */
+static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed) {
+    Job *j = t->job;
+    pthread_mutex_lock(&orbit.mutex);
+    bool found = true;
+    if (j->mirror_id[0]) found = remote_mirror_locked(&j->release, j->mirror_id, candidate);
+    else *candidate = j->release;
+    pthread_mutex_unlock(&orbit.mutex);
+    if (!found) {
+        *source_failed = true;
+        copy_text(t->error, sizeof t->error, "This mirror is no longer available.");
+        return false;
+    }
+    if (torbox(t)) return true;
+    Release locator;
+    int checked = remote_page_pending(candidate)
+        ? remote_download_resolve(candidate, &locator, &j->cancel, t->error, sizeof t->error)
+        : remote_download_verify(candidate, candidate->url, &j->cancel, t->error, sizeof t->error);
+    if (checked || !remote_mirror_file(t->release, candidate)) {
+        *source_failed = true;
+        if (!t->error[0]) copy_text(t->error, sizeof t->error, "The mirror did not return the selected file.");
+        return false;
+    }
+    if (!j->filename[0]) {
+        Release file = *t->release;
+        if (remote_file_format(&file, candidate->filename)) return false;
+        file.size = candidate->size;
+        pthread_mutex_lock(&orbit.mutex);
+        bool assigned = job_assign_remote_file_locked(j, &file, t->error, sizeof t->error);
+        pthread_mutex_unlock(&orbit.mutex);
+        if (!assigned) return false;
+        *t->release = file;
+        t->limit = file.size;
+    }
+    copy_text(t->release->url, sizeof t->release->url, candidate->url);
+    return true;
+}
+
+/* A partial file only belongs to the URL that wrote it. Clear its validators
+ * and range map along with its bytes before switching mirrors. */
+static bool advance_mirror_locked(Job *j) {
+    Release candidate;
+    if (j->archive_ready) return false;
+    bool original_next = j->mirror_first[0] && !strcmp(j->mirror_id, j->mirror_first);
+    if (original_next) {
+        candidate = j->release;
+    } else {
+        char after[sizeof j->mirror_id];
+        copy_text(after, sizeof after, j->mirror_id);
+        do {
+            if (!remote_next_mirror_locked(&j->release, after, &candidate)) return false;
+            copy_text(after, sizeof after, candidate.id);
+        } while (!strcmp(candidate.id, j->mirror_first));
+    }
+    if (job_delete_partial_locked(j, j->error, sizeof j->error)) return false;
+    copy_text(j->mirror_id, sizeof j->mirror_id, original_next ? "" : candidate.id);
+    j->mirror_torbox |= !strcmp(j->delivery, "torbox");
+    if (!j->mirror_torbox || debrid_prepare_locked(&candidate, j, j->error, sizeof j->error) != 200)
+        copy_text(j->delivery, sizeof j->delivery, "direct");
+    j->debrid_submitted = false;
+    j->debrid_submitted_at = 0;
+    j->debrid_progress = 0;
+    j->error[0] = j->delivery_phase[0] = 0;
+    j->attempts = 0;
+    j->retry_at = 0;
+    copy_text(j->status, sizeof j->status, "queued");
+    return true;
+}
+
 static void run_job(Job *j) {
     Release resolved = j->release;
     Release *r = &resolved;
@@ -1166,18 +1268,37 @@ static void run_job(Job *j) {
     pthread_mutex_unlock(&orbit.mutex);
     int dir = -1;
     char partial[192], note[256] = "";
-    snprintf(partial, sizeof partial, "%s.part", j->filename);
     CURLcode rc = CURLE_OK;
     CURL *c = NULL;
     struct curl_slist *conditions = NULL;
-    bool done = false, debrid_waiting = false;
+    bool done = false, debrid_waiting = false, source_failed = false;
     int unpacked = -1; /* extract_job(): 3 when there was no room to unpack */
     if (controlled(&t)) goto finish;
     pthread_mutex_lock(&orbit.mutex);
     /* A drive the console remounted is recognised; an unmarked one gets its mark. */
     if (storage_rebind_locked(j) && storage_mark_locked(j)) (void)state_save_locked();
     pthread_mutex_unlock(&orbit.mutex);
-    if (remote_transfer(&t) && !j->archive_ready) {
+    Release mirror;
+    const Release *route = &j->release;
+    if ((j->mirror_id[0] || j->mirror_first[0]) && !j->archive_ready) {
+        if (!prepare_mirror(&t, &mirror, &source_failed)) goto finish;
+        if (j->mirror_id[0]) route = &mirror;
+    }
+    bool early_torbox = torbox(&t) && remote_transfer(&t) && (!r->filename[0] || !r->size);
+    if (early_torbox) {
+        if (!storage_matches(j)) {
+            copy_text(t.error, sizeof t.error, "Destination is missing or not writable.");
+            goto finish;
+        }
+        int prepared = prepare_torbox(&t, route);
+        if (prepared != 1) {
+            debrid_waiting = prepared == 0;
+            source_failed = !debrid_waiting;
+            goto finish;
+        }
+        if (controlled(&t)) goto finish;
+    }
+    if (remote_transfer(&t) && !torbox(&t) && !j->archive_ready) {
         c = request(&t);
         if (!c) {
             copy_text(t.error, sizeof t.error, "Could not initialize HTTPS.");
@@ -1190,10 +1311,12 @@ static void run_job(Job *j) {
         c = NULL;
         if (rc != CURLE_OK || t.status != 200 || t.length <= 0 || t.length > 9007199254740991LL ||
             strstr(t.type, "text/") || strstr(t.type, "json") || strstr(t.type, "xml")) {
+            source_failed = true;
             copy_text(t.error, sizeof t.error, "Could not verify the community catalogue download.");
             goto finish;
         }
         if (r->size && r->size != t.length) {
+            source_failed = true;
             copy_text(t.error, sizeof t.error, "Source size changed. Catalogue needs verification.");
             goto finish;
         }
@@ -1222,6 +1345,7 @@ static void run_job(Job *j) {
         }
         if (controlled(&t)) goto finish;
     }
+    snprintf(partial, sizeof partial, "%s.part", j->filename);
     dir = storage_open(j);
     if (dir < 0 || storage_check_writable(dir)) {
         copy_text(t.error, sizeof t.error, "Destination is missing or not writable.");
@@ -1300,17 +1424,16 @@ static void run_job(Job *j) {
         copy_text(t.error, sizeof t.error, "Not enough free space to finish this download.");
         goto finish;
     }
-    if (!strcmp(j->delivery, "torbox")) {
-        pthread_mutex_lock(&orbit.mutex);
-        copy_text(j->delivery_phase, sizeof j->delivery_phase, "Preparing with TorBox");
-        pthread_mutex_unlock(&orbit.mutex);
-        int prepared = debrid_resolve(j, r->url, sizeof r->url, &t.retry_at, t.error, sizeof t.error);
-        if (prepared != 1) { debrid_waiting = prepared == 0; goto finish; }
-        pthread_mutex_lock(&orbit.mutex);
-        copy_text(j->delivery_phase, sizeof j->delivery_phase, "Downloading via TorBox");
-        pthread_mutex_unlock(&orbit.mutex);
+    if (torbox(&t) && !early_torbox) {
+        int prepared = prepare_torbox(&t, route);
+        if (prepared != 1) {
+            debrid_waiting = prepared == 0;
+            source_failed = !debrid_waiting;
+            goto finish;
+        }
     }
     bool viking = torbox(&t) || provider_browser_source(r->source);
+    int direct_ranges = -1;
     if (viking) {
         /* Test the saved captured URL with one byte first. No provider page is
          * opened by Resume; expired links get an explicit refresh action. */
@@ -1319,6 +1442,9 @@ static void run_job(Job *j) {
                 copy_text(t.error, sizeof t.error, "Source did not return a valid byte range.");
             goto finish;
         }
+    } else if (direct_transfer(&t)) {
+        direct_ranges = range_support(&t, NULL, &rc);
+        if (direct_ranges < 0) goto finish;
     } else if (!remote_transfer(&t)) {
         c = request(&t);
         if (!c) {
@@ -1337,7 +1463,8 @@ static void run_job(Job *j) {
         }
     }
     if (t.length != r->size) {
-        copy_text(t.error, sizeof t.error, "Source size changed. Catalogue needs verification.");
+        copy_text(t.error, sizeof t.error, direct_transfer(&t) ? "The file size changed after the download URL was checked."
+                                                             : "Source size changed. Catalogue needs verification.");
         goto finish;
     }
     bool strong = strong_etag(t.etag);
@@ -1394,7 +1521,7 @@ static void run_job(Job *j) {
         bool parallel = false;
         if (!single_connection && j->etag[0] && t.offset < range_boundary(r->size, count, 1) &&
             r->size - t.offset >= PARALLEL_MIN_REMAINING) {
-            int supported = viking ? 1 : range_support(&t, conditions, &rc);
+            int supported = viking ? 1 : direct_ranges >= 0 ? direct_ranges : range_support(&t, conditions, &rc);
             if (supported < 0) goto finish;
             parallel = supported == 1;
         }
@@ -1420,7 +1547,7 @@ static void run_job(Job *j) {
     /* A one-cursor USB job may have used either range windows or a host that
      * ignores ranges. Recheck on resume; do not require a new queue schema. */
     if (!single_connection && usb && !usb_parallel && j->etag[0] && t.offset < r->size) {
-        int supported = viking ? 1 : range_support(&t, conditions, &rc);
+        int supported = viking ? 1 : direct_ranges >= 0 ? direct_ranges : range_support(&t, conditions, &rc);
         if (supported < 0) goto finish;
         usb_parallel = supported == 1;
     }
@@ -1473,7 +1600,13 @@ static void run_job(Job *j) {
     state_save_locked();
     pthread_mutex_unlock(&orbit.mutex);
     if (!checksum(&t)) {
+        source_failed = true;
         copy_text(t.error, sizeof t.error, "Checksum verification failed. Partial file preserved.");
+        goto finish;
+    }
+    if ((direct_transfer(&t) || (remote_transfer(&t) && (torbox(&t) || j->mirror_id[0] || j->mirror_first[0]))) && !file_type_matches(&t)) {
+        source_failed = true;
+        copy_text(t.error, sizeof t.error, "The downloaded file does not match its PKG, FPKG, ZIP or RAR filename.");
         goto finish;
     }
     if (controlled(&t))
@@ -1554,7 +1687,11 @@ finish:
     j->speed = 0;
     /* The TorBox progress watch lasts only while the job keeps waiting. */
     if (!debrid_waiting || j->cancel || j->pause || orbit.stop) j->debrid_watch = 0;
-    if (t.status == 429 || t.status == 503) {
+    /* An unavailable or rate-limited link should not cool down its other mirrors. */
+    bool mirror_switched = !done && !j->cancel && !j->pause && !orbit.stop && !debrid_waiting && unpacked == -1 &&
+        remote_transfer(&t) && (source_failed || t.status == 401 || t.status == 403 || t.status == 404 ||
+            t.status == 410 || t.status == 429 || t.status == 503) && advance_mirror_locked(j);
+    if (!mirror_switched && (t.status == 429 || t.status == 503)) {
         time_t until = time(NULL) + orbit.download_policy.delay;
         if (t.retry_at > until) until = t.retry_at;
         if (until > orbit.source_retry_at[retry_source(j)]) orbit.source_retry_at[retry_source(j)] = until;
@@ -1581,7 +1718,7 @@ finish:
     } else if (debrid_waiting) {
         copy_text(j->status, sizeof j->status, "queued");
         j->retry_at = t.retry_at; j->error[0] = 0;
-    } else if ((retryable(t.status, rc) || (torbox(&t) && (t.status == 401 || t.status == 403 || t.status == 410)) ||
+    } else if (!mirror_switched && (retryable(t.status, rc) || (torbox(&t) && (t.status == 401 || t.status == 403 || t.status == 410)) ||
                 (t.stalled && rc != CURLE_WRITE_ERROR)) &&
                j->attempts < orbit.download_policy.retries &&
                (!j->received || j->etag[0] || j->modified[0])) {
@@ -1594,7 +1731,8 @@ finish:
          * release the slot so an unrelated source can make progress. */
         j->retry_worker = j->retry_at <= time(NULL) + 30 &&
                           orbit.source_retry_at[retry_source(j)] <= time(NULL) + 30;
-    } else {
+    } else if (!mirror_switched && !(remote_transfer(&t) && (t.status >= 400 || retryable(t.status, rc)) &&
+                                    advance_mirror_locked(j))) {
         copy_text(j->status, sizeof j->status, "error");
         copy_text(j->error, sizeof j->error, t.error[0] ? t.error : "Transfer interrupted.");
     }

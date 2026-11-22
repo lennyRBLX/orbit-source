@@ -602,6 +602,14 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         return json_response(c, 200, catalog_status());
     if (get && (!strcmp(url, "/api/v1/catalog") || !strcmp(url, "/api/v1/addons")))
         return catalog_response(c, !strcmp(url, "/api/v1/addons"));
+    if (get && !strcmp(url, "/api/v1/community-metadata")) {
+        if (!authorized(c)) return error(c, 401, "Pair this device first.");
+        const char *ids = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "ids");
+        pthread_mutex_lock(&orbit.mutex);
+        cJSON *o = remote_metadata_json_locked(ids);
+        pthread_mutex_unlock(&orbit.mutex);
+        return o ? json_response(c, 200, o) : error(c, 503, "Orbit is short of memory. Try again shortly.");
+    }
     if (get && !strcmp(url, "/api/v1/sources")) {
         pthread_mutex_lock(&orbit.mutex);
         cJSON *o = sources_json_locked();
@@ -1134,6 +1142,12 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
             cJSON *o = jobs_json_locked();
             pthread_mutex_unlock(&orbit.mutex);
             return json_response(c, 200, o);
+        }
+        if (post && !strcmp(url, "/api/v1/downloads/direct")) {
+            char e[256] = {0};
+            int code = browser_direct_download(input, e, sizeof e);
+            cJSON_Delete(input);
+            return code == 202 ? json_response(c, 202, browser_status()) : error(c, (unsigned)code, e);
         }
         if (post && !strcmp(url, "/api/v1/downloads")) {
             const cJSON *delivery = cJSON_GetObjectItemCaseSensitive(input, "delivery");

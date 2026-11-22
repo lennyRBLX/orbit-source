@@ -28,6 +28,7 @@
 #define ORBIT_SOURCE_DATANODES 8U
 #define ORBIT_SOURCE_ONEFICHIER 16U
 #define ORBIT_SOURCE_REMOTE 32U
+#define ORBIT_DIRECT_SOURCE "direct-url"
 #define ORBIT_SOURCE_ALL (ORBIT_SOURCE_ARCHIVE | ORBIT_SOURCE_VIKINGFILE | ORBIT_SOURCE_AKIRABOX | ORBIT_SOURCE_DATANODES | ORBIT_SOURCE_ONEFICHIER | ORBIT_SOURCE_REMOTE)
 typedef struct {
     unsigned enabled, notice_version;
@@ -41,10 +42,12 @@ typedef struct {
     char browser_url[128];
     char remote_catalog_id[25]; /* Empty for built-in download providers. */
     char remote_label[128]; /* Download link label from a community catalogue. */
+    char mirror_key[65]; /* Shared identity of verified community mirrors, when available. */
     bool remote_page; /* Stable catalogue identity is the selected provider page. */
     char compression[8]; /* "zip", "7z" or "rar"; empty for a plain file. */
     char archive_password[129]; /* Public source password, optional. */
     int64_t size, extracted_size;
+    int64_t display_size; /* Catalogue estimate. Never used to verify a transfer. */
     char content_format[8]; /* Legacy v8 display subtype (LZ4); not archive verification. */
     char asset_compression[8]; /* ZSTD game assets; independent of the outer archive. */
     bool archive_unverified; /* Identity checked; contents inspected after download. */
@@ -74,6 +77,9 @@ typedef struct {
     char status[24], error[256], etag[256], modified[128], verification[24];
     char archive_password[129]; /* User override: saved privately, never API/diagnostics. */
     char delivery[16], delivery_phase[64], debrid_account[65];
+    char mirror_id[24]; /* Current alternate, or empty while using the original link. */
+    char mirror_first[24]; /* An alternate used before the original to enable TorBox. */
+    bool mirror_torbox; /* Keep preferring TorBox after trying a direct-only mirror. */
     int64_t debrid_id, debrid_file;
     bool debrid_submitted;
     time_t debrid_submitted_at; /* when the last create request was sent; 0 if unknown */
@@ -224,6 +230,7 @@ void browser_source_changed_locked(void);
 cJSON *browser_status(void);
 cJSON *browser_diagnostics_locked(void);
 int browser_action(const cJSON *input, char *error, size_t cap);
+int browser_direct_download(const cJSON *input, char *error, size_t cap);
 void browser_job_changed_locked(const char *id);
 int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
                               char *modified, char *error, size_t cap);
@@ -249,6 +256,7 @@ int job_create_locked(const char *release_id, const char *storage_id, char *erro
 int job_create_delivery_locked(const char *release_id, const char *storage_id,
                                 const char *delivery, char *error, size_t cap, Job **result);
 int job_check_capture_locked(const Release *release, const Storage *destination, char *error, size_t cap);
+bool job_assign_remote_file_locked(Job *job, const Release *file, char *error, size_t cap);
 bool job_can_refresh_link(const Job *job);
 int job_refresh_link_locked(Job *job, const Release *release, const Storage *destination,
                             const char *etag, const char *modified, char *error, size_t cap);

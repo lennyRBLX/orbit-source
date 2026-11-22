@@ -20,6 +20,7 @@ static struct {
     bool check_account, resolving;
     atomic_bool cancel;
     char id[33], state[16], message[256], job_id[33], title[128], client_id[65];
+    char mirror_page[128];
     char native_failure[256];
     Release release;
     Storage storage;
@@ -82,7 +83,7 @@ static const char *native_failure_message(const char *failure) {
     return NULL;
 }
 static bool selected_locked(void) {
-    if (session.account) return true;
+    if (session.account || !strcmp(session.release.source, ORBIT_DIRECT_SOURCE)) return true;
     if (session.refresh_job.id[0]) {
         const Job *j = job_find(session.refresh_job.id), *p = &session.refresh_job;
         return job_can_refresh_link(j) && source_enabled_locked(&j->release) &&
@@ -282,6 +283,64 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
     return false;
 #endif
 }
+
+/* A mirror supplies the bytes; the queue still uses the selected option's
+ * identity, source settings, and stable provider page. */
+static void community_file(Release *selected, const Release *file) {
+    copy_text(selected->url, sizeof selected->url, file->url);
+    copy_text(selected->filename, sizeof selected->filename, file->filename);
+    copy_text(selected->format, sizeof selected->format, file->format);
+    copy_text(selected->compression, sizeof selected->compression, file->compression);
+    selected->size = file->size;
+}
+
+static bool resolve_community(Release *selected, char *etag, char *modified, char *error, size_t cap) {
+    Release candidate = *selected, interactive = {0}, interactive_locator = {0};
+    char after[sizeof candidate.id] = "";
+    while (active()) {
+        Release locator;
+        error[0] = 0;
+        bool primary = !strcmp(candidate.id, selected->id);
+        int result = remote_page_pending(&candidate)
+            ? remote_download_resolve(&candidate, &locator, &session.cancel, error, cap)
+            : remote_download_verify(&candidate, candidate.url, &session.cancel, error, cap);
+        if (result == 1 && !strcmp(locator.source, "vikingfile") && active() &&
+            viking_resolve_download(&locator, session.native_dialog, &session.cancel) &&
+            !verify_community_capture(&candidate, &locator, locator.url, error, cap)) result = 0;
+        if (!result && (primary || remote_mirror_file(selected, &candidate))) {
+            community_file(selected, &candidate);
+            pthread_mutex_lock(&orbit.mutex);
+            session.return_to_browser = false;
+            pthread_mutex_unlock(&orbit.mutex);
+            return true;
+        }
+        if (result == 1 && !interactive.id[0]) {
+            interactive = candidate;
+            interactive_locator = locator;
+        }
+        pthread_mutex_lock(&orbit.mutex);
+        bool next = remote_next_mirror_locked(selected, after, &candidate);
+        pthread_mutex_unlock(&orbit.mutex);
+        if (!next) break;
+        copy_text(after, sizeof after, candidate.id);
+    }
+    if (!interactive.id[0] || !active()) return false;
+
+    pthread_mutex_lock(&orbit.mutex);
+    session.resolving = false;
+    if (!atomic_load(&session.cancel)) {
+        copy_text(session.mirror_page, sizeof session.mirror_page, interactive_locator.browser_url);
+        state_locked("opening", "Opening the download page on your PS5…");
+    }
+    pthread_mutex_unlock(&orbit.mutex);
+    bool validated = false;
+    error[0] = 0;
+    if (!capture(&interactive_locator, &interactive, etag, modified, &validated, error, cap) ||
+        (strcmp(interactive.id, selected->id) && !remote_mirror_file(selected, &interactive))) return false;
+    community_file(selected, &interactive);
+    return true;
+}
+
 static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
@@ -335,9 +394,12 @@ static void *worker(void *unused) {
             continue;
         }
         Release resolved = session.release;
+        bool direct = !strcmp(resolved.source, ORBIT_DIRECT_SOURCE);
         if (atomic_load(&session.cancel)) {
             /* The owner may report failure before this worker is scheduled. */
-        } else if (session.resolving)
+        } else if (direct)
+            state_locked("validating", "Checking the download URL…");
+        else if (session.resolving)
             state_locked("validating", remote_page_pending(&resolved)
                 ? "Reading the community catalogue download option…" : "Checking sign-in…");
         else if (session.native_dialog && !session.dialog_opened)
@@ -350,27 +412,10 @@ static void *worker(void *unused) {
         char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
         bool validated = false;
         bool ok = false;
-        if (remote_page_pending(&resolved)) {
-            Release locator;
-            int result = active()
-                ? remote_download_resolve(&resolved, &locator, &session.cancel, error, sizeof error) : -1;
-            ok = result == 0;
-            if (result == 1 && active() && !strcmp(locator.source, "vikingfile") &&
-                viking_resolve_download(&locator, session.native_dialog, &session.cancel))
-                ok = !verify_community_capture(&resolved, &locator, locator.url, error, sizeof error);
-            validated = ok;
-            pthread_mutex_lock(&orbit.mutex);
-            if (ok) session.return_to_browser = false;
-            else if (result == 1 && !atomic_load(&session.cancel)) {
-                session.resolving = false;
-                state_locked("opening", "Opening the download page on your PS5…");
-            }
-            pthread_mutex_unlock(&orbit.mutex);
-            if (!ok && result == 1 && active()) {
-                error[0] = 0;
-                ok = capture(&locator, &resolved, etag, modified, &validated, error, sizeof error);
-                validated = ok;
-            }
+        if (direct) {
+            validated = ok = active() && !remote_download_verify(&resolved, resolved.url, &session.cancel, error, sizeof error);
+        } else if (remote_page_pending(&resolved)) {
+            validated = ok = resolve_community(&resolved, etag, modified, error, sizeof error);
         } else {
             ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
             if (ok) {
@@ -429,6 +474,7 @@ static void *worker(void *unused) {
         /* No pending verification survives a restart. No browser bytes are saved. */
         memset(&resolved, 0, sizeof resolved);
         memset(&session.release, 0, sizeof session.release);
+        session.mirror_page[0] = 0;
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
         session.finished_ms = milliseconds() - session.started_ms;
         session.resolving = session.busy = false;
@@ -504,13 +550,15 @@ cJSON *browser_status(void) {
     cJSON_AddStringToObject(o, "vikingNativeState", native_account);
     cJSON_AddStringToObject(o, "vikingPass", pass_account);
     cJSON_AddBoolToObject(o, "accountPage", session.account);
+    if (session.diagnostic_operation && !strcmp(session.diagnostic_operation, "direct-download"))
+        cJSON_AddTrueToObject(o, "directDownload");
     cJSON_AddBoolToObject(o, "nativeDialogAvailable", session.ready && available() && !session.stop);
     if (session.native_dialog) {
         cJSON_AddStringToObject(o, "clientId", session.client_id);
         cJSON_AddBoolToObject(o, "dialogOpened", session.dialog_opened);
         /* Only the catalogue's public page, never a captured/signed file URL. */
         if (session.busy && !session.resolving && !session.check_account && !session.dialog_opened && !atomic_load(&session.cancel))
-            cJSON_AddStringToObject(o, "pageUrl", session.release.browser_url);
+            cJSON_AddStringToObject(o, "pageUrl", session.mirror_page[0] ? session.mirror_page : session.release.browser_url);
     }
     cJSON_AddStringToObject(o, "id", session.id);
     cJSON_AddStringToObject(o, "state", session.state[0] ? session.state : "idle");
@@ -533,9 +581,8 @@ cJSON *browser_status(void) {
     pthread_mutex_unlock(&orbit.mutex);
     return o;
 }
-int browser_action(const cJSON *input, char *error, size_t cap) {
+static int perform_action(const cJSON *input, const char *action, char *error, size_t cap) {
     int code = 202;
-    const char *action = json_text(input, "action");
     pthread_mutex_lock(&orbit.mutex);
     if (!strcmp(action, "opened")) {
         if (!session.busy || !session.native_dialog || atomic_load(&session.cancel) ||
@@ -584,12 +631,46 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
             if (session.native_failure[0]) state_locked("failed", session.native_failure);
             else state_locked("cancelled", "Verification cancelled. No download was added.");
         }
-    } else if (strcmp(action, "start") && strcmp(action, "refresh") && strcmp(action, "viking-account") && strcmp(action, "viking-check")) {
+    } else if (strcmp(action, "start") && strcmp(action, "refresh") && strcmp(action, "viking-account") && strcmp(action, "viking-check") && strcmp(action, ORBIT_DIRECT_SOURCE)) {
         copy_text(error, cap, "Unknown browser action."); code = 400;
     } else if (!session.ready || session.stop || !available()) {
         copy_text(error, cap, "Provider verification is available on the PS5 only."); code = 409;
     } else if (session.busy) {
         copy_text(error, cap, "Finish or cancel the current verification first."); code = 409;
+    } else if (!strcmp(action, ORBIT_DIRECT_SOURCE)) {
+        Release direct;
+        if (!direct_release_init(&direct, json_text(input, "url"))) {
+            copy_text(error, cap, "Enter a valid HTTP or HTTPS download URL without credentials or a fragment."); code = 400;
+            goto done;
+        }
+        Storage drives[ORBIT_MAX_STORAGE], *selected = NULL;
+        size_t count = storage_list(drives);
+        for (size_t i = 0; i < count; i++)
+            if (!strcmp(drives[i].id, json_text(input, "storageId"))) selected = &drives[i];
+        if (!selected) {
+            copy_text(error, cap, "Reconnect the selected drive first."); code = 409;
+            goto done;
+        }
+        if (start_worker_locked()) {
+            copy_text(error, cap, "Download URL verification could not start. Try again."); code = 503;
+            goto done;
+        }
+        session.account = session.check_account = session.native_dialog = session.dialog_opened = session.return_to_browser = false;
+        session.resolving = true;
+        session.release = direct;
+        session.storage = *selected;
+        memset(&session.refresh_job, 0, sizeof session.refresh_job);
+        session.native_failure[0] = session.job_id[0] = session.client_id[0] = 0;
+        copy_text(session.title, sizeof session.title, "Direct URL download");
+        random_hex(session.id, 16);
+        session.started_ms = milliseconds();
+        session.capture_ms = session.link_ms = session.validation_ms = session.queued_ms = session.finished_ms = 0;
+        session.scanned_bytes = session.candidates = session.browser_processes = 0;
+        reset_diagnostics_locked(direct.source, "direct-download");
+        session.busy = session.pending = true;
+        atomic_store(&session.cancel, false);
+        state_locked("validating", "Checking the download URL…");
+        pthread_cond_signal(&session.changed);
     } else {
         const cJSON *target = cJSON_GetObjectItemCaseSensitive(input, "returnTarget");
         const cJSON *legacy = cJSON_GetObjectItemCaseSensitive(input, "returnToOrbit");
@@ -696,6 +777,14 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
 done:
     pthread_mutex_unlock(&orbit.mutex);
     return code;
+}
+
+int browser_action(const cJSON *input, char *error, size_t cap) {
+    return perform_action(input, json_text(input, "action"), error, cap);
+}
+
+int browser_direct_download(const cJSON *input, char *error, size_t cap) {
+    return perform_action(input, ORBIT_DIRECT_SOURCE, error, cap);
 }
 
 void browser_source_changed_locked(void) {

@@ -24,6 +24,9 @@
 #define REFRESH_INTERVAL (6 * 60 * 60)
 #define REFRESH_COOLDOWN_MS 60000
 #define URL_LIMIT 2048
+#define REMOTE_RELEASE_LIMIT 12288
+#define METADATA_LIMIT 128
+#define METADATA_REQUEST_LIMIT 32
 
 /* Mirrors the Pegasus default-sources manifest, with a revision stored alongside
  * the user's choices. Future defaults are merged by id, never by enabled state. */
@@ -64,6 +67,21 @@ static struct {
     time_t next;
     int64_t empty_after, manual_after;
 } remote = {.cache_fd = -1, .changed = PTHREAD_COND_INITIALIZER};
+
+enum MetadataState { META_EMPTY, META_QUEUED, META_LOADING, META_DONE };
+typedef struct {
+    char id[24];
+    enum MetadataState state;
+    time_t expires;
+    RemoteFileMetadata file;
+} MetadataRequest;
+
+static struct {
+    pthread_cond_t changed;
+    pthread_t threads[2];
+    size_t count;
+    MetadataRequest requests[METADATA_LIMIT];
+} metadata = {.changed = PTHREAD_COND_INITIALIZER};
 
 static const char *const errors[] = {
     "", "network", "http", "too-large", "invalid-catalogue", "invalid-entries", "storage", "limit",
@@ -106,6 +124,37 @@ bool remote_source_enabled_locked(const Release *r) {
     const RemoteSource *source = find(r->remote_catalog_id);
     return notice_acknowledged_locked() && (orbit.sources.enabled & ORBIT_SOURCE_REMOTE) &&
            source && source->enabled;
+}
+
+static bool mirror_enabled(const Release *original, const Release *other) {
+    return original->mirror_key[0] && !strcmp(original->mirror_key, other->mirror_key) &&
+           strcmp(original->id, other->id) && remote_source_enabled_locked(other);
+}
+
+bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror) {
+    const Release *best = NULL;
+    for (size_t i = 0; i < orbit.remote_release_count && release->mirror_key[0]; i++) {
+        const Release *next = &orbit.remote_releases[i];
+        if (strcmp(next->id, after) > 0 && (!best || strcmp(next->id, best->id) < 0) &&
+            mirror_enabled(release, next))
+            best = next;
+    }
+    if (best) *mirror = *best;
+    return best != NULL;
+}
+
+bool remote_mirror_locked(const Release *release, const char *id, Release *mirror) {
+    const Release *candidate = release_find(id);
+    if (!candidate || !mirror_enabled(release, candidate)) return false;
+    *mirror = *candidate;
+    return true;
+}
+
+bool remote_mirror_file(const Release *selected, const Release *file) {
+    return (!selected->size || selected->size == file->size) &&
+           (!selected->compression[0] || !strcmp(selected->compression, file->compression)) &&
+           (!selected->format[0] || !strcmp(selected->format, "Unknown") ||
+            !strcmp(selected->format, file->format));
 }
 
 unsigned long remote_sources_generation_locked(void) { return remote.generation; }
@@ -339,7 +388,7 @@ static bool merge_manifest(void) {
  * available. A failed allocation or fetch leaves the old options visible. */
 static int reserve_locked(const RemoteSource *source, size_t count) {
     size_t total = orbit.remote_release_count - source->entries + count;
-    if (total > ORBIT_MAX_RELEASES) return -1;
+    if (total > REMOTE_RELEASE_LIMIT) return -1;
     if (total <= orbit.remote_release_count) return 0;
     Release *next = realloc(orbit.remote_releases, total * sizeof *next);
     if (!next) return -1;
@@ -583,6 +632,110 @@ static void refresh_one(const RemoteSource *snapshot) {
     free(response.data);
 }
 
+static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
+    MetadataRequest *entry = NULL;
+    for (size_t i = 0; i < METADATA_LIMIT; i++) {
+        MetadataRequest *request = &metadata.requests[i];
+        if (!strcmp(id, request->id)) {
+            if (request->state != META_DONE || request->expires > now) return request;
+            entry = request;
+            break;
+        }
+        if (request->state == META_EMPTY ||
+            (request->state == META_DONE && (!entry || request->expires < entry->expires)))
+            entry = request;
+    }
+    if (!entry) return NULL;
+    *entry = (MetadataRequest){.state = META_QUEUED};
+    copy_text(entry->id, sizeof entry->id, id);
+    pthread_cond_signal(&metadata.changed);
+    return entry;
+}
+
+static bool metadata_provider(const Release *r) {
+    return remote_page_pending(r) && remote_metadata_url(r->browser_url);
+}
+
+static bool next_metadata_mirror_locked(const Release *r, const char *after, Release *mirror) {
+    char cursor[sizeof mirror->id];
+    copy_text(cursor, sizeof cursor, after);
+    while (remote_next_mirror_locked(r, cursor, mirror)) {
+        if (metadata_provider(mirror)) return true;
+        copy_text(cursor, sizeof cursor, mirror->id);
+    }
+    return false;
+}
+
+cJSON *remote_metadata_json_locked(const char *ids) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON *rows = cJSON_AddArrayToObject(root, "files");
+    if (!rows) { cJSON_Delete(root); return NULL; }
+    bool pending = false;
+    time_t now = time(NULL);
+    for (unsigned i = 0; metadata.count && ids && *ids && i < METADATA_REQUEST_LIMIT; i++) {
+        char id[24];
+        size_t length = strcspn(ids, ",");
+        if (!length || length >= sizeof id) break;
+        memcpy(id, ids, length);
+        id[length] = 0;
+        ids += length + (ids[length] == ',');
+        const Release *release = release_find(id);
+        Release mirror;
+        if (!release || strcmp(release->source, "remote") || !remote_source_enabled_locked(release) ||
+            (!metadata_provider(release) && !next_metadata_mirror_locked(release, "", &mirror))) continue;
+        const MetadataRequest *request = metadata_request_locked(id, now);
+        if (!request || request->state != META_DONE) {
+            pending = true;
+            continue;
+        }
+        if (!request->file.size) continue;
+        cJSON *row = cJSON_CreateObject();
+        if (!cJSON_AddStringToObject(row, "id", id) ||
+            !cJSON_AddNumberToObject(row, "sizeBytes", (double)request->file.size) ||
+            !cJSON_AddBoolToObject(row, "exact", request->file.exact) ||
+            !cJSON_AddItemToArray(rows, row)) cJSON_Delete(row);
+    }
+    cJSON_AddBoolToObject(root, "pending", pending);
+    return root;
+}
+
+static void *metadata_worker(void *unused) {
+    (void)unused;
+    pthread_mutex_lock(&orbit.mutex);
+    while (!orbit.stop) {
+        MetadataRequest *request = NULL;
+        for (size_t i = 0; i < METADATA_LIMIT; i++)
+            if (metadata.requests[i].state == META_QUEUED) {
+                request = &metadata.requests[i];
+                break;
+            }
+        if (!request) {
+            pthread_cond_wait(&metadata.changed, &orbit.mutex);
+            continue;
+        }
+        request->state = META_LOADING;
+        RemoteFileMetadata file = {0};
+        const Release *release = release_find(request->id);
+        if (release && remote_source_enabled_locked(release)) {
+            Release selected = *release, candidate = selected;
+            bool found = metadata_provider(&candidate) || next_metadata_mirror_locked(&selected, "", &candidate);
+            while (found && !orbit.stop && remote_source_enabled_locked(&selected)) {
+                pthread_mutex_unlock(&orbit.mutex);
+                bool known = remote_download_metadata(&candidate, &file, NULL);
+                pthread_mutex_lock(&orbit.mutex);
+                if (known) break;
+                found = next_metadata_mirror_locked(&selected, strcmp(candidate.id, selected.id) ? candidate.id : "",
+                                                    &candidate);
+            }
+        }
+        request->file = file;
+        request->expires = time(NULL) + (file.size ? 1800 : 300);
+        request->state = META_DONE;
+    }
+    pthread_mutex_unlock(&orbit.mutex);
+    return NULL;
+}
+
 static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
@@ -627,6 +780,10 @@ int remote_sources_start(void) {
     pthread_mutex_lock(&orbit.mutex);
     if (!rc) rc = pthread_create(&remote.thread, &attr, worker, NULL);
     remote.started = rc == 0;
+    if (remote.started)
+        for (size_t i = 0; i < sizeof metadata.threads / sizeof *metadata.threads; i++)
+            if (!pthread_create(&metadata.threads[metadata.count], &attr, metadata_worker, NULL))
+                metadata.count++;
     pthread_mutex_unlock(&orbit.mutex);
     pthread_attr_destroy(&attr);
     return rc ? -1 : 0;
@@ -635,8 +792,10 @@ int remote_sources_start(void) {
 void remote_sources_stop(void) {
     pthread_mutex_lock(&orbit.mutex);
     pthread_cond_signal(&remote.changed);
+    pthread_cond_broadcast(&metadata.changed);
     pthread_mutex_unlock(&orbit.mutex);
     if (remote.started) pthread_join(remote.thread, NULL);
+    for (size_t i = 0; i < metadata.count; i++) pthread_join(metadata.threads[i], NULL);
     if (remote.cache_fd >= 0) close(remote.cache_fd);
     pthread_mutex_lock(&orbit.mutex);
     free(orbit.remote_releases);

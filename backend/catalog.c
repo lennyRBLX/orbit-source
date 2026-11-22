@@ -270,6 +270,7 @@ cJSON *release_json(const Release *r) {
     if (r->remote_catalog_id[0]) { FIELD("remoteCatalogId", remote_catalog_id); }
     if (r->remote_label[0]) { FIELD("remoteLabel", remote_label); }
     if (r->remote_page) cJSON_AddTrueToObject(o, "remotePage");
+    if (r->mirror_key[0]) { FIELD("mirrorKey", mirror_key); }
     if (r->compression[0]) {
         FIELD("compression", compression);
         if (r->archive_password[0]) { FIELD("archivePassword", archive_password); }
@@ -278,6 +279,7 @@ cJSON *release_json(const Release *r) {
     }
 #undef FIELD
     cJSON_AddNumberToObject(o, "sizeBytes", (double)r->size);
+    if (r->display_size > 0) cJSON_AddNumberToObject(o, "sizeEstimateBytes", (double)r->display_size);
     return o;
 }
 void release_download_title(const Release *r, char *out, size_t cap) {

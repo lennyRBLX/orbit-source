@@ -16,32 +16,40 @@ export interface DebridStatus {
   lastDelivery?: "direct" | "torbox";
   alwaysUseTorBox?: boolean;
   hosts: { sourceId: string; available: boolean; maxFileSize: number }[];
+  domains?: { host: string; maxFileSize: number }[];
+}
+function availableHost(status: DebridStatus | null, release: Release) {
+  if (release.sourceId === "remote") {
+    const hosts = release.torboxHosts ?? [release.torboxHost];
+    const configured = status?.domains?.filter((host) => hosts.includes(host.host));
+    return configured?.find((host) => !host.maxFileSize || release.sizeBytes <= host.maxFileSize) ?? configured?.[0];
+  }
+  return status?.hosts.find((host) => host.available && host.sourceId === release.sourceId);
 }
 // Always use TorBox covers the options TorBox can take now. Others, such as
 // AkiraBox, or a host TorBox has paused, keep their original source.
 export function alwaysTorbox(status: DebridStatus | null, release: Release) {
-  const host = status?.hosts.find((h) => h.sourceId === release.sourceId);
-  return !!status?.alwaysUseTorBox && !!status.connected && !!status.available && !!host?.available;
+  return !!status?.alwaysUseTorBox && !!status.connected && !!status.available && !!availableHost(status, release);
 }
 export function preferredDelivery(status: DebridStatus | null, release: Release): "direct" | "torbox" {
   if (alwaysTorbox(status, release)) return "torbox";
-  const host = status?.hosts.find((h) => h.sourceId === release.sourceId);
+  const host = availableHost(status, release);
   return status?.lastDelivery === "torbox" && torboxAvailable(status, release) &&
     (!host?.maxFileSize || release.sizeBytes <= host.maxFileSize) ? "torbox" : "direct";
 }
 export function torboxAvailable(status: DebridStatus | null, release: Release) {
-  const host = status?.hosts.find((h) => h.sourceId === release.sourceId);
   return (
     !!status?.connected &&
     !!status.available &&
     !status.busy &&
-    !!host?.available
+    !!availableHost(status, release)
   );
 }
 // The sources TorBox can download right now: torboxAvailable for each of their options.
 export function torboxSources(status: DebridStatus | null): ReadonlySet<string> {
   return new Set(status?.connected && status.available && !status.busy
-    ? status.hosts.filter((h) => h.available).map((h) => h.sourceId) : []);
+    ? [...status.hosts.filter((h) => h.available).map((h) => h.sourceId),
+       ...(status.domains || []).map((h) => h.host)] : []);
 }
 export function useDebrid(enabled = true) {
   const [status, setStatus] = useState<DebridStatus | null>(null);

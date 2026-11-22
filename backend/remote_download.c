@@ -14,11 +14,12 @@
 typedef struct {
     char *body;
     size_t used;
-    bool page, collect_page, truncated;
+    bool page, collect_page, truncated, direct;
     unsigned char sample[SAMPLE_BYTES];
     char url[2048], name[160];
     int64_t size;
     atomic_bool *cancel;
+    CURL *handle;
 } Response;
 
 static bool cancelled(const Response *r) {
@@ -32,9 +33,11 @@ static int progress(void *context, curl_off_t a, curl_off_t b, curl_off_t c, cur
 
 static int before_request(void *context, char *address, char *local, int port, int local_port) {
     (void)address; (void)local; (void)port; (void)local_port;
+    const Response *r = context;
     char *url = NULL;
-    curl_easy_getinfo(context, CURLINFO_EFFECTIVE_URL, &url);
-    return remote_https_url(url) ? CURL_PREREQFUNC_OK : CURL_PREREQFUNC_ABORT;
+    curl_easy_getinfo(r->handle, CURLINFO_EFFECTIVE_URL, &url);
+    bool allowed = r->direct ? direct_http_url(url) : remote_https_url(url);
+    return allowed ? CURL_PREREQFUNC_OK : CURL_PREREQFUNC_ABORT;
 }
 
 static size_t headers(char *data, size_t a, size_t b, void *context) {
@@ -73,21 +76,23 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
 }
 
 static bool fetch(const char *url, Response *r) {
-    if (!remote_https_url(url) || cancelled(r)) return false;
+    if (!(r->direct ? direct_http_url(url) : remote_https_url(url)) || cancelled(r)) return false;
     CURL *curl = curl_easy_init();
     if (!curl) return false;
+    r->handle = curl;
     struct curl_blob ca = {(void *)orbit_ca, sizeof orbit_ca - 1, CURL_BLOB_COPY};
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca);
     curl_easy_setopt(curl, CURLOPT_PROXY, "");
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, provider_open_socket);
     curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, before_request);
-    curl_easy_setopt(curl, CURLOPT_PREREQDATA, curl);
+    curl_easy_setopt(curl, CURLOPT_PREREQDATA, r);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
 #ifndef ORBIT_TEST
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    const char *protocols = r->direct && !strncasecmp(url, "http://", 7) ? "http,https" : "https";
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, protocols);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, protocols);
 #else
     curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
@@ -96,6 +101,7 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Orbit-Store/" ORBIT_VERSION);
+    if (r->collect_page) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (!r->collect_page) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
@@ -130,12 +136,12 @@ static bool fetch(const char *url, Response *r) {
         }
     }
     curl_easy_cleanup(curl);
+    r->handle = NULL;
     return ok;
 }
 
-static bool magic_matches(const Release *r, const Response *response) {
-    if (response->used < SAMPLE_BYTES) return false;
-    const unsigned char *p = response->sample;
+bool download_file_magic(const Release *r, const unsigned char *p, size_t length) {
+    if (length < SAMPLE_BYTES) return false;
     if (!strcmp(r->compression, "zip"))
         return !memcmp(p, "PK\3\4", 4);
     if (!strcmp(r->compression, "rar"))
@@ -153,10 +159,10 @@ static int file_from_response(Release *r, const Response *response, const char *
     const char *actual = response->name[0] ? response->name : name;
     if (r->filename[0] && strcmp(r->filename, actual)) return -1;
     Release file = *r;
-    int format = remote_file_format(&file, actual);
+    int format = response->direct ? direct_file_format(&file, actual) : remote_file_format(&file, actual);
     if (format) return format;
     if (response->page || response->size < SAMPLE_BYTES || response->size > 9007199254740991LL ||
-        !magic_matches(&file, response)) return -1;
+        !download_file_magic(&file, response->sample, response->used)) return -1;
     copy_text(file.url, sizeof file.url, url);
     file.size = response->size;
     *r = file;
@@ -164,9 +170,10 @@ static int file_from_response(Release *r, const Response *response, const char *
 }
 
 int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, char *error, size_t cap) {
-    Response response = {.cancel = cancel};
+    Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE)};
     int code = fetch(url, &response) ? file_from_response(r, &response, url) : -1;
-    if (code) copy_text(error, cap, code > 0 ? "This option uses an unsupported download format."
+    if (code) copy_text(error, cap, response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP or RAR with a filename and size."
+                                      : code > 0 ? "This option uses an unsupported download format."
                                              : "The provider did not return a verifiable PKG, FPKG, RAR or ZIP.");
     return code;
 }
@@ -179,7 +186,7 @@ static bool html_text(const char *start, size_t length, char *out, size_t cap) {
     size_t used = 0;
     const struct { const char *entity; char value; } entities[] = {
         {"&amp;", '&'}, {"&quot;", '"'}, {"&apos;", '\''}, {"&#39;", '\''},
-        {"&#x27;", '\''}, {"&lt;", '<'}, {"&gt;", '>'}
+        {"&#x27;", '\''}, {"&lt;", '<'}, {"&gt;", '>'}, {"&nbsp;", ' '}, {"&#160;", ' '}
     };
     for (size_t i = 0; i < length; i++) {
         if (used + 1 == cap) return false;
@@ -235,6 +242,132 @@ static bool page_filename(const char *html, const char *provider, char *name, si
         if (suffix && !strcmp(suffix, suffixes[i])) { *suffix = 0; break; }
     }
     return true;
+}
+
+static int64_t display_bytes(const char *text, bool bare, bool *exact) {
+    const struct { const char *name; int64_t multiplier; } units[] = {
+        {"bytes", 1}, {"byte", 1}, {"B", 1},
+        {"KB", 1000}, {"MB", 1000000}, {"GB", 1000000000LL}, {"TB", 1000000000000LL},
+        {"KiB", 1024}, {"MiB", 1048576}, {"GiB", 1073741824LL}, {"TiB", 1099511627776LL}
+    };
+    for (const char *p = text; *p; p++) {
+        if (!isdigit((unsigned char)*p) || (p != text &&
+                (isalnum((unsigned char)p[-1]) || p[-1] == '.' || p[-1] == ','))) continue;
+        char number[32];
+        const char *end = p;
+        size_t n = 0;
+        while ((isdigit((unsigned char)*end) || *end == '.' ||
+               (*end == ',' && isdigit((unsigned char)end[1]))) && n + 1 < sizeof number) {
+            if (*end != ',') number[n++] = *end;
+            end++;
+        }
+        number[n] = 0;
+        char *tail = NULL;
+        double count = strtod(number, &tail);
+        if (!tail || *tail) continue;
+        while (isspace((unsigned char)*end)) end++;
+        int64_t scale = 0;
+        for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
+            size_t length = strlen(units[i].name);
+            if (!strncasecmp(end, units[i].name, length) && !isalnum((unsigned char)end[length])) {
+                scale = units[i].multiplier;
+                break;
+            }
+        }
+        if (bare && !*end) scale = 1;
+        double bytes = count * scale;
+        if (!(bytes >= 1 && bytes <= 9007199254740991.0)) continue;
+        *exact = scale == 1 && !strchr(number, '.');
+        return (int64_t)bytes;
+    }
+    return 0;
+}
+
+static bool size_label(const char *name) {
+    const char *markers[] = {"fileSize", "filesize", "file-size", "file_size", "file_size_info",
+        "fsize", "download-size", "downloadSize", "contentSize"};
+    if (!strcasecmp(name, "size")) return true;
+    for (size_t i = 0; i < sizeof markers / sizeof *markers; i++)
+        if (strstr(name, markers[i])) return true;
+    return false;
+}
+
+static void offer_size(RemoteFileMetadata *metadata, const char *text, bool bare) {
+    bool exact = false;
+    int64_t size = display_bytes(text, bare, &exact);
+    if (size && (!metadata->size || (exact && !metadata->exact))) {
+        metadata->size = size;
+        metadata->exact = exact;
+    }
+}
+
+static void page_metadata(const char *html, const char *provider, RemoteFileMetadata *metadata) {
+    if (!page_filename(html, provider, metadata->filename, sizeof metadata->filename) &&
+        !page_filename(html, "", metadata->filename, sizeof metadata->filename))
+        metadata->filename[0] = 0;
+    for (const char *tag = html; (tag = strchr(tag, '<')); tag++) {
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        if (end - tag > 2048) { tag = end; continue; }
+        char label[128], value[512];
+        const char *attributes[] = {"data-file-size", "data-filesize", "data-size-bytes", "data-size"};
+        for (size_t i = 0; i < sizeof attributes / sizeof *attributes; i++)
+            if (tag_value(tag, end, attributes[i], value, sizeof value))
+                offer_size(metadata, value, true);
+        if ((tag_value(tag, end, "property", label, sizeof label) ||
+             tag_value(tag, end, "name", label, sizeof label) ||
+             tag_value(tag, end, "itemprop", label, sizeof label)) &&
+             tag_value(tag, end, "content", value, sizeof value)) {
+            if (size_label(label)) offer_size(metadata, value, true);
+            else if (!strcmp(label, "og:description") || !strcmp(label, "description"))
+                offer_size(metadata, value, false);
+        }
+        if ((tag_value(tag, end, "id", label, sizeof label) && size_label(label)) ||
+            (tag_value(tag, end, "class", label, sizeof label) && size_label(label)) ||
+            (tag_value(tag, end, "itemprop", label, sizeof label) && size_label(label))) {
+            const char *close = strchr(end + 1, '<');
+            if (close && html_text(end + 1, (size_t)(close - end - 1), value, sizeof value))
+                offer_size(metadata, value, true);
+        }
+        tag = end;
+    }
+    const char *fields[] = {"\"sizeBytes\"", "\"fileSize\"", "\"contentSize\""};
+    for (size_t i = 0; i < sizeof fields / sizeof *fields; i++) {
+        const char *field = strstr(html, fields[i]);
+        if (!field || strstr(field + strlen(fields[i]), fields[i])) continue;
+        field += strlen(fields[i]);
+        while (isspace((unsigned char)*field)) field++;
+        if (*field++ != ':') continue;
+        while (isspace((unsigned char)*field)) field++;
+        bool quoted = *field == '"';
+        if (quoted) field++;
+        char value[64];
+        size_t length = strcspn(field, quoted ? "\"" : ",}]");
+        if (html_text(field, length, value, sizeof value)) offer_size(metadata, value, true);
+    }
+    const char *name = metadata->filename;
+    if (*name == '.' || strpbrk(name, "/\\:") || strstr(name, "..") || !utf8_text(name))
+        metadata->filename[0] = 0;
+}
+
+bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, atomic_bool *cancel) {
+    memset(metadata, 0, sizeof *metadata);
+    if (!remote_page_pending(r) || !remote_metadata_url(r->browser_url)) return false;
+    Response page = {.cancel = cancel, .collect_page = true};
+    if (fetch(r->browser_url, &page)) {
+        if (!page.page) {
+            Release file = *r;
+            if (!file_from_response(&file, &page, r->browser_url)) {
+                copy_text(metadata->filename, sizeof metadata->filename, file.filename);
+                metadata->size = file.size;
+                metadata->exact = true;
+            }
+        } else if (page.body && remote_metadata_url(page.url)) {
+            page_metadata(page.body, remote_browser_provider(page.url), metadata);
+        }
+    }
+    free(page.body);
+    return metadata->size > 0;
 }
 
 static bool resolve_href(const char *base, const char *href, char *out, size_t cap) {

@@ -105,11 +105,58 @@ static const cJSON *match_title(const TitleEntry *titles, size_t count, const ch
     return lo < count && !strcmp(titles[lo].title_id, id) ? titles[lo].entry : NULL;
 }
 
+static int compare_mirrors(const void *a, const void *b) {
+    const Release *x = *(const Release *const *)a, *y = *(const Release *const *)b;
+    int key = strcmp(x->mirror_key, y->mirror_key);
+    return key ? key : strcmp(x->id, y->id);
+}
+
+static size_t first_mirror(const Release *const *rows, size_t count, const char *key) {
+    size_t lo = 0, hi = count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (strcmp(rows[mid]->mirror_key, key) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static bool describe_mirrors(cJSON *entry, const Release *r, const Release *const *group, size_t count) {
+    char host[254];
+    if (remote_link_host(r, host, sizeof host) && !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
+    bool metadata = remote_page_pending(r) && remote_metadata_url(r->browser_url);
+    if (count > 1) {
+        cJSON *hosts = cJSON_AddArrayToObject(entry, "torboxHosts");
+        if (!hosts || !cJSON_AddNumberToObject(entry, "mirrorCount", (double)count)) return false;
+        for (size_t i = 0; i < count; i++) {
+            const Release *mirror = group[i];
+            metadata |= remote_page_pending(mirror) && remote_metadata_url(mirror->browser_url);
+            if (!remote_link_host(mirror, host, sizeof host)) continue;
+            bool duplicate = false;
+            const cJSON *item;
+            cJSON_ArrayForEach(item, hosts)
+                if (!strcmp(item->valuestring, host)) { duplicate = true; break; }
+            if (duplicate) continue;
+            cJSON *name = cJSON_CreateString(host);
+            if (!name || !cJSON_AddItemToArray(hosts, name)) { cJSON_Delete(name); return false; }
+        }
+    }
+    return !metadata || cJSON_AddTrueToObject(entry, "providerMetadata");
+}
+
 static bool append_remote_locked(cJSON *out) {
     if (!(orbit.sources.enabled & ORBIT_SOURCE_REMOTE) || !orbit.remote_release_count) return true;
     size_t count = (size_t)cJSON_GetArraySize(orbit.catalog), i = 0;
     TitleEntry *titles = malloc((count ? count : 1) * sizeof *titles);
-    if (!titles) return false;
+    const Release **mirrors = malloc(orbit.remote_release_count * sizeof *mirrors);
+    if (!titles || !mirrors) { free(titles); free(mirrors); return false; }
+    size_t mirror_count = 0;
+    for (i = 0; i < orbit.remote_release_count; i++) {
+        const Release *r = &orbit.remote_releases[i];
+        if (r->mirror_key[0] && source_enabled_locked(r)) mirrors[mirror_count++] = r;
+    }
+    qsort(mirrors, mirror_count, sizeof *mirrors, compare_mirrors);
+    i = 0;
     const cJSON *curated;
     cJSON_ArrayForEach(curated, orbit.catalog) {
         titles[i] = (TitleEntry){curated, json_text(curated, "titleId"), i};
@@ -120,12 +167,20 @@ static bool append_remote_locked(cJSON *out) {
     for (i = 0; i < orbit.remote_release_count && ok; i++) {
         const Release *r = &orbit.remote_releases[i];
         if (!source_enabled_locked(r)) continue;
+        size_t begin = 0, end = 0;
+        if (r->mirror_key[0]) {
+            begin = first_mirror(mirrors, mirror_count, r->mirror_key);
+            if (begin == mirror_count || mirrors[begin] != r) continue;
+            end = begin + 1;
+            while (end < mirror_count && !strcmp(mirrors[end]->mirror_key, r->mirror_key)) end++;
+        }
         cJSON *entry = release_json(r);
         if (!entry) { ok = false; break; }
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "url");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteCatalogId");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteLabel");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "mirrorKey");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remotePage");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "sha256");
         const cJSON *match = match_title(titles, count, r->title_id);
@@ -153,11 +208,13 @@ static bool append_remote_locked(cJSON *out) {
         ok = ok && cJSON_AddStringToObject(entry, "provider", r->remote_label[0] ? r->remote_label : "Community catalogues") &&
              cJSON_AddBoolToObject(entry, "browserAvailable", remote_page_pending(r)) &&
              cJSON_AddBoolToObject(entry, "directAvailable", !remote_page_pending(r));
+        if (ok) ok = describe_mirrors(entry, r, mirrors + begin, end - begin);
         firmware_describe(entry, orbit.firmware);
         if (ok) ok = cJSON_AddItemToArray(out, entry);
         if (!ok) cJSON_Delete(entry);
     }
     free(titles);
+    free(mirrors);
     return ok;
 }
 

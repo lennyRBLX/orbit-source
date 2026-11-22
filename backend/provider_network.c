@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 
 #ifndef ORBIT_TEST
@@ -11,8 +12,9 @@ static bool suffix(const char *host, const char *ending) {
     return a > b && !strcmp(host + a - b, ending);
 }
 #endif
-bool remote_https_url(const char *url) {
+static bool public_url(const char *url, bool allow_http) {
     if (!url || !*url || strpbrk(url, "\\#") || strlen(url) > 8192) return false;
+    if (strncasecmp(url, "https://", 8) && strncasecmp(url, "http://", 7)) return false;
     for (const unsigned char *p = (const unsigned char *)url; *p; p++)
         if (*p <= 32 || *p >= 127) return false;
     CURLU *parsed = curl_url();
@@ -21,7 +23,7 @@ bool remote_https_url(const char *url) {
     bool ok = !curl_url_set(parsed, CURLUPART_URL, url, CURLU_DISALLOW_USER) &&
               !curl_url_get(parsed, CURLUPART_SCHEME, &scheme, 0) &&
               !curl_url_get(parsed, CURLUPART_HOST, &host, 0) && *host &&
-              (!strcmp(scheme, "https")
+              (!strcmp(scheme, "https") || (allow_http && !strcmp(scheme, "http"))
 #ifdef ORBIT_TEST
                || (!strcmp(scheme, "http") && !strcmp(host, "127.0.0.1"))
 #endif
@@ -31,6 +33,9 @@ bool remote_https_url(const char *url) {
     curl_url_cleanup(parsed);
     return ok;
 }
+
+bool remote_https_url(const char *url) { return public_url(url, false); }
+bool direct_http_url(const char *url) { return public_url(url, true); }
 
 bool provider_transfer_url_allowed(const char *url) {
     if (!url || strlen(url) > 8192) return false;

@@ -1242,6 +1242,12 @@ html.pointer .source-acknowledgement:hover {
   gap: 0.8rem;
   margin-top: 1.4rem;
 }
+.direct-url-modal form > p {
+  margin: 1rem 0 0;
+}
+.direct-url-modal form > .form-error {
+  color: var(--bad);
+}
 .storage-list {
   margin: 1rem 0;
 }
