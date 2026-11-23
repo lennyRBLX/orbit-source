@@ -46,6 +46,8 @@ static const char *compression(const char *suffix) {
     return "";
 }
 
+static int file_format(Release *r, const char *name, bool community, const char *detected);
+
 /* Include the full source id in the digest even when its displayed prefix is shortened. */
 static void identify(Release *r) {
     char identity[sizeof r->remote_catalog_id + sizeof r->url + sizeof r->sha256 +
@@ -75,10 +77,18 @@ static bool valid(const Release *r) {
             (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
              !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG"));
     if (!filename_valid(r->filename) || !orbit_format_allowed(r)) return false;
-    const char *suffix = strrchr(r->filename, '.');
-    if (!suffix || strcmp(compression(suffix), r->compression) ||
-        (!r->compression[0] && (strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg"))) ||
-        (!r->compression[0] && r->extracted_size)) return false;
+    if (r->remote_page) {
+        Release checked = *r;
+        const char *suffix = !strcmp(r->compression, "zip") ? ".zip" :
+                             !strcmp(r->compression, "rar") ? ".rar" : !r->compression[0] ? ".pkg" : NULL;
+        if (!suffix || file_format(&checked, r->filename, true, suffix) ||
+            strcmp(checked.compression, r->compression) || strcmp(checked.format, r->format)) return false;
+    } else {
+        const char *suffix = strrchr(r->filename, '.');
+        if (!suffix || strcmp(compression(suffix), r->compression) ||
+            (!r->compression[0] && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg"))) return false;
+    }
+    if (!r->compression[0] && r->extracted_size) return false;
     return !r->sha256[0] || (strlen(r->sha256) == 64 &&
         strspn(r->sha256, "0123456789abcdefABCDEF") == 64);
 }
@@ -160,7 +170,7 @@ bool remote_metadata_url(const char *url) {
     }
 #endif
     const char *hosts[] = {"akirabox.com", "akirabox.to", "rootz.so", "vikingfile.com",
-        "vik1ngfile.site", "vik1ngf1le.online", "gofile.io", "datanodes.to", "datanodes.co", "filekeeper.net"};
+        "vik1ngfile.site", "vik1ngf1le.online", "gofile.io", "datanodes.to", "datanodes.co", "filekeeper.net", "1fichier.com"};
     char host[254];
     if (!url_host(url, host, sizeof host)) return false;
     for (size_t i = 0; i < sizeof hosts / sizeof *hosts; i++)
@@ -191,23 +201,24 @@ static const char *label_format(const char *label) {
 
 /* The payload filename determines the container. A link's PKG/FPKG label
  * describes what is inside a supported archive. Unlabeled archives are folders. */
-static int file_format(Release *r, const char *name, bool community) {
+static int file_format(Release *r, const char *name, bool community, const char *detected) {
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
     if (community && unsupported_label(name)) return 1;
     const char *suffix = strrchr(name, '.');
-    if (!suffix) return -1;
-    const char *archive = compression(suffix);
     const char *excluded[] = {".7z", ".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; i++)
-        if (!strcasecmp(suffix, excluded[i])) return 1;
-    bool fpkg = !strcasecmp(suffix, ".fpkg");
-    bool pkg = !strcasecmp(suffix, ".pkg");
-    if (!*archive && !pkg && !fpkg) return -1;
-    if (!strcasecmp(suffix, ".rar")) {
+        if (suffix && !strcasecmp(suffix, excluded[i])) return 1;
+    if (suffix && !strcasecmp(suffix, ".rar")) {
         const char *volume = suffix;
         while (volume > name && isdigit((unsigned char)volume[-1])) volume--;
         if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 1;
     }
+    if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg")))
+        suffix = detected;
+    if (!suffix) return -1;
+    const char *archive = compression(suffix);
+    bool fpkg = !strcasecmp(suffix, ".fpkg");
+    bool pkg = !strcasecmp(suffix, ".pkg");
     const char *format = "Game folder";
     if (fpkg || !strcmp(r->format, "FPKG")) format = "FPKG";
     else if (pkg || !strcmp(r->format, "PKG")) format = "PKG";
@@ -219,10 +230,14 @@ static int file_format(Release *r, const char *name, bool community) {
     return 0;
 }
 
-int remote_file_format(Release *r, const char *name) { return file_format(r, name, true); }
+int remote_file_format(Release *r, const char *name) { return file_format(r, name, true, NULL); }
+
+int remote_file_detected_format(Release *r, const char *name, const char *suffix) {
+    return file_format(r, name, true, suffix);
+}
 
 int direct_file_format(Release *r, const char *name) {
-    int result = file_format(r, name, false);
+    int result = file_format(r, name, false, NULL);
     if (!result) {
         copy_text(r->title, sizeof r->title, name);
         for (size_t n = strlen(r->title); n && !utf8_text(r->title);) r->title[--n] = 0;
@@ -293,7 +308,7 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     if (!*hint) {
         if (unsupported_label(format) || unsupported_label(category)) return 1;
         hint = label_format(*format ? format : category);
-        if (*format && !*hint) return 1;
+        if (*format && !*hint && strcasecmp(format, "Unknown") && strcasecmp(format, "Unknown file type")) return 1;
     }
     copy_text(r->format, sizeof r->format, hint);
     if (*label && strlen(label) < sizeof r->remote_label && utf8_text(label))
@@ -325,7 +340,7 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     if (result > 0) return result;
     if (result < 0 || hosted) {
         /* Opaque routes are resolved only after the option is selected. */
-        if ((*filename && result < 0) || strlen(r->url) >= sizeof r->browser_url) return -1;
+        if (strlen(r->url) >= sizeof r->browser_url) return -1;
         copy_text(r->browser_url, sizeof r->browser_url, r->url);
         memset(r->url, 0, sizeof r->url);
         memset(r->filename, 0, sizeof r->filename);

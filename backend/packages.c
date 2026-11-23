@@ -307,6 +307,9 @@ void packages_completed(const Job *pin, const char *origin, const char *output, 
     }
     identity(r, "device", pin->device); identity(r, "inode", pin->inode);
     text(r, "state", "checking"); text(r, "message", "Checking downloaded files…");
+    if (pin->release.remote_page && !pin->release.compression[0] &&
+        (!strcmp(pin->release.format, "PKG") || !strcmp(pin->release.format, "FPKG")))
+        cJSON_AddTrueToObject(r, "packageOutput");
     cJSON_AddArrayToObject(r, "packages");
     /* Get everything: install once checked, after install_after's download is in place,
      * and add the game to the home screen without waiting for Scan. */
@@ -462,7 +465,8 @@ static int walk(int parent, const char *name, const char *prefix, cJSON *r, unsi
             }
         }
     }
-    if (!extension(name, ".pkg") && !extension(name, ".fpkg")) return 0;
+    if (!extension(name, ".pkg") && !extension(name, ".fpkg") &&
+        !(yes(r, "packageOutput") && !depth)) return 0;
     cJSON *list = cJSON_GetObjectItemCaseSensitive(r, "packages");
     if (cJSON_GetArraySize(list) >= PACKAGE_LIMIT) return -1;
     cJSON *p = cJSON_CreateObject(); char hash[17], stamp[1000];

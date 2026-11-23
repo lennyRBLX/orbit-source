@@ -898,6 +898,9 @@ html.pointer .search-field input:hover {
   margin: 0;
   font-size: 0.95rem;
 }
+.facts .release-filename {
+  overflow-wrap: anywhere;
+}
 .notice {
   max-width: 40rem;
   margin-top: 1rem;

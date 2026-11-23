@@ -8,6 +8,27 @@ bool provider_browser_source(const char *source) {
     return source && (!strcmp(source, "vikingfile") || !strcmp(source, "akirabox") ||
                       !strcmp(source, "datanodes") || !strcmp(source, "1fichier"));
 }
+static bool browser_format(const Release *r) {
+    if (r->archive_unverified && (strcmp(r->format, "Unknown") || r->extracted_size || !r->compression[0])) return false;
+    const char *suffix = !strcmp(r->format, "exFAT") ? ".exfat" :
+                         !strcmp(r->format, "FFPFSC") ? ".ffpfsc" :
+                         (!strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG")) ? ".pkg" : NULL;
+    if (!suffix && !r->archive_unverified && (strcmp(r->format, "Game folder") || !r->compression[0] ||
+        strncmp(r->title_id, "PPSA", 4))) return false;
+    if (r->compression[0]) {
+        if (r->extracted_size <= 0 && !r->archive_unverified) return false;
+        suffix = !strcmp(r->compression, "zip") ? ".zip" :
+                 !strcmp(r->compression, "7z") ? ".7z" :
+                 !strcmp(r->compression, "rar") ? ".rar" : NULL;
+    }
+    size_t n = strlen(r->filename);
+    /* The provider filename remains exact; compression selects the actual
+     * RAR decoder even when the published filename has a .7z suffix. */
+    if (suffix && !strcmp(r->compression, "rar") && n > 3 &&
+        !strcasecmp(r->filename + n - 3, ".7z"))
+        suffix = ".7z";
+    return suffix && n > strlen(suffix) && !strcasecmp(r->filename + n - strlen(suffix), suffix);
+}
 static bool browser_file(const Release *r) {
     if (!provider_browser_source(r->source) || strlen(r->title_id) != 9 ||
         (strncmp(r->title_id, "PPSA", 4) && strncmp(r->title_id, "CUSA", 4)) || !r->filename[0] ||
@@ -17,28 +38,8 @@ static bool browser_file(const Release *r) {
         if (!isdigit((unsigned char)r->title_id[i])) return false;
     for (const unsigned char *p = (const void *)r->filename; *p; p++)
         if (*p < 32 || *p == 127) return false;
-    if (r->archive_unverified && (strcmp(r->format, "Unknown") || r->extracted_size || !r->compression[0])) return false;
-    const char *suffix = !strcmp(r->format, "exFAT") ? ".exfat" :
-                         !strcmp(r->format, "FFPFSC") ? ".ffpfsc" :
-                         (!strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG")) ? ".pkg" : NULL;
-    if (!suffix && !r->archive_unverified && (strcmp(r->format, "Game folder") || !r->compression[0] ||
-        (!r->remote_page && strncmp(r->title_id, "PPSA", 4)))) return false;
-    if (r->compression[0]) {
-        if (r->extracted_size <= 0 && !r->archive_unverified && !r->remote_page) return false;
-        suffix = !strcmp(r->compression, "zip") ? ".zip" :
-                 !strcmp(r->compression, "7z") ? ".7z" :
-                 !strcmp(r->compression, "rar") ? ".rar" : NULL;
-    }
-    size_t n = strlen(r->filename);
-    if (r->remote_page && suffix && !strcmp(suffix, ".pkg") && n > 5 && !strcasecmp(r->filename + n - 5, ".fpkg"))
-        suffix = ".fpkg";
-    /* The provider filename remains exact; compression selects the actual
-     * RAR decoder even when the published filename has a .7z suffix. */
-    if (suffix && !strcmp(r->compression, "rar") && n > 3 &&
-        !strcasecmp(r->filename + n - 3, ".7z"))
-        suffix = ".7z";
-    if (!suffix || n <= strlen(suffix) || strcasecmp(r->filename + n - strlen(suffix), suffix))
-        return false;
+    /* Community locators pin the name. Their GET verifies the signature. */
+    if (!r->remote_page && !browser_format(r)) return false;
     /* A source may use a descriptive filename without its title ID. If an ID
      * is present it must agree with the catalogue; matching remains exact. */
     const char *prefixes[] = {"PPSA", "CUSA"};
@@ -420,13 +421,45 @@ bool provider_browser_supported(const Release *release) {
 #ifdef ORBIT_TEST
     if (!strncmp(release->browser_url, "http://127.0.0.1:", 17)) return true;
 #endif
-    return browser_file(release) && browser_page(release, release->browser_url) &&
+    return browser_page(release, release->browser_url) &&
+        (browser_file(release) || (release->remote_page && !release->filename[0])) &&
         (!strcmp(release->url, release->browser_url) || provider_url_supported(release));
 }
 
+/* When the page omitted a filename, a captured path can supply it only if
+ * its file ID is the same as the selected provider page's. Opaque routes
+ * still need the page's exact filename before they can be matched. */
+static bool page_bound_filename(Release *r) {
+    if (!r->remote_page || !browser_page(r, r->browser_url) || strncmp(r->url, "https://", 8)) return false;
+    const char *page = strchr(r->browser_url + 8, '/'), *path = strchr(r->url + 8, '/');
+    if (!page || !path) return false;
+    bool akira = !strcmp(r->source, "akirabox");
+    const char *id = path + 1;
+    size_t length = 12;
+    if (!strcmp(r->source, "vikingfile")) {
+        page += 3; /* /f/ */
+        length = 10;
+        if (!strncmp(path, "/d/", 3)) id = path + 3;
+        else if (!strncmp(path, "/download/", 10)) id = path + 10;
+        else return false;
+    } else {
+        page++;
+        if (akira && !strncmp(path, "/download/", 10)) id = path + 10;
+        else if (strcmp(r->source, "datanodes")) return false;
+    }
+    if (strncmp(page, id, length) || id[length] != '/') return false;
+    const char *start = id + length + 1;
+    size_t n = strcspn(start, "?#");
+    char encoded[3 * sizeof r->filename];
+    if (!n || n >= sizeof encoded || memchr(start, '/', n)) return false;
+    for (size_t i = 0; i < n; i++) encoded[i] = akira && start[i] == '+' ? ' ' : start[i];
+    return percent_decode(encoded, n, r->filename, sizeof r->filename);
+}
+
 bool provider_capture_url(const Release *release, const char *candidate) {
-    if (!candidate || strlen(candidate) >= sizeof release->url) return false;
+    if (!provider_browser_source(release->source) || !candidate || strlen(candidate) >= sizeof release->url) return false;
     Release resolved = *release;
     strcpy(resolved.url, candidate);
-    return provider_browser_source(release->source) && provider_supported(&resolved);
+    if (!resolved.filename[0] && !page_bound_filename(&resolved)) return false;
+    return provider_supported(&resolved);
 }

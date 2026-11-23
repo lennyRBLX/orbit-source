@@ -70,6 +70,9 @@ typedef struct Transfer {
 static bool torbox(const Transfer *t) { return !strcmp(t->job->delivery, "torbox"); }
 static bool remote_transfer(const Transfer *t) { return !strcmp(t->release->source, "remote"); }
 static bool direct_transfer(const Transfer *t) { return !strcmp(t->release->source, ORBIT_DIRECT_SOURCE); }
+static bool get_verified_file(const Transfer *t) {
+    return direct_transfer(t) || (remote_transfer(t) && t->release->remote_page);
+}
 static bool guarded(const Transfer *t) {
     return torbox(t) || remote_transfer(t) || direct_transfer(t) || provider_browser_source(t->release->source);
 }
@@ -286,9 +289,9 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         /* Vikingfile's signed route already identifies the exact filename.
          * Its storage server may return only a bare attachment disposition. */
         bool viking_route = t->capture_probe && !torbox(t) && !strcmp(t->release->source, "vikingfile");
-        bool direct_full_probe = direct_transfer(t) && t->range_probe && t->status == 200;
+        bool full_probe = get_verified_file(t) && t->range_probe && t->status == 200;
         if ((t->capture_probe || torbox(t) || ((remote_transfer(t) || direct_transfer(t)) && named)) &&
-            (t->accepted || direct_full_probe) && t->disposition[0] && (named || !viking_route)) {
+            (t->accepted || full_probe) && t->disposition[0] && (named || !viking_route)) {
             if (!disposition_matches(t->disposition, t->release->filename)) {
                 t->accepted = false;
                 copy_text(t->error, sizeof t->error, "Provider returned a different filename.");
@@ -504,7 +507,7 @@ static int range_support(Transfer *owner, struct curl_slist *conditions, CURLcod
     *result = curl_easy_perform(c);
     curl_easy_cleanup(c);
     if (probe.unsupported_range) {
-        if (owner->probe && direct_transfer(owner)) {
+        if (owner->probe && get_verified_file(owner)) {
             owner->status = probe.status;
             owner->length = probe.length;
             copy_text(owner->etag, sizeof owner->etag, probe.etag);
@@ -1206,7 +1209,9 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed)
     }
     if (!j->filename[0]) {
         Release file = *t->release;
-        if (remote_file_format(&file, candidate->filename)) return false;
+        copy_text(file.filename, sizeof file.filename, candidate->filename);
+        copy_text(file.format, sizeof file.format, candidate->format);
+        copy_text(file.compression, sizeof file.compression, candidate->compression);
         file.size = candidate->size;
         pthread_mutex_lock(&orbit.mutex);
         bool assigned = job_assign_remote_file_locked(j, &file, t->error, sizeof t->error);
@@ -1216,6 +1221,7 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed)
         t->limit = file.size;
     }
     copy_text(t->release->url, sizeof t->release->url, candidate->url);
+    copy_text(t->release->filename, sizeof t->release->filename, candidate->filename);
     return true;
 }
 
@@ -1298,7 +1304,7 @@ static void run_job(Job *j) {
         }
         if (controlled(&t)) goto finish;
     }
-    if (remote_transfer(&t) && !torbox(&t) && !j->archive_ready) {
+    if (remote_transfer(&t) && !get_verified_file(&t) && !torbox(&t) && !j->archive_ready) {
         c = request(&t);
         if (!c) {
             copy_text(t.error, sizeof t.error, "Could not initialize HTTPS.");
@@ -1442,9 +1448,12 @@ static void run_job(Job *j) {
                 copy_text(t.error, sizeof t.error, "Source did not return a valid byte range.");
             goto finish;
         }
-    } else if (direct_transfer(&t)) {
+    } else if (get_verified_file(&t)) {
         direct_ranges = range_support(&t, NULL, &rc);
-        if (direct_ranges < 0) goto finish;
+        if (direct_ranges < 0) {
+            source_failed = remote_transfer(&t);
+            goto finish;
+        }
     } else if (!remote_transfer(&t)) {
         c = request(&t);
         if (!c) {
@@ -1604,7 +1613,7 @@ static void run_job(Job *j) {
         copy_text(t.error, sizeof t.error, "Checksum verification failed. Partial file preserved.");
         goto finish;
     }
-    if ((direct_transfer(&t) || (remote_transfer(&t) && (torbox(&t) || j->mirror_id[0] || j->mirror_first[0]))) && !file_type_matches(&t)) {
+    if ((get_verified_file(&t) || (remote_transfer(&t) && (torbox(&t) || j->mirror_id[0] || j->mirror_first[0]))) && !file_type_matches(&t)) {
         source_failed = true;
         copy_text(t.error, sizeof t.error, "The downloaded file does not match its PKG, FPKG, ZIP or RAR filename.");
         goto finish;

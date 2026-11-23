@@ -688,11 +688,14 @@ cJSON *remote_metadata_json_locked(const char *ids) {
             pending = true;
             continue;
         }
-        if (!request->file.size) continue;
+        if (!request->file.size && !request->file.filename[0]) continue;
         cJSON *row = cJSON_CreateObject();
         if (!cJSON_AddStringToObject(row, "id", id) ||
             !cJSON_AddNumberToObject(row, "sizeBytes", (double)request->file.size) ||
             !cJSON_AddBoolToObject(row, "exact", request->file.exact) ||
+            (request->file.filename[0] && !cJSON_AddStringToObject(row, "filename", request->file.filename)) ||
+            (request->file.format[0] && !cJSON_AddStringToObject(row, "format", request->file.format)) ||
+            (request->file.compression[0] && !cJSON_AddStringToObject(row, "compression", request->file.compression)) ||
             !cJSON_AddItemToArray(rows, row)) cJSON_Delete(row);
     }
     cJSON_AddBoolToObject(root, "pending", pending);
@@ -721,15 +724,21 @@ static void *metadata_worker(void *unused) {
             bool found = metadata_provider(&candidate) || next_metadata_mirror_locked(&selected, "", &candidate);
             while (found && !orbit.stop && remote_source_enabled_locked(&selected)) {
                 pthread_mutex_unlock(&orbit.mutex);
-                bool known = remote_download_metadata(&candidate, &file, NULL);
+                RemoteFileMetadata current;
+                remote_download_metadata(&candidate, &current, NULL);
                 pthread_mutex_lock(&orbit.mutex);
-                if (known) break;
+                if (!strcmp(candidate.id, selected.id)) file = current;
+                if (current.size) {
+                    file.size = current.size;
+                    file.exact = current.exact;
+                    break;
+                }
                 found = next_metadata_mirror_locked(&selected, strcmp(candidate.id, selected.id) ? candidate.id : "",
                                                     &candidate);
             }
         }
         request->file = file;
-        request->expires = time(NULL) + (file.size ? 1800 : 300);
+        request->expires = time(NULL) + (file.size || file.filename[0] ? 1800 : 300);
         request->state = META_DONE;
     }
     pthread_mutex_unlock(&orbit.mutex);

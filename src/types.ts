@@ -34,8 +34,8 @@ export interface Release extends AddonIdentity {
   torboxHosts?: string[];
   mirrorCount?: number;
   providerMetadata?: boolean;
-  // The only formats the service offers (browse.ts DOWNLOAD_FORMATS); it leaves out the rest.
-  format: "FPKG" | "PKG" | "Game folder";
+  // An unresolved provider page can omit the file type.
+  format: "FPKG" | "PKG" | "Game folder" | "Unknown";
   // Downloaded as an archive and extracted on the drive; format is what's inside.
   compression?: "zip" | "7z" | "rar";
   archivePassword?: string;
@@ -361,10 +361,11 @@ export interface AutoStart {
   etaHEN?: { installed: boolean };
 }
 // "RAR · PKG" for a compressed option, otherwise its format.
-export function formatLabel(r: Pick<Release, "format" | "compression">) {
-  if (!r.compression) return r.format;
+export function formatLabel(r: Pick<Job, "format" | "compression">) {
+  const format = r.format === "Unknown" ? "" : r.format;
+  if (!r.compression) return format || t("Download");
   const kind = r.compression === "7z" ? "7z" : r.compression.toUpperCase();
-  return `${kind} · ${r.format}`;
+  return format ? `${kind} · ${format}` : kind;
 }
 const tenths = { minimumFractionDigits: 1, maximumFractionDigits: 1 };
 // 49.4 GB in English, 49,4 GB in German, 49,4 ГБ in Russian, 49,4 Go in French.

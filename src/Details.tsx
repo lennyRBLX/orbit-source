@@ -9,6 +9,7 @@ import { useDebrid, torboxAvailable, preferredDelivery } from "./Debrid";
 import {
   bytes,
   formatLabel,
+  type Release,
   releaseProvider,
   releaseSize,
   type Game,
@@ -162,9 +163,11 @@ export function Details({
     if (xbMenu === null && (document.activeElement === document.body || !document.activeElement))
       document.querySelector<HTMLElement>(".xb-game .xb-row.on .xb-row-main")?.focus({ preventScroll: true });
   }, [xbMenu]);
-  const [providerSizes, setProviderSizes] = useState<Record<string, { sizeBytes: number; exact: boolean }>>({});
+  type ProviderFile = { id: string; sizeBytes: number; exact: boolean } &
+    Partial<Pick<Release, "filename" | "format" | "compression">>;
+  const [providerFiles, setProviderFiles] = useState<Record<string, ProviderFile>>({});
   const metadataIds = game.releases
-    .filter((r) => r.providerMetadata && !r.sizeBytes)
+    .filter((r) => r.providerMetadata && (!r.sizeBytes || !r.filename || r.format === "Unknown"))
     .map((r) => r.id)
     .slice(0, 32)
     .join(",");
@@ -174,11 +177,11 @@ export function Details({
     const deadline = Date.now() + 60_000;
     async function poll() {
       try {
-        const info = await api<{ pending: boolean; files: { id: string; sizeBytes: number; exact: boolean }[] }>(
+        const info = await api<{ pending: boolean; files: ProviderFile[] }>(
           `/community-metadata?ids=${encodeURIComponent(metadataIds)}`,
         );
         if (cancelled) return;
-        setProviderSizes(Object.fromEntries(info.files.map(({ id, sizeBytes, exact }) => [id, { sizeBytes, exact }])));
+        setProviderFiles(Object.fromEntries(info.files.map((file) => [file.id, file])));
         if (info.pending && Date.now() < deadline) timer = setTimeout(poll, 1200);
       } catch { /* Keep the catalogue estimate if a provider cannot be reached. */ }
     }
@@ -186,8 +189,16 @@ export function Details({
     return () => { cancelled = true; clearTimeout(timer); };
   }, [metadataIds, system?.paired]);
   const releases = game.releases.map((r) => {
-    const size = providerSizes[r.id];
-    return size ? { ...r, sizeEstimateBytes: size.sizeBytes, sizeEstimateExact: size.exact } : r;
+    const file = providerFiles[r.id];
+    if (!file) return r;
+    return {
+      ...r,
+      filename: file.filename || r.filename,
+      format: file.format || r.format,
+      compression: file.format ? file.compression : r.compression,
+      sizeEstimateBytes: file.sizeBytes || r.sizeEstimateBytes,
+      sizeEstimateExact: file.sizeBytes ? file.exact : r.sizeEstimateExact,
+    };
   });
   // A source can be switched off by another paired device while this page is open.
   const release =
@@ -515,10 +526,18 @@ export function Details({
         </dl>
       )}
       <dl className="facts release-facts">
-        <div>
-          <dt>{t("Format")}</dt>
-          <dd>{formatLabel(release)}</dd>
-        </div>
+        {(release.format !== "Unknown" || release.compression) && (
+          <div>
+            <dt>{t("Format")}</dt>
+            <dd>{formatLabel(release)}</dd>
+          </div>
+        )}
+        {release.sourceId === "remote" && release.filename && (
+          <div>
+            <dt>{t("File")}</dt>
+            <dd className="release-filename">{release.filename}</dd>
+          </div>
+        )}
         <div>
           <dt>{t("Title ID")}</dt>
           <dd>{release.titleId}</dd>

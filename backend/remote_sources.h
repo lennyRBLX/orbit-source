@@ -29,6 +29,7 @@ bool remote_mirror_file(const Release *selected, const Release *file);
 bool remote_metadata_url(const char *url);
 bool remote_url_filename(const char *url, char *name, size_t cap);
 int remote_file_format(Release *release, const char *name);
+int remote_file_detected_format(Release *release, const char *name, const char *suffix);
 int direct_file_format(Release *release, const char *name);
 bool direct_release_init(Release *release, const char *url);
 int direct_release_parse(const cJSON *entry, Release *release);
@@ -39,6 +40,7 @@ int remote_download_verify(Release *release, const char *url, atomic_bool *cance
                            char *error, size_t cap);
 typedef struct {
     char filename[160];
+    char format[24], compression[16];
     int64_t size;
     bool exact;
 } RemoteFileMetadata;

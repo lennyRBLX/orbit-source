@@ -450,7 +450,8 @@ export function Downloads({
                     </span>
                   </div>
                   <p>
-                    {r && `${releaseProvider(r)} · ${formatLabel(r)} · `}
+                    {r && `${releaseProvider(r)} · `}
+                    {`${formatLabel(j)} · `}
                     {j.delivery === "torbox" && `${t("via TorBox")} · `}
                     {drive ? placeName(drive.label) : j.storageId}
                     {!drive && j.status !== "complete"

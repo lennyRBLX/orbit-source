@@ -117,7 +117,8 @@ export function CrossbarDownloads({
         : job.status === "error"
           ? [status, job.error && t(job.error)].filter(Boolean).join(" · ")
           : [
-              release ? `${releaseProvider(release)} · ${formatLabel(release)}` : "",
+              release && releaseProvider(release),
+              formatLabel(job),
               job.delivery === "torbox" ? t("via TorBox") : "",
               drive ? placeName(drive.label) : job.storageId,
               lost ? t("Reconnect this drive") : "",

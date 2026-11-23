@@ -28,6 +28,7 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             validator = self.headers.get("If-None-Match")
             self.server.requests.append(validator)
             self.server.paths.append(self.path)
+            self.server.ranges.append((self.path, self.headers.get("Range")))
             extra = self.server.downloads.get(self.path)
             if extra:
                 status, headers, body = extra
@@ -56,6 +57,7 @@ class FixtureServer(http.server.ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.requests = []
         self.paths = []
+        self.ranges = []
         self.failure = None
         self.feed = None
         self.feeds = {}
@@ -230,6 +232,79 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertTrue(all(row["browserAvailable"] and not row["directAvailable"] for row in rows))
                 self.assertTrue(all(row["torboxHost"] == "127.0.0.1" for row in rows))
                 self.assertEqual(len({row["gameId"] for row in rows}), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_opaque_provider_file_is_identified_by_the_download_get(self):
+        server = FixtureServer()
+        address = server.url.removesuffix("/catalogue.json")
+        html = {"Content-Type": "text/html"}
+        sample = b"\x7fFIHtest"
+        server.downloads.update({
+            "/metadata/opaque": (200, html, b'<title>Provider</title>'
+                                 b'<a HREF = "/token" download="Game &amp; Add-on">Download</a>'),
+            "/token": (206, {"Content-Range": "bytes 0-7/42",
+                             "Content-Disposition": "attachment; filename*=UTF-8''Game%20%26%20Add-on"},
+                       sample),
+            "/metadata/full": (200, html, b"<a href=/no-range download='Full Game.pkg'>Download</a>"),
+            "/no-range": (200, {"Content-Type": "application/octet-stream"}, sample + b"rest"),
+            "/metadata/plain": (200, html, b'<h1>Provider Game.pkg</h1><a href="/plain">Download</a>'),
+            "/bad-type": (200, html, b'<a href="/token" download="Game.zip">Download</a>'),
+            "/bad-magic": (200, html, b'<a href="/plain" download="Game.zip">Download</a>'),
+            "/plain": (200, {}, sample),
+            "/unsupported": (200, html, b'<a href="/plain" download="Game.7z">Download</a>'),
+        })
+        server.feed = {"packages": [{"title": "Game", "titleId": "PPSA12345", "format": "Unknown file type",
+                        "downloadLinks": [{"name": label, "url": address + "/metadata/" + label}
+                                          for label in ("opaque", "full")]}]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name in DEFAULTS:
+                    service.command("PATCH", id=name, enabled=False)
+                service.command("POST", url=server.url)
+                self.assertEqual(service.command("start"), 0)
+                service.command("policy", remote=True, notice=True)
+                service.idle()
+
+                rows = service.command("view")["remote"]
+                ids = ",".join(row["id"] for row in rows)
+                self.assertTrue(all(row["browserAvailable"] and row["format"] == "Unknown" for row in rows))
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    result = service.command("metadata", ids=ids)
+                    if not result["pending"]:
+                        break
+                    time.sleep(0.02)
+                self.assertFalse(result["pending"])
+                files = {row["filename"]: row for row in result["files"]}
+                self.assertEqual(files["Full Game.pkg"]["format"], "PKG")
+                self.assertNotIn("format", files["Game & Add-on"])
+                self.assertTrue(all(row["sizeBytes"] == 0 for row in files.values()))
+                self.assertNotIn("/token", server.paths)
+                self.assertNotIn("/no-range", server.paths)
+
+                base = server.feed["packages"][0]
+
+                def resolve(path):
+                    return service.command("resolve", entry=dict(
+                        base, downloadLinks=[{"name": "Mirror", "url": address + path}]))
+
+                for path, name, size in (("/metadata/opaque", "Game & Add-on", 42),
+                                         ("/metadata/full", "Full Game.pkg", 12),
+                                         ("/metadata/plain", "Provider Game.pkg", 8)):
+                    with self.subTest(path=path):
+                        resolved = resolve(path)
+                        self.assertEqual((resolved["filename"], resolved["format"], resolved["sizeBytes"]),
+                                         (name, "PKG", size))
+                self.assertIn(("/token", "bytes=0-7"), server.ranges)
+                self.assertIn(("/no-range", "bytes=0-7"), server.ranges)
+                for path in ("/bad-type", "/bad-magic", "/unsupported"):
+                    with self.subTest(path=path):
+                        self.assertEqual(resolve(path), -1)
         finally:
             server.shutdown()
             server.server_close()

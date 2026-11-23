@@ -10,6 +10,7 @@ const { outputFiles } = await build({
       export { groupGames } from "./src/catalog";
       export { releaseMatches } from "./src/browse";
       export { releaseState } from "./src/collection";
+      export { formatLabel } from "./src/types";
     `,
     resolveDir: fileURLToPath(new URL("..", import.meta.url)),
   },
@@ -18,7 +19,7 @@ const { outputFiles } = await build({
   format: "esm",
   platform: "node",
 });
-const { groupGames, releaseMatches, releaseState } = await import(
+const { groupGames, releaseMatches, releaseState, formatLabel } = await import(
   `data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString("base64")}`
 );
 
@@ -62,4 +63,10 @@ test("a resolved community page download still belongs to its catalogue option",
     format: "Game folder", total: 3482, status: "queued" };
   assert.equal(releaseState(page, [job], []).job, job);
   assert.equal(releaseState({ ...page, id: "different-mirror" }, [job], []), undefined);
+});
+
+test("provider options have a usable label while the file type is pending", () => {
+  assert.equal(formatLabel({ format: "Unknown" }), "Download");
+  assert.equal(formatLabel({ format: "Unknown", compression: "zip" }), "ZIP");
+  assert.equal(formatLabel({ format: "PKG", compression: "rar" }), "RAR · PKG");
 });

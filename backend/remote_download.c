@@ -140,28 +140,43 @@ static bool fetch(const char *url, Response *r) {
     return ok;
 }
 
-bool download_file_magic(const Release *r, const unsigned char *p, size_t length) {
-    if (length < SAMPLE_BYTES) return false;
-    if (!strcmp(r->compression, "zip"))
-        return !memcmp(p, "PK\3\4", 4);
-    if (!strcmp(r->compression, "rar"))
-        return !memcmp(p, "Rar!\x1a\x07", 6) && (p[6] == 0 || (p[6] == 1 && p[7] == 0));
-    return !memcmp(p, "\x7f" "CNT", 4) || !memcmp(p, "\x7f" "FIH", 4);
+static const char *sample_suffix(const unsigned char *p, size_t length) {
+    if (length < SAMPLE_BYTES) return NULL;
+    if (!memcmp(p, "PK\3\4", 4)) return ".zip";
+    if (!memcmp(p, "Rar!\x1a\x07", 6) && (p[6] == 0 || (p[6] == 1 && p[7] == 0))) return ".rar";
+    if (!memcmp(p, "\x7f" "CNT", 4) || !memcmp(p, "\x7f" "FIH", 4)) return ".pkg";
+    return NULL;
 }
 
-static int file_from_response(Release *r, const Response *response, const char *url) {
+bool download_file_magic(const Release *r, const unsigned char *p, size_t length) {
+    const char *suffix = sample_suffix(p, length);
+    return suffix && !strcmp(suffix + 1, r->compression[0] ? r->compression : "pkg");
+}
+
+static int file_from_response(Release *r, const Response *response, const char *url, const char *page_name) {
     char name[sizeof r->filename] = "";
-    if (!response->name[0]) {
-        remote_url_filename(response->url, name, sizeof name);
-        if (r->filename[0] && strcmp(r->filename, name))
-            remote_url_filename(url, name, sizeof name);
+    const char *actual = response->name;
+    if (!*actual && !(r->remote_page && (provider_disposition_name(response->url, name, sizeof name) ||
+                                        provider_disposition_name(url, name, sizeof name)))) {
+        name[0] = 0;
+        if (page_name && *page_name) copy_text(name, sizeof name, page_name);
+        else {
+            remote_url_filename(response->url, name, sizeof name);
+            if (r->filename[0] && strcmp(r->filename, name)) {
+                name[0] = 0;
+                remote_url_filename(url, name, sizeof name);
+            }
+        }
     }
-    const char *actual = response->name[0] ? response->name : name;
+    if (!*actual) actual = name;
     if (r->filename[0] && strcmp(r->filename, actual)) return -1;
     Release file = *r;
-    int format = response->direct ? direct_file_format(&file, actual) : remote_file_format(&file, actual);
+    const char *suffix = sample_suffix(response->sample, response->used);
+    int format = response->direct ? direct_file_format(&file, actual) :
+        remote_file_detected_format(&file, actual, r->remote_page ? suffix : NULL);
     if (format) return format;
     if (response->page || response->size < SAMPLE_BYTES || response->size > 9007199254740991LL ||
+        (r->size && r->size != response->size) ||
         !download_file_magic(&file, response->sample, response->used)) return -1;
     copy_text(file.url, sizeof file.url, url);
     file.size = response->size;
@@ -171,7 +186,7 @@ static int file_from_response(Release *r, const Response *response, const char *
 
 int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, char *error, size_t cap) {
     Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE)};
-    int code = fetch(url, &response) ? file_from_response(r, &response, url) : -1;
+    int code = fetch(url, &response) ? file_from_response(r, &response, url, NULL) : -1;
     if (code) copy_text(error, cap, response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP or RAR with a filename and size."
                                       : code > 0 ? "This option uses an unsupported download format."
                                              : "The provider did not return a verifiable PKG, FPKG, RAR or ZIP.");
@@ -206,42 +221,89 @@ static bool html_text(const char *start, size_t length, char *out, size_t cap) {
     return used > 0;
 }
 
-static bool tag_value(const char *tag, const char *end, const char *attribute, char *out, size_t cap) {
-    size_t n = strlen(attribute);
-    for (const char *p = tag; p < end; p++) {
-        if (!isspace((unsigned char)*p) || end - p <= (ptrdiff_t)n + 2 ||
-            strncasecmp(p + 1, attribute, n) || p[n + 1] != '=') continue;
-        p += n + 2;
-        if (*p != '"' && *p != '\'') return false;
-        const char *close = memchr(p + 1, *p, (size_t)(end - p - 1));
-        return close && html_text(p + 1, (size_t)(close - p - 1), out, cap);
+static bool tag_attribute(const char *tag, const char *end, const char *attribute, char *out, size_t cap) {
+    out[0] = 0;
+    const char *p = tag;
+    while (p < end && !isspace((unsigned char)*p)) p++;
+    while (p < end) {
+        while (p < end && isspace((unsigned char)*p)) p++;
+        const char *key = p;
+        while (p < end && *p != '=' && !isspace((unsigned char)*p)) p++;
+        size_t length = (size_t)(p - key);
+        if (!length) return false;
+        bool match = length == strlen(attribute) && !strncasecmp(key, attribute, length);
+        while (p < end && isspace((unsigned char)*p)) p++;
+        if (p == end || *p != '=') {
+            if (match) return true;
+            continue;
+        }
+        p++;
+        while (p < end && isspace((unsigned char)*p)) p++;
+        char quote = p < end && (*p == '"' || *p == '\'') ? *p++ : 0;
+        const char *value = p;
+        while (p < end && (quote ? *p != quote : !isspace((unsigned char)*p))) p++;
+        if (quote && p == end) return false;
+        if (match) return p == value || html_text(value, (size_t)(p - value), out, cap);
+        if (quote) p++;
     }
     return false;
 }
 
-static bool page_filename(const char *html, const char *provider, char *name, size_t cap) {
-    if (!strcmp(provider, "vikingfile")) {
-        const char *tag = strstr(html, "id=\"filename\"");
-        const char *text = tag ? strchr(tag, '>') : NULL;
-        const char *end = text ? strchr(++text, '<') : NULL;
-        return end && html_text(text, (size_t)(end - text), name, cap);
+static bool tag_value(const char *tag, const char *end, const char *attribute, char *out, size_t cap) {
+    return tag_attribute(tag, end, attribute, out, cap) && *out;
+}
+
+static bool safe_page_name(const char *name) {
+    return *name && *name != '.' && !strpbrk(name, "/\\:") && !strstr(name, "..") && utf8_text(name);
+}
+
+static bool known_title_filename(char *name, Release *file) {
+    const char *suffixes[] = {" - DataNodes", " · AkiraBox", " - 1fichier.com"};
+    for (size_t i = 0; i < sizeof suffixes / sizeof *suffixes; i++) {
+        size_t length = strlen(name), suffix = strlen(suffixes[i]);
+        if (length > suffix && !strcasecmp(name + length - suffix, suffixes[i])) {
+            name[length - suffix] = 0;
+            break;
+        }
+    }
+    return !remote_file_format(file, name);
+}
+
+static bool page_filename(const char *html, const Release *r, char *name, size_t cap) {
+    Release file = *r;
+    char heading[sizeof file.filename] = "";
+    for (const char *tag = html; (tag = strchr(tag, '<')); tag++) {
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        char label[64];
+        if ((tag[1] == 'a' || tag[1] == 'A') && isspace((unsigned char)tag[2]) &&
+            tag_value(tag, end, "download", name, cap) && safe_page_name(name)) return true;
+        if (tag_value(tag, end, "data-filename", name, cap) && safe_page_name(name)) return true;
+        if ((tag_value(tag, end, "id", label, sizeof label) || tag_value(tag, end, "class", label, sizeof label)) &&
+            (!strcasecmp(label, "filename") || !strcasecmp(label, "file-name"))) {
+            if (tag_value(tag, end, "title", name, cap) && safe_page_name(name)) return true;
+            const char *close = strchr(end + 1, '<');
+            if (close && html_text(end + 1, (size_t)(close - end - 1), name, cap) && safe_page_name(name)) return true;
+        }
+        if (!heading[0] && !strncasecmp(tag, "<h1", 3) && (end == tag + 3 || isspace((unsigned char)tag[3]))) {
+            const char *close = strchr(end + 1, '<');
+            if (!close || !html_text(end + 1, (size_t)(close - end - 1), heading, sizeof heading) ||
+                !known_title_filename(heading, &file)) heading[0] = 0;
+        }
+        tag = end;
     }
     for (const char *tag = html; (tag = strstr(tag, "<meta")); tag += 5) {
         const char *end = strchr(tag, '>');
         if (!end) break;
         char property[32];
         if (tag_value(tag, end, "property", property, sizeof property) && !strcmp(property, "og:title") &&
-            tag_value(tag, end, "content", name, cap)) return true;
+            tag_value(tag, end, "content", name, cap) && known_title_filename(name, &file)) return true;
     }
+    if (heading[0]) { copy_text(name, cap, heading); return true; }
     const char *tag = strstr(html, "<title>");
     const char *end = tag ? strstr(tag += strlen("<title>"), "</title>") : NULL;
     if (!end || !html_text(tag, (size_t)(end - tag), name, cap)) return false;
-    const char *suffixes[] = {" - DataNodes", " · AkiraBox", " - 1fichier.com"};
-    for (size_t i = 0; i < sizeof suffixes / sizeof *suffixes; i++) {
-        char *suffix = strstr(name, suffixes[i]);
-        if (suffix && !strcmp(suffix, suffixes[i])) { *suffix = 0; break; }
-    }
-    return true;
+    return known_title_filename(name, &file);
 }
 
 static int64_t display_bytes(const char *text, bool bare, bool *exact) {
@@ -301,10 +363,7 @@ static void offer_size(RemoteFileMetadata *metadata, const char *text, bool bare
     }
 }
 
-static void page_metadata(const char *html, const char *provider, RemoteFileMetadata *metadata) {
-    if (!page_filename(html, provider, metadata->filename, sizeof metadata->filename) &&
-        !page_filename(html, "", metadata->filename, sizeof metadata->filename))
-        metadata->filename[0] = 0;
+static void page_size(const char *html, RemoteFileMetadata *metadata) {
     for (const char *tag = html; (tag = strchr(tag, '<')); tag++) {
         const char *end = strchr(tag, '>');
         if (!end) break;
@@ -345,29 +404,6 @@ static void page_metadata(const char *html, const char *provider, RemoteFileMeta
         size_t length = strcspn(field, quoted ? "\"" : ",}]");
         if (html_text(field, length, value, sizeof value)) offer_size(metadata, value, true);
     }
-    const char *name = metadata->filename;
-    if (*name == '.' || strpbrk(name, "/\\:") || strstr(name, "..") || !utf8_text(name))
-        metadata->filename[0] = 0;
-}
-
-bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, atomic_bool *cancel) {
-    memset(metadata, 0, sizeof *metadata);
-    if (!remote_page_pending(r) || !remote_metadata_url(r->browser_url)) return false;
-    Response page = {.cancel = cancel, .collect_page = true};
-    if (fetch(r->browser_url, &page)) {
-        if (!page.page) {
-            Release file = *r;
-            if (!file_from_response(&file, &page, r->browser_url)) {
-                copy_text(metadata->filename, sizeof metadata->filename, file.filename);
-                metadata->size = file.size;
-                metadata->exact = true;
-            }
-        } else if (page.body && remote_metadata_url(page.url)) {
-            page_metadata(page.body, remote_browser_provider(page.url), metadata);
-        }
-    }
-    free(page.body);
-    return metadata->size > 0;
 }
 
 static bool resolve_href(const char *base, const char *href, char *out, size_t cap) {
@@ -383,20 +419,101 @@ static bool resolve_href(const char *base, const char *href, char *out, size_t c
     return ok;
 }
 
-static int page_link(const Response *page, Release *r, char *url, size_t cap) {
-    char href[2048], candidate[2048], filename[sizeof r->filename];
-    for (const char *tag = page->body; (tag = strstr(tag, "<a ")); tag += 3) {
+typedef struct {
+    char url[2048], filename[160];
+    bool pinned, recognized;
+} PageLink;
+
+static int page_link(const Response *page, const Release *r, const Release *locator, PageLink *link) {
+    for (const char *tag = page->body; (tag = strchr(tag, '<')); tag++) {
+        if ((tag[1] != 'a' && tag[1] != 'A') || !isspace((unsigned char)tag[2])) continue;
         const char *end = strchr(tag, '>');
         if (!end) break;
+        PageLink candidate = {0};
+        char href[sizeof candidate.url], named[sizeof candidate.filename];
         Release file = *r;
         if (!tag_value(tag, end, "href", href, sizeof href) ||
-            !resolve_href(page->url, href, candidate, sizeof candidate) ||
-            !strcmp(candidate, page->url) || *remote_browser_provider(candidate) ||
-            !remote_url_filename(candidate, filename, sizeof filename) || remote_file_format(&file, filename)) continue;
-        if (url[0] && strcmp(url, candidate)) return -2;
-        copy_text(url, cap, candidate);
+            !resolve_href(page->url, href, candidate.url, sizeof candidate.url) ||
+            !strcmp(candidate.url, page->url) || *remote_browser_provider(candidate.url)) continue;
+        bool download = tag_attribute(tag, end, "download", named, sizeof named);
+        if (!download) named[0] = 0;
+        if (*named && !safe_page_name(named)) continue;
+        if (*named) {
+            copy_text(candidate.filename, sizeof candidate.filename, named);
+            candidate.pinned = true;
+        } else if (!provider_disposition_name(candidate.url, candidate.filename, sizeof candidate.filename)) {
+            candidate.filename[0] = 0;
+            remote_url_filename(candidate.url, candidate.filename, sizeof candidate.filename);
+        }
+        if (locator) {
+            Release match = *locator;
+            if (!match.filename[0] && safe_page_name(candidate.filename)) {
+                int format = remote_file_format(&match, candidate.filename);
+                if (format > 0) continue;
+                if (format < 0 && candidate.pinned)
+                    copy_text(match.filename, sizeof match.filename, candidate.filename);
+            }
+            if (!provider_capture_url(&match, candidate.url)) continue;
+            if (match.filename[0]) {
+                copy_text(candidate.filename, sizeof candidate.filename, match.filename);
+                candidate.pinned = true;
+            }
+        } else {
+            int format = remote_file_format(&file, candidate.filename);
+            if (format > 0) continue;
+            candidate.recognized = !format;
+            if (!download && !candidate.recognized) {
+                char label[16];
+                const char *close = strchr(end + 1, '<');
+                if (!close || !html_text(end + 1, (size_t)(close - end - 1), label, sizeof label) ||
+                    strcasecmp(label, "Download")) continue;
+            }
+        }
+        if (!safe_page_name(candidate.filename)) candidate.filename[0] = 0;
+        if (link->url[0]) {
+            if (strcmp(link->url, candidate.url) || strcmp(link->filename, candidate.filename)) return -2;
+            candidate.pinned |= link->pinned;
+        }
+        *link = candidate;
     }
-    return url[0] ? 0 : -1;
+    return link->url[0] ? 0 : -1;
+}
+
+static void file_metadata(const Release *file, RemoteFileMetadata *metadata) {
+    copy_text(metadata->filename, sizeof metadata->filename, file->filename);
+    if (strcmp(file->format, "Unknown")) copy_text(metadata->format, sizeof metadata->format, file->format);
+    copy_text(metadata->compression, sizeof metadata->compression, file->compression);
+}
+
+bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, atomic_bool *cancel) {
+    memset(metadata, 0, sizeof *metadata);
+    if (!remote_page_pending(r) || !remote_metadata_url(r->browser_url)) return false;
+    Response page = {.cancel = cancel, .collect_page = true};
+    if (fetch(r->browser_url, &page)) {
+        Release file = *r;
+        if (!page.page) {
+            if (!file_from_response(&file, &page, r->browser_url, NULL)) {
+                file_metadata(&file, metadata);
+                metadata->size = file.size;
+                metadata->exact = true;
+            }
+        } else if (page.body && remote_metadata_url(page.url)) {
+            page_size(page.body, metadata);
+            char name[sizeof file.filename];
+            if (page_filename(page.body, r, name, sizeof name)) {
+                if (!remote_file_format(&file, name)) file_metadata(&file, metadata);
+                else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
+            } else if (!page.truncated) {
+                PageLink link = {0};
+                if (!page_link(&page, r, NULL, &link)) {
+                    if (!remote_file_format(&file, link.filename)) file_metadata(&file, metadata);
+                    else if (link.pinned) copy_text(metadata->filename, sizeof metadata->filename, link.filename);
+                }
+            }
+        }
+    }
+    free(page.body);
+    return metadata->size > 0 || metadata->filename[0];
 }
 
 static int archive_link(const Response *page, Release *r, char *url, size_t cap) {
@@ -439,31 +556,54 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
     int result = -1;
     if (!fetch(r->browser_url, &page)) goto done;
     if (!page.page) {
-        result = file_from_response(r, &page, r->browser_url) ? -1 : 0;
+        result = file_from_response(r, &page, r->browser_url, NULL) ? -1 : 0;
         goto done;
     }
     if (!page.body || !page.used) goto done;
     const char *provider = remote_browser_provider(page.url);
     if (*provider) {
-        char name[sizeof r->filename];
-        if (!page_filename(page.body, provider, name, sizeof name)) goto done;
         *locator = *r;
-        if (remote_file_format(locator, name)) goto done;
+        char name[sizeof r->filename];
+        if (page_filename(page.body, r, name, sizeof name)) {
+            if (remote_file_format(locator, name) > 0) goto done;
+            copy_text(locator->filename, sizeof locator->filename, name);
+        }
         copy_text(locator->source, sizeof locator->source, provider);
         /* The private matcher still enforces the provider's selected file route. */
         if (strlen(page.url) >= sizeof locator->browser_url) goto done;
         copy_text(locator->browser_url, sizeof locator->browser_url, page.url);
         copy_text(locator->url, sizeof locator->url, page.url);
         if (!provider_browser_supported(locator)) goto done;
-        result = 1;
-    } else {
+    }
+    if (!strncmp(page.url, "https://archive.org/details/", 28)) {
         char direct[sizeof r->url] = "";
-        int link = !strncmp(page.url, "https://archive.org/details/", 28)
-            ? archive_link(&page, r, direct, sizeof direct)
-            : page.truncated ? -1 : page_link(&page, r, direct, sizeof direct);
+        int link = archive_link(&page, r, direct, sizeof direct);
         if (!link && !remote_download_verify(r, direct, cancel, error, cap)) result = 0;
         if (link == -2) copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
+        goto done;
     }
+    PageLink link = {0};
+    int found = page.truncated ? -1 : page_link(&page, r, *provider ? locator : NULL, &link);
+    if (!found) {
+        Release file = *r;
+        Response response = {.cancel = cancel};
+        char heading[sizeof file.filename];
+        const char *name = NULL;
+        if (link.pinned) {
+            name = link.filename;
+            copy_text(file.filename, sizeof file.filename, name);
+        } else if (!*provider && !link.recognized && page_filename(page.body, r, heading, sizeof heading)) {
+            name = heading;
+        }
+        if (fetch(link.url, &response) && !file_from_response(&file, &response, link.url, name)) {
+            *r = file;
+            result = 0;
+            goto done;
+        }
+    }
+    if (*provider) result = 1;
+    else if (found == -2)
+        copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
 done:
     free(page.body);
     if (result < 0 && !error[0])

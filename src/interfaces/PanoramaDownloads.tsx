@@ -199,7 +199,7 @@ export function PanoramaDownloads({
         glyph={job.status === "error" ? "warn" : undefined}
         kicker={
           focused && size === "large"
-            ? [extracting ? t("Extracting") : status, release && releaseProvider(release), release && formatLabel(release)].filter(Boolean).join(" · ")
+            ? [extracting ? t("Extracting") : status, release && releaseProvider(release), formatLabel(job)].filter(Boolean).join(" · ")
             : undefined
         }
         title={title}
