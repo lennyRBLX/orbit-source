@@ -20,7 +20,6 @@
 #define RESPONSE_MAX (1024 * 1024)
 #define HOST_TTL 600
 #define HOST_COUNT 4
-#define COMMUNITY_HOST_COUNT 256
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
@@ -63,7 +62,7 @@ static struct {
     time_t checked, retry_at, next_check;
     unsigned revision;
     struct { bool available; int64_t limit; } hosts[HOST_COUNT];
-    DebridHost community_hosts[COMMUNITY_HOST_COUNT];
+    DebridHost *community_hosts;
     size_t community_host_count;
 } debrid;
 typedef struct {
@@ -187,7 +186,7 @@ static void message(const cJSON *json, long status, char *err, size_t cap) {
     /* Never relay upstream text: it may contain credentials, a URL or account data. */
     copy_text(err, cap, text);
 }
-static cJSON *call(const char *key, const char *path, const char *form, bool bearer,
+static cJSON *call(const char *key, const char *path, const char *link, bool bearer,
                    Job *job, time_t *retry, char *err, size_t cap, bool *rejected) {
     if (rejected) *rejected = false;
     const char *base = api_base();
@@ -197,13 +196,28 @@ static cJSON *call(const char *key, const char *path, const char *form, bool bea
     Reply reply = {.job = job};
     CURL *curl = curl_easy_init(); struct curl_slist *h = NULL;
     if (!curl) { copy_text(err, cap, "Could not initialize TorBox HTTPS."); return NULL; }
+    curl_mime *form = NULL;
+    if (link) {
+        form = curl_mime_init(curl);
+        curl_mimepart *url_part = form ? curl_mime_addpart(form) : NULL;
+        curl_mimepart *queued_part = form ? curl_mime_addpart(form) : NULL;
+        if (!url_part || !queued_part || curl_mime_name(url_part, "link") ||
+            curl_mime_data(url_part, link, CURL_ZERO_TERMINATED) || curl_mime_name(queued_part, "as_queued") ||
+            curl_mime_data(queued_part, "false", CURL_ZERO_TERMINATED) ||
+            curl_easy_setopt(curl, CURLOPT_MIMEPOST, form)) {
+            curl_easy_cleanup(curl);
+            curl_mime_free(form);
+            if (rejected) *rejected = true;
+            copy_text(err, cap, "Could not prepare the TorBox request.");
+            return NULL;
+        }
+    }
     if (bearer) {
         snprintf(authorization, sizeof authorization, "Authorization: Bearer %s", key);
         h = curl_slist_append(h, authorization);
         OPENSSL_cleanse(authorization, sizeof authorization);
     }
     h = curl_slist_append(h, "Accept: application/json");
-    if (form) h = curl_slist_append(h, "Content-Type: application/x-www-form-urlencoded");
     struct curl_blob ca = {(void *)orbit_ca, sizeof orbit_ca - 1, CURL_BLOB_COPY};
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca);
@@ -219,7 +233,6 @@ static cJSON *call(const char *key, const char *path, const char *form, bool bea
     curl_easy_setopt(curl, CURLOPT_PROXY, "");
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, provider_open_socket);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
-    if (form) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, form);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "OrbitStore/" ORBIT_VERSION);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
@@ -234,13 +247,15 @@ static cJSON *call(const char *key, const char *path, const char *form, bool bea
     CURLcode rc = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &reply.status);
     curl_easy_cleanup(curl);
+    curl_mime_free(form);
     for (struct curl_slist *p = h; p; p = p->next) OPENSSL_cleanse(p->data, strlen(p->data));
     curl_slist_free_all(h); OPENSSL_cleanse(url, sizeof url);
     cJSON *json = rc == CURLE_OK && reply.body ? cJSON_Parse(reply.body) : NULL;
     if (reply.body) { OPENSSL_cleanse(reply.body, reply.length); free(reply.body); }
     if (reply.status == 429 && reply.retry_at < time(NULL) + 60) reply.retry_at = time(NULL) + 60;
     if (reply.retry_at > *retry) *retry = reply.retry_at;
-    if (rc != CURLE_OK || reply.status != 200 || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "success"))) {
+    bool success_status = reply.status >= 200 && reply.status < 300;
+    if (rc != CURLE_OK || !success_status || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "success"))) {
         /* A complete rejection can be retried. A lost response or server failure
            may have created a remote item, so the queue must reconcile first. */
         bool removed = rejected && rc == CURLE_OK && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success")) &&
@@ -248,7 +263,7 @@ static cJSON *call(const char *key, const char *path, const char *form, bool bea
         if (rejected && rc == CURLE_OK &&
             (removed || reply.status == 400 || reply.status == 401 || reply.status == 403 || reply.status == 404 ||
              reply.status == 410 || reply.status == 422 || reply.status == 429 ||
-             (reply.status == 200 && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success")) &&
+             (success_status && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success")) &&
               strcmp(json_text(json, "error"), "DUPLICATE_ITEM")))) *rejected = true;
         if (rc != CURLE_OK) copy_text(err, cap, halted(job) ? "TorBox request stopped." : "Could not reach TorBox. Check your connection and retry.");
         else if (removed) copy_text(err, cap, SOURCE_REMOVED);
@@ -313,7 +328,7 @@ static void pause_jobs_locked(void) {
 static void check_account(const char *key) {
     char err[256] = {0}, account[65] = {0}; time_t retry = 0;
     bool available[HOST_COUNT] = {0}; int64_t limits[HOST_COUNT] = {0};
-    DebridHost community_hosts[COMMUNITY_HOST_COUNT] = {0};
+    DebridHost *community_hosts = NULL;
     size_t community_count = 0;
     cJSON *user = call(key, "/user/me?settings=false", NULL, true, NULL, &retry, err, sizeof err, NULL);
     bool ok = user && account_hash(cJSON_GetObjectItemCaseSensitive(user, "data"), account);
@@ -322,7 +337,23 @@ static void check_account(const char *key) {
     cJSON *hosters = ok ? call(key, "/webdl/hosters", NULL, true, NULL, &retry, err, sizeof err, NULL) : NULL;
     const cJSON *hosts = cJSON_GetObjectItemCaseSensitive(hosters, "data"), *host;
     ok = ok && cJSON_IsArray(hosts);
-    cJSON_ArrayForEach(host, hosts) {
+    if (ok) {
+        /* The same hoster can advertise several domains. Size the lookup from
+         * the response so later aliases remain available to community links. */
+        size_t domain_count = 0;
+        cJSON_ArrayForEach(host, hosts) {
+            const cJSON *domains = cJSON_GetObjectItemCaseSensitive(host, "domains");
+            if (cJSON_IsArray(domains)) domain_count += (size_t)cJSON_GetArraySize(domains);
+        }
+        if (domain_count) {
+            community_hosts = calloc(domain_count, sizeof *community_hosts);
+            if (!community_hosts) {
+                ok = false;
+                copy_text(err, sizeof err, "Could not store TorBox host availability.");
+            }
+        }
+    }
+    cJSON_ArrayForEach(host, (ok ? hosts : NULL)) {
         int64_t limit = 0, daily = 0, used = 0, links = 0, link_used = 0;
         /* Host size metadata is advisory. Let createwebdownload decide for this account. */
         identifier(host, "per_link_size_limit", &limit);
@@ -332,8 +363,8 @@ static void check_account(const char *key) {
                      (identifier(host, "daily_link_used", &link_used) && link_used < links);
         bool up = bandwidth && count && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(host, "status"));
         int64_t ceiling = daily > used && (!limit || daily - used < limit) ? daily - used : limit;
-        const cJSON *domain;
-        cJSON_ArrayForEach(domain, cJSON_GetObjectItemCaseSensitive(host, "domains")) {
+        const cJSON *domains = cJSON_GetObjectItemCaseSensitive(host, "domains"), *domain;
+        cJSON_ArrayForEach(domain, (cJSON_IsArray(domains) ? domains : NULL)) {
             if (!cJSON_IsString(domain)) continue;
             const char *name = bare_domain(domain->valuestring);
             int index = domain_host(name);
@@ -343,7 +374,6 @@ static void check_account(const char *key) {
                 continue;
             size_t i = 0;
             while (i < community_count && strcasecmp(name, community_hosts[i].name)) i++;
-            if (i == COMMUNITY_HOST_COUNT) continue;
             if (i == community_count) community_count++;
             DebridHost *entry = &community_hosts[i];
             copy_text(entry->name, sizeof entry->name, name);
@@ -368,8 +398,10 @@ static void check_account(const char *key) {
             copy_text(debrid.key, sizeof debrid.key, key); copy_text(debrid.account, sizeof debrid.account, account);
             debrid.connected = true; debrid.checked = time(NULL);
             for (int i = 0; i < HOST_COUNT; i++) { debrid.hosts[i].available = available[i]; debrid.hosts[i].limit = limits[i]; }
-            memcpy(debrid.community_hosts, community_hosts, community_count * sizeof community_hosts[0]);
+            free(debrid.community_hosts);
+            debrid.community_hosts = community_hosts;
             debrid.community_host_count = community_count;
+            community_hosts = NULL;
             debrid.revision++;
         }
     }
@@ -386,6 +418,7 @@ static void check_account(const char *key) {
     if (debrid.next_check < debrid.retry_at) debrid.next_check = debrid.retry_at;
     debrid.busy = false;
     pthread_mutex_unlock(&orbit.mutex);
+    free(community_hosts);
 }
 static void *worker(void *unused) {
     (void)unused;
@@ -437,6 +470,9 @@ void debrid_stop(void) {
     if (debrid.started) pthread_join(debrid.thread, NULL);
     pthread_mutex_lock(&orbit.mutex);
     debrid.connected = false;
+    free(debrid.community_hosts);
+    debrid.community_hosts = NULL;
+    debrid.community_host_count = 0;
     OPENSSL_cleanse(debrid.key, sizeof debrid.key); OPENSSL_cleanse(debrid.pending_key, sizeof debrid.pending_key);
     pthread_mutex_unlock(&orbit.mutex);
 }
@@ -605,15 +641,8 @@ int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *re
         if (listing) { *retry_at = listed_by; result = 0; goto end; }
         if (!saved) { copy_text(err, cap, "Could not save the TorBox submission state."); goto end; }
         if (time(NULL) < next) { *retry_at = next; result = 0; goto end; }
-        char *escaped = curl_easy_escape(NULL, original_url, 0);
-        char form[8192];
-        if (!escaped) {
-            pthread_mutex_lock(&orbit.mutex); job->debrid_submitted = false; state_save_locked(); pthread_mutex_unlock(&orbit.mutex);
-            copy_text(err, cap, "Could not prepare the TorBox request."); goto end;
-        }
-        snprintf(form, sizeof form, "link=%s&as_queued=false", escaped); curl_free(escaped);
         bool rejected = false;
-        cJSON *created = call(key, "/webdl/createwebdownload", form, true, job, retry_at, err, cap, &rejected);
+        cJSON *created = call(key, "/webdl/createwebdownload", original_url, true, job, retry_at, err, cap, &rejected);
         int64_t id = -1;
         bool valid = created && identifier(cJSON_GetObjectItemCaseSensitive(created, "data"), "webdownload_id", &id);
         cJSON_Delete(created);
