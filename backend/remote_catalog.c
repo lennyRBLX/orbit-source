@@ -139,6 +139,10 @@ bool remote_page_pending(const Release *r) {
     return r->remote_page && !r->url[0];
 }
 
+bool job_needs_browser(const Release *r) {
+    return remote_page_pending(r) || (!provider_supported(r) && provider_browser_supported(r));
+}
+
 /* Expose the provider domain without returning the private catalogue URL. */
 static bool url_host(const char *url, char *host, size_t cap) {
     CURLU *parts = curl_url();
@@ -159,7 +163,7 @@ static bool url_host(const char *url, char *host, size_t cap) {
 }
 
 bool remote_link_host(const Release *r, char *host, size_t cap) {
-    return url_host(r->remote_page ? r->browser_url : r->url, host, cap);
+    return url_host(provider_torbox_url(r), host, cap);
 }
 
 bool remote_metadata_url(const char *url) {

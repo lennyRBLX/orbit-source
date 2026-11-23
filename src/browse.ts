@@ -127,6 +127,14 @@ export function newlyAddedGames(games: Game[], latest: Game[] = []): Game[] {
 // Source's "TorBox available" choice: options from the sources TorBox can download right now,
 // as a game page shows them (torbox: those sourceIds; none while TorBox isn't connected).
 export const TORBOX_SOURCE = "torbox";
+export function releaseHasTorboxHost(r: Release, hosts: ReadonlySet<string>) {
+  return (r.torboxHosts ?? [r.torboxHost || r.sourceId]).some((host) => {
+    if (hosts.has(host)) return true;
+    for (let dot = host.indexOf("."); dot !== -1; dot = host.indexOf(".", dot + 1))
+      if (hosts.has(host.slice(dot + 1))) return true;
+    return false;
+  });
+}
 // installed: the IDs of games in the PS5's Library, for hideInstalled.
 // A download option matches when it passes every filter that applies to options; a game shows
 // in Browse when one of its options does.
@@ -134,7 +142,7 @@ export function releaseMatches(r: Release, filters: BrowseFilters, torbox: Reado
   if (filters.platform && (r.homebrew ? "homebrew" : gamePlatform(r)) !== filters.platform) return false;
   if (filters.source.length && !filters.source.includes(r.sourceId) &&
       !(filters.source.includes(TORBOX_SOURCE) &&
-        (r.torboxHosts ?? [r.torboxHost || r.sourceId]).some((host) => torbox.has(host))))
+        releaseHasTorboxHost(r, torbox)))
     return false;
   const formats = downloadFormats(filters.format);
   if (formats.length && !formats.includes(releaseFormat(r))) return false;

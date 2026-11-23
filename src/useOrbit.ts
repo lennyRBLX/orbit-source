@@ -165,7 +165,7 @@ export function useOrbit() {
   const download = async (
     releaseId: string,
     storageId: string,
-    delivery: "direct" | "torbox" = "direct",
+    delivery?: "direct" | "torbox",
   ) => {
     await api("/downloads", { releaseId, storageId, delivery });
     await polling.current;

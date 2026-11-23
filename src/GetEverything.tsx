@@ -28,7 +28,6 @@ import {
   type ChecklistRow,
   type RowProgress,
 } from "./bundle";
-import { preferredDelivery, type DebridStatus } from "./Debrid";
 import { rememberChoice } from "./downloadChoice";
 import { placeName, t } from "./i18n";
 import { Icon } from "./components";
@@ -72,17 +71,15 @@ export function useEverything({
   jobs,
   library,
   system,
-  debrid,
   catalog,
 }: {
   game: Game;
   release: Release;
-  delivery: "direct" | "torbox";
+  delivery?: "direct" | "torbox";
   drive: Storage | undefined;
   jobs: Job[];
   library: LibraryGame[];
   system: System | null;
-  debrid: DebridStatus | null;
   catalog: BundleCatalog;
 }) {
   const rows = useMemo(
@@ -124,7 +121,7 @@ export function useEverything({
           drive.id,
           chosen.map((r) => ({
             release: r.release,
-            delivery: r.kind === "game" && r.release.id === release.id ? delivery : preferredDelivery(debrid, r.release),
+            delivery: r.kind === "game" && r.release.id === release.id ? delivery : undefined,
           })),
           true,
         ),

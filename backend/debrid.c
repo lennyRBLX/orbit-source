@@ -19,31 +19,18 @@
 #define KEY_CAP 513
 #define RESPONSE_MAX (1024 * 1024)
 #define HOST_TTL 600
-#define HOST_COUNT 4
+#define HOST_COUNT 5
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
-static const char *const host_sources[HOST_COUNT] = {"archive", "vikingfile", "datanodes", "1fichier"};
-static int source_host(const char *source) {
-    if (source)
-        for (int i = 0; i < HOST_COUNT; i++)
-            if (!strcmp(source, host_sources[i])) return i;
-    return -1;
-}
+static const char *const host_sources[HOST_COUNT] = {"archive", "vikingfile", "datanodes", "1fichier", "akirabox"};
 static int domain_host(const char *domain) {
     if (!strcmp(domain, "archive.org")) return 0;
     if (!strcmp(domain, "vikingfile.com") || !strcmp(domain, "vik1ngfile.site")) return 1;
     if (!strcmp(domain, "datanodes.to")) return 2;
     if (!strcmp(domain, "1fichier.com")) return 3;
+    if (!strcmp(domain, "akirabox.com") || !strcmp(domain, "akirabox.to")) return 4;
     return -1;
-}
-/* Prefer DataNodes' permanent file page over an expiring browser-captured URL.
- * Existing Archive.org/Vikingfile queue identities remain unchanged. */
-static const char *source_url(const Release *release) {
-    if (!strcmp(release->source, "remote") && release->remote_page)
-        return release->browser_url;
-    return (!strcmp(release->source, "datanodes") || !strcmp(release->source, "1fichier")) && provider_browser_supported(release)
-        ? release->browser_url : release->url;
 }
 typedef struct {
     char name[254];
@@ -368,7 +355,7 @@ static void check_account(const char *key) {
             if (!cJSON_IsString(domain)) continue;
             const char *name = bare_domain(domain->valuestring);
             int index = domain_host(name);
-            if (index >= 0) { available[index] = up; limits[index] = ceiling; }
+            if (index >= 0 && up) { available[index] = true; limits[index] = ceiling; }
             if (!*name || strlen(name) >= sizeof community_hosts[0].name ||
                 strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-") != strlen(name))
                 continue;
@@ -534,18 +521,21 @@ int debrid_action(const cJSON *input, char *err, size_t cap) {
 /* -1 means no currently usable host. Zero is an unreported size limit. */
 static int64_t covered_limit(const Release *r) {
     if (!r || !strcmp(r->id, "orbit-network-check")) return -1;
-    if (!strcmp(r->source, "remote")) {
-        char host[sizeof debrid.community_hosts[0].name];
-        if (!remote_link_host(r, host, sizeof host)) return -1;
-        for (size_t i = 0; i < debrid.community_host_count; i++) {
-            const DebridHost *entry = &debrid.community_hosts[i];
-            if (entry->available && !strcmp(host, entry->name)) return entry->limit;
-        }
-        return -1;
+    if (!remote_page_pending(r) && !provider_supported(r) && !provider_browser_supported(r)) return -1;
+    if (!strcmp(r->source, ORBIT_DIRECT_SOURCE)) return -1;
+    char host[sizeof debrid.community_hosts[0].name];
+    if (!remote_link_host(r, host, sizeof host)) return -1;
+    int64_t limit = -1;
+    size_t length = strlen(host), matched = 0;
+    for (size_t i = 0; i < debrid.community_host_count; i++) {
+        const DebridHost *entry = &debrid.community_hosts[i];
+        size_t n = strlen(entry->name);
+        if (n <= matched || n > length || (n < length && host[length - n - 1] != '.') ||
+            strcmp(host + length - n, entry->name)) continue;
+        matched = n;
+        limit = entry->available ? entry->limit : -1;
     }
-    int host = source_host(r->source);
-    return host >= 0 && debrid.hosts[host].available && (provider_supported(r) || provider_browser_supported(r))
-        ? debrid.hosts[host].limit : -1;
+    return limit;
 }
 static bool current_account(void) {
     return debrid.connected && debrid.key[0] && time(NULL) < debrid.checked + HOST_TTL;
@@ -553,21 +543,22 @@ static bool current_account(void) {
 bool debrid_link_covered_locked(const Release *r) {
     return current_account() && covered_limit(r) >= 0;
 }
+bool debrid_job_account_locked(const Job *job) {
+    return debrid.connected && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
+}
 static bool covered_option(const Release *r) {
     if (!r || !current_account()) return false;
-    int64_t limit = covered_limit(r);
-    if (limit >= 0 && (!limit || r->size <= limit)) return true;
+    if (covered_limit(r) >= 0) return true;
     Release mirror;
     char after[sizeof mirror.id] = "";
     while (remote_next_mirror_locked(r, after, &mirror)) {
-        limit = covered_limit(&mirror);
-        if (limit >= 0 && (!limit || r->size <= limit)) return true;
+        if (covered_limit(&mirror) >= 0) return true;
         copy_text(after, sizeof after, mirror.id);
     }
     return false;
 }
 bool debrid_default_locked(const Release *r) {
-    return !strcmp(orbit.last_delivery, "torbox") && !debrid.busy && covered_option(r);
+    return !debrid.busy && covered_option(r);
 }
 int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
     if (!debrid.connected || !debrid.key[0]) { copy_text(err, cap, "Connect TorBox in App settings first."); return 409; }
@@ -591,16 +582,22 @@ static cJSON *find_item(cJSON *reply, Job *job, const char *original_url) {
     return NULL;
 }
 int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at, char *err, size_t cap) {
-    const char *original_url = source_url(route);
+    const char *original_url = provider_torbox_url(route);
     const bool using_mirror = route != &job->release;
     char key[KEY_CAP], path[2048]; int result = -1;
     pthread_mutex_lock(&orbit.mutex);
-    bool account = debrid.connected && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
+    bool account = debrid_job_account_locked(job);
     bool checking = debrid.busy && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
+    bool covered = debrid_link_covered_locked(route);
     copy_text(key, sizeof key, account ? debrid.key : "");
     pthread_mutex_unlock(&orbit.mutex);
     if (!account && checking) { *retry_at = time(NULL) + 5; result = 0; goto end; }
     if (!account) { copy_text(err, cap, "Reconnect the original TorBox account before resuming this download."); goto end; }
+    if (!covered) {
+        if (checking) { *retry_at = time(NULL) + 5; result = 0; goto end; }
+        copy_text(err, cap, "TorBox is unavailable for this option. Choose the original source or check App settings.");
+        goto end;
+    }
     if (halted(job)) goto end;
     snprintf(path, sizeof path, job->debrid_id >= 0 ? "/webdl/mylist?id=%lld&bypass_cache=true" : "/webdl/mylist?limit=1000&bypass_cache=true", (long long)job->debrid_id);
     cJSON *list = call(key, path, NULL, true, job, retry_at, err, cap, NULL);

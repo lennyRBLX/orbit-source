@@ -463,3 +463,10 @@ bool provider_capture_url(const Release *release, const char *candidate) {
     if (!resolved.filename[0] && !page_bound_filename(&resolved)) return false;
     return provider_supported(&resolved);
 }
+
+const char *provider_torbox_url(const Release *r) {
+    /* Submit the stable page for these providers, including after capture. */
+    if (r->remote_page || ((!strcmp(r->source, "datanodes") || !strcmp(r->source, "1fichier") ||
+        !strcmp(r->source, "akirabox")) && provider_browser_supported(r))) return r->browser_url;
+    return r->url;
+}

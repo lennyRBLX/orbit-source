@@ -19,6 +19,7 @@ static struct {
     bool check_account, resolving;
     atomic_bool cancel;
     char id[33], state[16], message[256], job_id[33], title[128], client_id[65];
+    char queued_job_id[sizeof ((Job *)0)->id];
     char mirror_page[128];
     char native_failure[256];
     Release release;
@@ -83,6 +84,11 @@ static const char *native_failure_message(const char *failure) {
 }
 static bool selected_locked(void) {
     if (session.account || !strcmp(session.release.source, ORBIT_DIRECT_SOURCE)) return true;
+    if (session.queued_job_id[0]) {
+        const Job *j = job_find(session.queued_job_id);
+        return j && j->browser_pending && !j->cancel && !j->pause &&
+            !strcmp(j->status, "verifying") && source_enabled_locked(&j->release);
+    }
     if (session.refresh_job.id[0]) {
         const Job *j = job_find(session.refresh_job.id), *p = &session.refresh_job;
         return job_can_refresh_link(j) && source_enabled_locked(&j->release) &&
@@ -340,6 +346,41 @@ static bool resolve_community(Release *selected, char *etag, char *modified, cha
     return true;
 }
 
+static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
+                                 const char *etag, const char *modified, char *error, size_t cap) {
+    if (!j || !j->browser_pending || strcmp(j->status, "verifying")) return;
+    j->delivery_phase[0] = 0;
+    const char *status = "error";
+    if (orbit.stop || session.stop || j->pause || !source_enabled_locked(&j->release)) {
+        status = "paused";
+    } else if (j->cancel || atomic_load(&session.cancel)) {
+        status = "cancelled";
+    } else if (ok) {
+        j->browser_pending = false;
+        copy_text(j->status, sizeof j->status, "queued");
+        copy_text(j->etag, sizeof j->etag, etag);
+        copy_text(j->modified, sizeof j->modified, modified);
+        if (job_assign_remote_file_locked(j, resolved, error, cap)) {
+            copy_text(session.job_id, sizeof session.job_id, j->id);
+            state_locked("queued", "Your verified file has been added to Downloads.");
+            session.queued_ms = milliseconds() - session.started_ms;
+            pthread_cond_broadcast(&orbit.changed);
+            return;
+        }
+        j->browser_pending = true;
+        j->etag[0] = j->modified[0] = 0;
+    }
+    copy_text(j->status, sizeof j->status, status);
+    if (!strcmp(status, "error")) {
+        copy_text(j->error, sizeof j->error, error[0] ? error : "Verification stopped. Return to Orbit to try again.");
+        state_locked("failed", j->error);
+    } else {
+        state_locked("cancelled", "Verification cancelled");
+    }
+    (void)state_save_locked();
+    pthread_cond_broadcast(&orbit.changed);
+}
+
 static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
@@ -439,7 +480,10 @@ static void *worker(void *unused) {
         pthread_mutex_unlock(&orbit.mutex);
         if (ok && !validated) ok = !validate_capture(&resolved, etag, modified, error, sizeof error);
         pthread_mutex_lock(&orbit.mutex);
-        if (session.stop || atomic_load(&session.cancel)) {
+        if (session.queued_job_id[0]) {
+            finish_queued_locked(job_find(session.queued_job_id), &resolved, ok,
+                                 etag, modified, error, sizeof error);
+        } else if (session.stop || atomic_load(&session.cancel)) {
             if (session.native_failure[0]) state_locked("failed", session.native_failure);
             else state_locked("cancelled", "Verification cancelled. No download was added.");
         } else if (!selected_locked()) {
@@ -474,6 +518,7 @@ static void *worker(void *unused) {
         memset(&resolved, 0, sizeof resolved);
         memset(&session.release, 0, sizeof session.release);
         session.mirror_page[0] = 0;
+        session.queued_job_id[0] = 0;
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
         session.finished_ms = milliseconds() - session.started_ms;
         session.resolving = session.busy = false;
@@ -498,6 +543,44 @@ static int start_worker_locked(void) {
     pthread_attr_destroy(&attr);
     session.thread_started = !rc;
     return rc;
+}
+static void begin_download_locked(const Release *r, const Storage *storage, const Job *refresh,
+                                  bool native, const char *client, bool return_to_browser) {
+    session.account = session.check_account = false;
+    session.resolving = remote_page_pending(r) || !strcmp(r->source, "vikingfile");
+    session.release = *r;
+    if (storage) session.storage = *storage;
+    session.native_dialog = native;
+    session.dialog_opened = false;
+    session.native_failure[0] = 0;
+    copy_text(session.client_id, sizeof session.client_id, native ? client : "");
+    session.return_to_browser = return_to_browser;
+    memset(&session.refresh_job, 0, sizeof session.refresh_job);
+    if (refresh) session.refresh_job = *refresh;
+    copy_text(session.title, sizeof session.title, r->title);
+    random_hex(session.id, 16);
+    session.job_id[0] = 0;
+    session.started_ms = milliseconds();
+    session.capture_ms = session.link_ms = session.validation_ms = 0;
+    session.queued_ms = session.finished_ms = 0;
+    session.scanned_bytes = session.candidates = session.browser_processes = 0;
+    reset_diagnostics_locked(r->source, refresh ? "link-refresh" : "download");
+    session.busy = session.pending = true;
+    atomic_store(&session.cancel, false);
+    state_locked(session.resolving ? "validating" : "opening", remote_page_pending(r)
+        ? "Reading the community catalogue download option…"
+        : session.resolving ? "Checking sign-in…" : "Opening the download page on your PS5…");
+    pthread_cond_signal(&session.changed);
+}
+int browser_start_queued_locked(Job *j, char *error, size_t cap) {
+    if (session.busy) return 0;
+    if (!session.ready || session.stop || !available() || start_worker_locked()) {
+        copy_text(error, cap, "Provider verification could not start. Try again.");
+        return -1;
+    }
+    copy_text(session.queued_job_id, sizeof session.queued_job_id, j->id);
+    begin_download_locked(&j->release, NULL, NULL, false, "", true);
+    return 1;
 }
 void browser_stop(void) {
     pthread_mutex_lock(&orbit.mutex);
@@ -742,32 +825,8 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
                 code = 503;
                 goto done;
             }
-            session.account = false;
-            session.check_account = false;
-            session.resolving = remote_page_pending(r) || !strcmp(r->source, "vikingfile");
-            session.release = *r; session.storage = *s;
-            session.native_dialog = cJSON_IsTrue(dialog);
-            session.dialog_opened = false;
-            session.native_failure[0] = 0;
-            copy_text(session.client_id, sizeof session.client_id, session.native_dialog ? client : "");
-            session.return_to_browser = (target && !strcmp(target->valuestring, "browser")) || cJSON_IsTrue(legacy);
-            memset(&session.refresh_job, 0, sizeof session.refresh_job);
-            if (refreshing) session.refresh_job = *job;
-            copy_text(session.title, sizeof session.title, r->title);
-            random_hex(session.id, 16);
-            session.job_id[0] = 0;
-            session.started_ms = milliseconds();
-            session.capture_ms = session.link_ms = session.validation_ms = 0;
-            session.queued_ms = session.finished_ms = 0;
-            session.scanned_bytes = 0;
-            session.candidates = session.browser_processes = 0;
-            reset_diagnostics_locked(r->source, refreshing ? "link-refresh" : "download");
-            session.busy = session.pending = true;
-            atomic_store(&session.cancel, false);
-            state_locked(session.resolving ? "validating" : "opening", remote_page_pending(r)
-                ? "Reading the community catalogue download option…"
-                : session.resolving ? "Checking sign-in…" : "Opening the download page on your PS5…");
-            pthread_cond_signal(&session.changed);
+            begin_download_locked(r, s, job, cJSON_IsTrue(dialog), client,
+                (target && !strcmp(target->valuestring, "browser")) || cJSON_IsTrue(legacy));
             code = 202;
         }
     }
@@ -790,4 +849,8 @@ void browser_source_changed_locked(void) {
 void browser_job_changed_locked(const char *id) {
     if (session.busy && session.refresh_job.id[0] && !strcmp(session.refresh_job.id, id))
         atomic_store(&session.cancel, true);
+    if (session.busy && session.queued_job_id[0] && !strcmp(session.queued_job_id, id)) {
+        const Job *j = job_find(id);
+        if (j && (j->pause || j->cancel)) atomic_store(&session.cancel, true);
+    }
 }

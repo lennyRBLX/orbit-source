@@ -5,7 +5,7 @@ import { api } from "./api";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./components";
 import { GameSheet, PadSymbol, type SheetView } from "./GameSheet";
-import { useDebrid, torboxAvailable, preferredDelivery } from "./Debrid";
+import { useDebrid, torboxAvailable } from "./Debrid";
 import {
   bytes,
   formatLabel,
@@ -214,13 +214,12 @@ export function Details({
     planned = space?.planned,
     afterDownload = space?.after ?? 0,
     enough = space?.enough;
-  const delivery = deliveryChoice ?? preferredDelivery(debrid.status, release);
-  const torbox = delivery === "torbox";
   const canTorbox = torboxAvailable(debrid.status, release);
+  const torbox = canTorbox && deliveryChoice !== "direct";
   const useBrowser = !!release.browserAvailable && !torbox;
   const resolveCommunityOption = useBrowser && release.sourceId === "remote";
   // Get everything: this option with its DLC, on the drive Download uses.
-  const everything = useEverything({ game, release, delivery, drive, jobs, library, system, debrid: debrid.status, catalog });
+  const everything = useEverything({ game, release, delivery: deliveryChoice ?? undefined, drive, jobs, library, system, catalog });
   const closeEverything = () => {
     everything.dismiss();
     setSheet(null);
@@ -242,7 +241,6 @@ export function Details({
   const downloadUnavailable =
     !game.releases.some((option) => option.id === releaseId) ||
     pending ||
-    (torbox && !canTorbox) ||
     !!browser?.active ||
     !enough ||
     !(
@@ -266,7 +264,7 @@ export function Details({
     setError("");
     try {
       if (!drive) return;
-      await download(release.id, drive.id, delivery);
+      await download(release.id, drive.id, deliveryChoice ?? undefined);
       openQueue();
     } catch (e) {
       setError((e as Error).message);
@@ -328,7 +326,7 @@ export function Details({
       viewLibrary();
     else {
       rememberChoice(release);
-      void (useBrowser ? verifyProvider() : start());
+      void (useBrowser && deliveryChoice === "direct" ? verifyProvider() : start());
     }
   }
   const actionLabel = !system?.paired

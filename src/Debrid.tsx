@@ -3,6 +3,7 @@ import { api } from "./api";
 import { type Release } from "./types";
 import { t } from "./i18n";
 import { rich } from "./Rich";
+import { releaseHasTorboxHost } from "./browse";
 export interface DebridStatus {
   provider: "torbox";
   available: boolean;
@@ -12,22 +13,13 @@ export interface DebridStatus {
   checkedAt: number;
   retryAt: number;
   revision: number;
-  lastDelivery?: "direct" | "torbox";
   hosts: { sourceId: string; available: boolean; maxFileSize: number }[];
   domains?: { host: string; maxFileSize: number }[];
 }
 function availableHost(status: DebridStatus | null, release: Release) {
-  if (release.sourceId === "remote") {
-    const hosts = release.torboxHosts ?? [release.torboxHost];
-    const configured = status?.domains?.filter((host) => hosts.includes(host.host));
-    return configured?.find((host) => !host.maxFileSize || release.sizeBytes <= host.maxFileSize) ?? configured?.[0];
-  }
-  return status?.hosts.find((host) => host.available && host.sourceId === release.sourceId);
-}
-export function preferredDelivery(status: DebridStatus | null, release: Release): "direct" | "torbox" {
-  const host = availableHost(status, release);
-  return status?.lastDelivery === "torbox" && torboxAvailable(status, release) &&
-    (!host?.maxFileSize || release.sizeBytes <= host.maxFileSize) ? "torbox" : "direct";
+  if (release.torboxHost || release.torboxHosts)
+    return releaseHasTorboxHost(release, new Set(status?.domains?.map((host) => host.host)));
+  return status?.hosts.some((host) => host.available && host.sourceId === release.sourceId);
 }
 export function torboxAvailable(status: DebridStatus | null, release: Release) {
   return (
@@ -114,7 +106,7 @@ export function Debrid() {
       tabIndex={-1}
     >
       <h2 id="debrid-heading">{t("Debrid")}</h2>
-      <p>{t("Connect TorBox to download supported links through your own account. Choose TorBox on a game's download page; your files still save to the selected PS5 drive.")}</p>
+      <p>{t("Orbit tries supported links through your TorBox account first, then uses the original provider if needed.")}</p>
       <p className="fine">{t("TorBox plan, host and file-size limits apply. Orbit does not purchase a plan or remove files from your TorBox account.")}</p>
       <p className="fine">{t("These limits come from TorBox's web-download service, including remaining daily allowance. Orbit automatically uses higher limits when TorBox reports them.")}</p>
       <p role="status">

@@ -341,7 +341,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         return 404;
     }
     bool torbox = delivery && !strcmp(delivery, "torbox");
-    bool pending_file = torbox && !strcmp(r->source, "remote") && remote_page_pending(r);
+    bool pending_file = remote_page_pending(r);
     /* The catalogue already leaves other formats out; refuse any that reaches here anyway. */
     if (!pending_file && !orbit_format_allowed(r)) {
         copy_text(err, cap, "Orbit downloads PKG, FPKG and game-folder options only.");
@@ -372,10 +372,16 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
                 copy_text(after, sizeof after, mirror.id);
             }
         }
-        int code = debrid_prepare_locked(route, &delivery_job, err, cap);
-        if (code != 200) return code;
+        if (debrid_prepare_locked(route, &delivery_job, err, cap) != 200) {
+            torbox = false;
+            delivery_job.mirror_id[0] = delivery_job.mirror_first[0] = 0;
+            delivery_job.mirror_torbox = false;
+            err[0] = 0;
+        }
     }
-    if (!torbox && !provider_supported(r) && !(dry_run && provider_browser_supported(r))) {
+    delivery_job.browser_pending = !torbox && !pin && job_needs_browser(r);
+    if (!torbox && !delivery_job.browser_pending && !provider_supported(r) &&
+        !(dry_run && provider_browser_supported(r))) {
         copy_text(err, cap, provider_browser_supported(r)
             ? (!strcmp(r->source, "akirabox") || !strcmp(r->source, "vikingfile")
                 ? "Complete verification if shown, then wait. Orbit will check the generated download link automatically."
@@ -577,6 +583,7 @@ int job_create_captured_locked(const Release *r, const Storage *s, const char *e
 }
 bool job_can_refresh_link(const Job *j) {
     return j && (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&
+        !j->browser_pending &&
         !j->archive_ready && !(j->release.compression[0] && j->received >= j->total) &&
         strcmp(j->delivery, "torbox") &&
         (!strcmp(j->release.source, "vikingfile") || !strcmp(j->release.source, "akirabox") ||
@@ -730,16 +737,13 @@ int job_action_locked(Job *j, const char *action, bool remove, char *err, size_t
         }
         Release *r = &j->release;
         bool torbox = !strcmp(j->delivery, "torbox");
-        if (!source_enabled_locked(r) || (!torbox && !provider_supported(r))) {
+        if (!source_enabled_locked(r) || (!torbox && !j->browser_pending && !provider_supported(r))) {
             copy_text(err, cap,
                       "Enable a supported source in Sources before resuming this download.");
             return 409;
         }
         if (torbox) {
-            Job checked = {0};
-            int code = debrid_prepare_locked(r, &checked, err, cap);
-            if (code != 200) return code;
-            if (strcmp(checked.debrid_account, j->debrid_account)) {
+            if (!debrid_job_account_locked(j)) {
                 copy_text(err, cap, "Reconnect the original TorBox account before resuming.");
                 return 409;
             }
@@ -799,6 +803,7 @@ int job_action_locked(Job *j, const char *action, bool remove, char *err, size_t
         copy_text(err, cap, "Could not persist the queue change.");
         return 503;
     }
+    browser_job_changed_locked(j->id);
     pthread_cond_broadcast(&orbit.changed);
     diagnostics_event_locked(action, j, 0, 0);
     return 200;

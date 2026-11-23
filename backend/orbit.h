@@ -80,6 +80,7 @@ typedef struct {
     char mirror_id[24]; /* Current alternate, or empty while using the original link. */
     char mirror_first[24]; /* An alternate used before the original to enable TorBox. */
     bool mirror_torbox; /* Keep preferring TorBox after trying a direct-only mirror. */
+    bool browser_pending; /* The original provider still needs to resolve a file URL. */
     int64_t debrid_id, debrid_file;
     bool debrid_submitted;
     time_t debrid_submitted_at; /* when the last create request was sent; 0 if unknown */
@@ -220,6 +221,7 @@ bool provider_url_supported(const Release *release);
 bool provider_browser_supported(const Release *release);
 bool provider_capture_url(const Release *release, const char *candidate);
 bool provider_browser_source(const char *source);
+const char *provider_torbox_url(const Release *release);
 bool provider_header_filename(const char *value, char *out, size_t cap);
 bool provider_disposition_name(const char *url, char *out, size_t cap);
 bool provider_viking_file_server(const char *host, size_t n);
@@ -230,6 +232,8 @@ cJSON *browser_status(void);
 cJSON *browser_diagnostics_locked(void);
 int browser_action(const cJSON *input, char *error, size_t cap);
 int browser_direct_download(const cJSON *input, char *error, size_t cap);
+/* Under orbit.mutex. 1 = started, 0 = browser busy, -1 = cannot start. */
+int browser_start_queued_locked(Job *job, char *error, size_t cap);
 void browser_job_changed_locked(const char *id);
 int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
                               char *modified, char *error, size_t cap);
@@ -256,6 +260,7 @@ int job_create_delivery_locked(const char *release_id, const char *storage_id,
                                 const char *delivery, char *error, size_t cap, Job **result);
 int job_check_capture_locked(const Release *release, const Storage *destination, char *error, size_t cap);
 bool job_assign_remote_file_locked(Job *job, const Release *file, char *error, size_t cap);
+bool job_needs_browser(const Release *release);
 bool job_can_refresh_link(const Job *job);
 int job_refresh_link_locked(Job *job, const Release *release, const Storage *destination,
                             const char *etag, const char *modified, char *error, size_t cap);

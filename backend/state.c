@@ -182,6 +182,7 @@ static cJSON *job_json(const Job *j, bool private_fields) {
         if (j->mirror_id[0]) { S("mirrorId", mirror_id); }
         if (j->mirror_first[0]) { S("mirrorFirst", mirror_first); }
         if (j->mirror_torbox) cJSON_AddTrueToObject(o, "mirrorTorBox");
+        if (j->browser_pending) cJSON_AddTrueToObject(o, "browserPending");
         cJSON_AddItemToObject(o, "release", release_json(&j->release));
         if (j->release.viking_context) {
             cJSON_AddNumberToObject(o, "vikingContext", j->release.viking_context);
@@ -566,6 +567,8 @@ int state_load(void) {
         copy_text(j->install_after, sizeof j->install_after, after);
         const char *delivery = json_text(x, "delivery");
         if (*delivery && strcmp(delivery, "direct") && strcmp(delivery, "torbox")) { cJSON_Delete(o); return -1; }
+        j->browser_pending = strcmp(delivery, "torbox") && job_needs_browser(r) &&
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "browserPending"));
         if (!strcmp(delivery, "torbox")) {
             const cJSON *web = cJSON_GetObjectItemCaseSensitive(x, "debridId"),
                         *file = cJSON_GetObjectItemCaseSensitive(x, "debridFile");
@@ -594,8 +597,10 @@ int state_load(void) {
             copy_text(j->drive_mark, sizeof j->drive_mark, mark);
         j->received = json_int(x, "received");
         const cJSON *ranges = cJSON_GetObjectItemCaseSensitive(x, "rangeReceived");
-        if (remote_page_pending(r) && ((!j->mirror_id[0] && !j->mirror_first[0] && strcmp(j->delivery, "torbox")) ||
-            (!r->filename[0] && (j->received || ranges || !strcmp(j->status, "complete"))))) {
+        bool has_file_data = j->received || ranges || !strcmp(j->status, "complete");
+        if ((j->browser_pending && has_file_data) ||
+            (remote_page_pending(r) && ((!r->filename[0] && has_file_data) ||
+             (!j->mirror_id[0] && !j->mirror_first[0] && !j->browser_pending && strcmp(j->delivery, "torbox"))))) {
             cJSON_Delete(o);
             return -1;
         }

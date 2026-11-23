@@ -243,6 +243,8 @@ static cJSON *snapshot_locked(bool addons) {
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
         cJSON_AddBoolToObject(entry, "browserAvailable", provider_browser_supported(r));
         cJSON_AddBoolToObject(entry, "directAvailable", provider_url_supported(r));
+        char host[254];
+        if (remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
         firmware_describe(entry, orbit.firmware);
         cJSON_AddItemToArray(a, entry);
     }
