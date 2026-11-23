@@ -447,7 +447,6 @@ cJSON *debrid_status(void) {
     cJSON_AddBoolToObject(o, "connected", debrid.connected);
     cJSON_AddBoolToObject(o, "busy", debrid.busy);
     cJSON_AddBoolToObject(o, "available", debrid.started);
-    cJSON_AddBoolToObject(o, "alwaysUseTorBox", orbit.always_use_torbox);
     cJSON_AddStringToObject(o, "lastDelivery", !strcmp(orbit.last_delivery, "torbox") ? "torbox" : "direct");
     cJSON_AddStringToObject(o, "error", debrid.error);
     cJSON_AddNumberToObject(o, "checkedAt", (double)debrid.checked);
@@ -473,18 +472,6 @@ cJSON *debrid_status(void) {
 }
 int debrid_action(const cJSON *input, char *err, size_t cap) {
     const char *action = json_text(input, "action"), *key = json_text(input, "apiKey");
-    if (!strcmp(action, "preferences")) {
-        const cJSON *always = cJSON_GetObjectItemCaseSensitive(input, "alwaysUseTorBox");
-        if (!cJSON_IsBool(always)) { copy_text(err, cap, "Choose whether to always use TorBox."); return 400; }
-        pthread_mutex_lock(&orbit.mutex);
-        bool previous = orbit.always_use_torbox;
-        orbit.always_use_torbox = cJSON_IsTrue(always);
-        int rc = state_save_locked();
-        if (rc) orbit.always_use_torbox = previous;
-        pthread_mutex_unlock(&orbit.mutex);
-        if (rc) copy_text(err, cap, "Could not save the setting.");
-        return rc ? 503 : 200;
-    }
     if (strcmp(action, "connect") && strcmp(action, "refresh") && strcmp(action, "disconnect")) { copy_text(err, cap, "Choose connect, refresh or disconnect."); return 400; }
     if (!strcmp(action, "connect") && !valid_key(key)) { copy_text(err, cap, "Enter a valid TorBox API key."); return 400; }
     pthread_mutex_lock(&orbit.mutex); int code = 202;
@@ -530,25 +517,21 @@ static bool current_account(void) {
 bool debrid_link_covered_locked(const Release *r) {
     return current_account() && covered_limit(r) >= 0;
 }
-static bool covered_option(const Release *r, bool check_size) {
+static bool covered_option(const Release *r) {
     if (!r || !current_account()) return false;
     int64_t limit = covered_limit(r);
-    if (limit >= 0 && (!check_size || !limit || r->size <= limit)) return true;
+    if (limit >= 0 && (!limit || r->size <= limit)) return true;
     Release mirror;
     char after[sizeof mirror.id] = "";
     while (remote_next_mirror_locked(r, after, &mirror)) {
         limit = covered_limit(&mirror);
-        if (limit >= 0 && (!check_size || !limit || r->size <= limit)) return true;
+        if (limit >= 0 && (!limit || r->size <= limit)) return true;
         copy_text(after, sizeof after, mirror.id);
     }
     return false;
 }
-bool debrid_covers_locked(const Release *r) {
-    return covered_option(r, false);
-}
 bool debrid_default_locked(const Release *r) {
-    if (orbit.always_use_torbox && debrid_covers_locked(r)) return true;
-    return !strcmp(orbit.last_delivery, "torbox") && !debrid.busy && covered_option(r, true);
+    return !strcmp(orbit.last_delivery, "torbox") && !debrid.busy && covered_option(r);
 }
 int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
     if (!debrid.connected || !debrid.key[0]) { copy_text(err, cap, "Connect TorBox in App settings first."); return 409; }

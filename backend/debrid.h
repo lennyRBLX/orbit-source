@@ -10,8 +10,6 @@ int debrid_action(const cJSON *input, char *error, size_t cap);
 int debrid_prepare_locked(const Release *release, Job *job, char *error, size_t cap);
 /* Suggested route only. Reported host limits never prevent an explicit TorBox request. */
 bool debrid_default_locked(const Release *release);
-/* Always use TorBox applies to the options TorBox can take now. Others keep the original source. */
-bool debrid_covers_locked(const Release *release);
 bool debrid_link_covered_locked(const Release *release);
 /* Runs on the download worker. 1 = ready, 0 = waiting, -1 = failed/stopped. */
 int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at,

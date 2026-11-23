@@ -3,7 +3,6 @@ import { api } from "./api";
 import { type Release } from "./types";
 import { t } from "./i18n";
 import { rich } from "./Rich";
-import { Icon } from "./components";
 export interface DebridStatus {
   provider: "torbox";
   available: boolean;
@@ -14,7 +13,6 @@ export interface DebridStatus {
   retryAt: number;
   revision: number;
   lastDelivery?: "direct" | "torbox";
-  alwaysUseTorBox?: boolean;
   hosts: { sourceId: string; available: boolean; maxFileSize: number }[];
   domains?: { host: string; maxFileSize: number }[];
 }
@@ -26,13 +24,7 @@ function availableHost(status: DebridStatus | null, release: Release) {
   }
   return status?.hosts.find((host) => host.available && host.sourceId === release.sourceId);
 }
-// Always use TorBox covers the options TorBox can take now. Others, such as
-// AkiraBox, or a host TorBox has paused, keep their original source.
-export function alwaysTorbox(status: DebridStatus | null, release: Release) {
-  return !!status?.alwaysUseTorBox && !!status.connected && !!status.available && !!availableHost(status, release);
-}
 export function preferredDelivery(status: DebridStatus | null, release: Release): "direct" | "torbox" {
-  if (alwaysTorbox(status, release)) return "torbox";
   const host = availableHost(status, release);
   return status?.lastDelivery === "torbox" && torboxAvailable(status, release) &&
     (!host?.maxFileSize || release.sizeBytes <= host.maxFileSize) ? "torbox" : "direct";
@@ -114,15 +106,6 @@ export function Debrid() {
       setSending(false);
     }
   }
-  async function setAlways(value: boolean) {
-    setSending(true);
-    setError("");
-    try {
-      await api("/debrid", { action: "preferences", alwaysUseTorBox: value });
-      await refresh();
-    } catch (e) { setError((e as Error).message); }
-    finally { setSending(false); }
-  }
   const disabled = sending || !!status?.busy || !status?.available;
   return (
     <section
@@ -168,13 +151,6 @@ export function Debrid() {
           {status?.connected ? t("Replace connection") : t("Connect TorBox")}
         </button>
       </form>
-      <button type="button" role="checkbox" className="source-acknowledgement"
-        aria-checked={!!status?.alwaysUseTorBox} disabled={disabled}
-        onClick={() => void setAlways(!status?.alwaysUseTorBox)}>
-        <span className="choice-check" aria-hidden="true">{status?.alwaysUseTorBox && <Icon name="check" />}</span>
-        <span>{t("Always use TorBox")}</span>
-      </button>
-      <p className="fine">{t("Use TorBox for new downloads. Turn this off to choose Direct or TorBox.")}</p>
       {status?.connected && (
         <>
           <ul>

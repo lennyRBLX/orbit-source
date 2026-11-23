@@ -146,7 +146,7 @@ static void next_item_locked(void) {
         else item_failed(it, error);
         return;
     }
-    bool torbox = (orbit.always_use_torbox && debrid_covers_locked(r)) || !strcmp(it->delivery, "torbox") ||
+    bool torbox = !strcmp(it->delivery, "torbox") ||
                   (!it->delivery[0] && debrid_default_locked(r));
     if (torbox || provider_supported(r) || (!remote_page_pending(r) && !provider_browser_supported(r))) {
         Job *job = NULL;

@@ -5,7 +5,6 @@
 #include "viking_session.h"
 #include "viking_pass.h"
 #include "network.h"
-#include "debrid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -726,9 +725,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
         size_t count = storage_list(drives);
         for (size_t i = 0; i < count; i++)
             if (!strcmp(drives[i].id, refreshing && job ? job->storage_id : json_text(input, "storageId"))) s = &drives[i];
-        if (!refreshing && orbit.always_use_torbox && r && debrid_covers_locked(r)) {
-            copy_text(error, cap, "Always use TorBox is on. Turn it off in TorBox settings to use the original source."); code = 409;
-        } else if (refreshing && (!job_can_refresh_link(job) || !source_enabled_locked(&job->release))) {
+        if (refreshing && (!job_can_refresh_link(job) || !source_enabled_locked(&job->release))) {
             copy_text(error, cap, "Pause the download and enable its source before refreshing its link."); code = 409;
         } else if (!r || (!remote_page_pending(r) && !provider_browser_supported(r))) {
             copy_text(error, cap, "This option has no supported provider browser page."); code = 400;

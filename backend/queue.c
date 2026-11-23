@@ -533,7 +533,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     copy_text(orbit.preferred_storage, sizeof orbit.preferred_storage, sid);
     char previous_delivery[sizeof orbit.last_delivery];
     copy_text(previous_delivery, sizeof previous_delivery, orbit.last_delivery);
-    if (!orbit.always_use_torbox && !direct_url)
+    if (!direct_url)
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, torbox ? "torbox" : "direct");
     if (state_save_locked()) {
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, previous_delivery);
@@ -557,7 +557,7 @@ int job_create_delivery_locked(const char *rid, const char *sid, const char *del
         copy_text(err, cap, "Choose direct or torbox delivery."); return 400;
     }
     const Release *r = release_find(rid);
-    const char *method = orbit.always_use_torbox && debrid_covers_locked(r) ? "torbox" : delivery && *delivery ? delivery :
+    const char *method = delivery && *delivery ? delivery :
                          debrid_default_locked(r) ? "torbox" : "direct";
     return create_locked(r, sid, NULL, NULL, NULL, false, method, err, cap, result);
 }

@@ -5,7 +5,7 @@ import { api } from "./api";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./components";
 import { GameSheet, PadSymbol, type SheetView } from "./GameSheet";
-import { useDebrid, torboxAvailable, preferredDelivery, alwaysTorbox } from "./Debrid";
+import { useDebrid, torboxAvailable, preferredDelivery } from "./Debrid";
 import {
   bytes,
   formatLabel,
@@ -203,8 +203,7 @@ export function Details({
     planned = space?.planned,
     afterDownload = space?.after ?? 0,
     enough = space?.enough;
-  const always = alwaysTorbox(debrid.status, release);
-  const delivery = always ? "torbox" : deliveryChoice || preferredDelivery(debrid.status, release);
+  const delivery = deliveryChoice ?? preferredDelivery(debrid.status, release);
   const torbox = delivery === "torbox";
   const canTorbox = torboxAvailable(debrid.status, release);
   const useBrowser = !!release.browserAvailable && !torbox;
@@ -341,20 +340,10 @@ export function Details({
   const methodLabel = torbox
     ? "TorBox"
     : t("{provider} directly", { provider: releaseProvider(release) });
-  const methodNote = always
-    ? t("Always use TorBox is on. Turn it off in TorBox settings to use the original source.")
+  const methodNote = !canTorbox
+    ? t("TorBox is unavailable for this option. Choose the original source or check App settings.")
     : torbox
-    ? canTorbox
-      ? t(
-          "Uses your TorBox account. Preparation may take time; follow it in Downloads.",
-        )
-      : t(
-          "TorBox is unavailable for this option. Choose the original source or check App settings.",
-        )
-    : !canTorbox
-      ? t(
-          "TorBox is unavailable for this option. Choose the original source or check App settings.",
-        )
+      ? t("Uses your TorBox account. Preparation may take time; follow it in Downloads.")
       : t("TorBox is available for this option.");
   const instructions = (
     <div
@@ -744,7 +733,7 @@ export function Details({
           }))
         : xbMenu === "using"
           ? [
-              { key: "direct", on: !torbox, title: t("{provider} directly", { provider: releaseProvider(release) }), sub: "", choose: () => setDelivery("direct"), disabled: always },
+              { key: "direct", on: !torbox, title: t("{provider} directly", { provider: releaseProvider(release) }), sub: "", choose: () => setDelivery("direct"), disabled: false },
               !debrid.status?.connected && !torbox
                 ? { key: "setup", on: false, title: t("Set up TorBox"), sub: t("Connect your TorBox account in App settings."), choose: () => configureDebrid(() => void debrid.refresh()), disabled: false }
                 : { key: "torbox", on: torbox, title: "TorBox", sub: methodNote, choose: () => setDelivery("torbox"), disabled: !canTorbox },
@@ -957,7 +946,7 @@ export function Details({
                 title={t("{provider} directly", { provider: releaseProvider(release) })}
                 check={!torbox}
                 current={!torbox}
-                disabled={pending || browser?.active || always}
+                disabled={pending || browser?.active}
                 onClick={() => setDelivery("direct")}
               />
               {!debrid.status?.connected && !torbox ? (
@@ -1271,7 +1260,7 @@ export function Details({
                         <button
                           className="cn-choice"
                           aria-pressed={!torbox}
-                          disabled={pending || browser?.active || always}
+                          disabled={pending || browser?.active}
                           onClick={() => setDelivery("direct")}
                         >
                           <strong>{t("{provider} directly", { provider: releaseProvider(release) })}</strong>
@@ -1559,7 +1548,7 @@ export function Details({
                   aria-pressed={!torbox}
                   data-delivery="direct"
                   data-initial-focus={!torbox || undefined}
-                  disabled={pending || browser?.active || always}
+                  disabled={pending || browser?.active}
                   onClick={() => {
                     setDelivery("direct");
                     setSheet("downloads");

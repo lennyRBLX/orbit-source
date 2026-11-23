@@ -163,7 +163,6 @@ typedef struct {
     unsigned notify_events; /* NOTIFY_* events that reach the PS5 and ntfy. */
     char notified_update[64]; /* The Orbit release last announced as available. */
     bool delete_packages; /* Remove a downloaded PKG once the PS5 reports it installed. */
-    bool always_use_torbox; /* Explicit override for new downloads, never existing jobs. */
     char last_delivery[16]; /* Last user-selected method; empty on older installations. */
     bool shutdown_when_done; /* Off by default; only newly completed work arms shutdown. */
     char shutdown_holds[16][65]; /* Busy paired computers survive a service restart. */

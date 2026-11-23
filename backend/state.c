@@ -260,7 +260,6 @@ static cJSON *state_json_locked(void) {
         if (orbit.notify_events & (1u << i)) cJSON_AddItemToArray(events, cJSON_CreateString(notify_event_name(i)));
     cJSON_AddStringToObject(o, "notifiedUpdate", orbit.notified_update);
     cJSON_AddBoolToObject(o, "deletePackages", orbit.delete_packages);
-    cJSON_AddBoolToObject(o, "alwaysUseTorBox", orbit.always_use_torbox);
     cJSON_AddStringToObject(o, "lastDelivery", !strcmp(orbit.last_delivery, "torbox") ? "torbox" : "direct");
     cJSON_AddBoolToObject(o, "shutdownWhenDone", orbit.shutdown_when_done);
     cJSON_AddStringToObject(o, "shutdownJob", orbit.shutdown_job);
@@ -426,7 +425,6 @@ int state_load(void) {
     const char *history_files = json_text(o, "historyFiles");
     copy_text(orbit.history_files, sizeof orbit.history_files,
         !strcmp(history_files, "keep") || !strcmp(history_files, "delete") ? history_files : "ask");
-    orbit.always_use_torbox = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o, "alwaysUseTorBox"));
     copy_text(orbit.last_delivery, sizeof orbit.last_delivery,
               !strcmp(json_text(o, "lastDelivery"), "torbox") ? "torbox" : "direct");
     download_policy_load(o, &orbit.download_policy);
