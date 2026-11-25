@@ -5,6 +5,7 @@
 #include "viking_session.h"
 #include "viking_pass.h"
 #include "network.h"
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,7 @@ static struct {
     char queued_job_id[sizeof ((Job *)0)->id];
     char mirror_page[128];
     char native_failure[256];
+    char archive_password[sizeof ((Job *)0)->archive_password];
     Release release;
     Storage storage;
     Job refresh_job;
@@ -492,7 +494,8 @@ static void *worker(void *unused) {
             Job *job = session.refresh_job.id[0] ? job_find(session.refresh_job.id) : NULL;
             int code = session.refresh_job.id[0]
                 ? job_refresh_link_locked(job, &resolved, &session.storage, etag, modified, error, sizeof error)
-                : job_create_captured_locked(&resolved, &session.storage, etag, modified, error, sizeof error, &job);
+                : job_create_captured_locked(&resolved, &session.storage, etag, modified,
+                                             session.archive_password, error, sizeof error, &job);
             if (code == 200 || code == 201) {
                 copy_text(session.job_id, sizeof session.job_id, job->id);
                 state_locked("queued", "Your verified file has been added to Downloads.");
@@ -517,6 +520,7 @@ static void *worker(void *unused) {
         /* No pending verification survives a restart. No browser bytes are saved. */
         memset(&resolved, 0, sizeof resolved);
         memset(&session.release, 0, sizeof session.release);
+        OPENSSL_cleanse(session.archive_password, sizeof session.archive_password);
         session.mirror_page[0] = 0;
         session.queued_job_id[0] = 0;
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
@@ -725,6 +729,16 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             copy_text(error, cap, "Enter a valid HTTP or HTTPS download URL without credentials or a fragment."); code = 400;
             goto done;
         }
+        const cJSON *password = cJSON_GetObjectItemCaseSensitive(input, "password");
+        const char *secret = json_text(input, "password");
+        if ((password && !cJSON_IsString(password)) || strlen(secret) >= sizeof session.archive_password) {
+            copy_text(error, cap, "Enter an archive password of up to 128 bytes."); code = 400;
+            goto done;
+        }
+        if (!utf8_text(secret)) {
+            copy_text(error, cap, "The archive password cannot contain control characters."); code = 400;
+            goto done;
+        }
         Storage drives[ORBIT_MAX_STORAGE], *selected = NULL;
         size_t count = storage_list(drives);
         for (size_t i = 0; i < count; i++)
@@ -740,6 +754,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
         session.account = session.check_account = session.native_dialog = session.dialog_opened = session.return_to_browser = false;
         session.resolving = true;
         session.release = direct;
+        copy_text(session.archive_password, sizeof session.archive_password, secret);
         session.storage = *selected;
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
         session.native_failure[0] = session.job_id[0] = session.client_id[0] = 0;

@@ -143,6 +143,7 @@ static bool fetch(const char *url, Response *r) {
 static const char *sample_suffix(const unsigned char *p, size_t length) {
     if (length < SAMPLE_BYTES) return NULL;
     if (!memcmp(p, "PK\3\4", 4)) return ".zip";
+    if (!memcmp(p, "7z\xbc\xaf\x27\x1c", 6)) return ".7z";
     if (!memcmp(p, "Rar!\x1a\x07", 6) && (p[6] == 0 || (p[6] == 1 && p[7] == 0))) return ".rar";
     if (!memcmp(p, "\x7f" "CNT", 4) || !memcmp(p, "\x7f" "FIH", 4)) return ".pkg";
     return NULL;
@@ -187,7 +188,7 @@ static int file_from_response(Release *r, const Response *response, const char *
 int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, char *error, size_t cap) {
     Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE)};
     int code = fetch(url, &response) ? file_from_response(r, &response, url, NULL) : -1;
-    if (code) copy_text(error, cap, response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP or RAR with a filename and size."
+    if (code) copy_text(error, cap, response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP, 7z or RAR with a filename and size."
                                       : code > 0 ? "This option uses an unsupported download format."
                                              : "The provider did not return a verifiable PKG, FPKG, RAR or ZIP.");
     return code;

@@ -171,8 +171,8 @@ export function useOrbit() {
     await polling.current;
     await refresh();
   };
-  const downloadUrl = async (url: string, storageId: string) => {
-    const status = await api<BrowserSession>("/downloads/direct", { url, storageId });
+  const downloadUrl = async (url: string, storageId: string, password?: string) => {
+    const status = await api<BrowserSession>("/downloads/direct", { url, storageId, password });
     if (alive.current) setBrowser(status);
     return status;
   };

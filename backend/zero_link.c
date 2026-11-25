@@ -80,7 +80,7 @@ static void *worker(void *unused) {
             copy_text(error, sizeof error, "Reconnect the selected drive first.");
         } else {
             Job *job = NULL;
-            int code = job_create_captured_locked(&candidate, &drive, etag, modified, error, sizeof error, &job);
+            int code = job_create_captured_locked(&candidate, &drive, etag, modified, NULL, error, sizeof error, &job);
             if ((code == 200 || code == 201) && job) {
                 copy_text(job_id, sizeof job_id, job->id);
                 queued = true;

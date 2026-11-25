@@ -1643,7 +1643,7 @@ static void run_job(Job *j) {
     }
     if ((get_verified_file(&t) || (remote_transfer(&t) && (torbox(&t) || j->mirror_id[0] || j->mirror_first[0]))) && !file_type_matches(&t)) {
         source_failed = true;
-        copy_text(t.error, sizeof t.error, "The downloaded file does not match its PKG, FPKG, ZIP or RAR filename.");
+        copy_text(t.error, sizeof t.error, "The downloaded file does not match the verified file type.");
         goto finish;
     }
     if (controlled(&t))

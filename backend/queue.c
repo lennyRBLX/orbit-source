@@ -330,7 +330,7 @@ int history_clear_locked(const cJSON *input, char *err, size_t cap) {
 }
 static int create_locked(const Release *r, const char *sid, const Storage *pin,
                          const char *etag, const char *modified, bool dry_run, const char *delivery,
-                         char *err, size_t cap, Job **result) {
+                         const char *password, char *err, size_t cap, Job **result) {
     const char *rid = r ? r->id : "";
     if (orbit.stop) {
         copy_text(err, cap, "Orbit is stopping. Reconnect after restarting it.");
@@ -478,6 +478,8 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     j.keep_packed = packed;
     bool direct_url = !strcmp(r->source, ORBIT_DIRECT_SOURCE);
     j.auto_install = direct_url;
+    if (direct_url && r->compression[0] && password)
+        copy_text(j.archive_password, sizeof j.archive_password, password);
     copy_text(j.etag, sizeof j.etag, etag ? etag : "");
     copy_text(j.modified, sizeof j.modified, modified ? modified : "");
     j.order = last_order + 1;
@@ -565,13 +567,13 @@ int job_create_delivery_locked(const char *rid, const char *sid, const char *del
     const Release *r = release_find(rid);
     const char *method = delivery && *delivery ? delivery :
                          debrid_default_locked(r) ? "torbox" : "direct";
-    return create_locked(r, sid, NULL, NULL, NULL, false, method, err, cap, result);
+    return create_locked(r, sid, NULL, NULL, NULL, false, method, NULL, err, cap, result);
 }
 int job_check_capture_locked(const Release *r, const Storage *s, char *err, size_t cap) {
-    return create_locked(r, s->id, s, NULL, NULL, true, "direct", err, cap, NULL);
+    return create_locked(r, s->id, s, NULL, NULL, true, "direct", NULL, err, cap, NULL);
 }
 int job_create_captured_locked(const Release *r, const Storage *s, const char *etag,
-                               const char *modified, char *err, size_t cap, Job **result) {
+                               const char *modified, const char *password, char *err, size_t cap, Job **result) {
     bool file_verified = (r->remote_page && !strcmp(r->source, "remote")) ||
                          !strcmp(r->source, ORBIT_DIRECT_SOURCE);
     if (file_verified ? (!provider_supported(r) || !r->filename[0] || r->size <= 0)
@@ -579,7 +581,7 @@ int job_create_captured_locked(const Release *r, const Storage *s, const char *e
         copy_text(err, cap, "The provider file has not been validated.");
         return 409;
     }
-    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+    return create_locked(r, s->id, s, etag, modified, false, "direct", password, err, cap, result);
 }
 bool job_can_refresh_link(const Job *j) {
     return j && (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&

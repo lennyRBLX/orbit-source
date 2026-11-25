@@ -265,7 +265,7 @@ bool job_can_refresh_link(const Job *job);
 int job_refresh_link_locked(Job *job, const Release *release, const Storage *destination,
                             const char *etag, const char *modified, char *error, size_t cap);
 int job_create_captured_locked(const Release *release, const Storage *destination,
-                               const char *etag, const char *modified, char *error,
+                               const char *etag, const char *modified, const char *password, char *error,
                                size_t cap, Job **result);
 int job_action_locked(Job *job, const char *action, bool remove, char *error, size_t cap);
 int job_password_locked(Job *job, const char *password, char *error, size_t cap);

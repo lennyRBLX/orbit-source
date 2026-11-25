@@ -1146,6 +1146,8 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         if (post && !strcmp(url, "/api/v1/downloads/direct")) {
             char e[256] = {0};
             int code = browser_direct_download(input, e, sizeof e);
+            cJSON *password = cJSON_GetObjectItemCaseSensitive(input, "password");
+            if (cJSON_IsString(password)) OPENSSL_cleanse(password->valuestring, strlen(password->valuestring));
             cJSON_Delete(input);
             return code == 202 ? json_response(c, 202, browser_status()) : error(c, (unsigned)code, e);
         }

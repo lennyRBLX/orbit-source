@@ -10,13 +10,14 @@ export function DirectDownload({
   browser: BrowserSession | null;
   storage: Storage[];
   preferredStorage: string;
-  download: (url: string, storageId: string) => Promise<BrowserSession>;
+  download: (url: string, storageId: string, password?: string) => Promise<BrowserSession>;
   cancel: (id: string) => Promise<void>;
   view: (id: string) => void;
   close: () => void;
 }) {
   const title = t("Download from URL");
   const [url, setUrl] = useState("");
+  const [password, setPassword] = useState("");
   const [drive, setDrive] = useState("");
   const [sending, setSending] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -36,7 +37,7 @@ export function DirectDownload({
     setSending(true);
     setError("");
     try {
-      setStarted(await download(url.trim(), storageId));
+      setStarted(await download(url.trim(), storageId, password || undefined));
     } catch (e) {
       setError(e instanceof Error ? e.message : t("Orbit could not complete this request."));
     } finally {
@@ -68,7 +69,7 @@ export function DirectDownload({
         </>
       ) : (
         <>
-          <p>{t("Enter a direct HTTP or HTTPS link to a PKG, FPKG, ZIP or RAR file.")}</p>
+          <p>{t("Enter a direct HTTP or HTTPS link to a PKG, FPKG, ZIP, 7z or RAR file.")}</p>
           <form onSubmit={(event) => { event.preventDefault(); void submit(); }}>
             <label className="field">
               {t("Download URL")}
@@ -84,6 +85,22 @@ export function DirectDownload({
                 readOnly={busy}
                 required
                 onChange={(event) => { setUrl(event.target.value); setStarted(null); setError(""); }}
+                onKeyDown={(event) => {
+                  if (event.key !== "ArrowDown" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+                  event.preventDefault();
+                  event.currentTarget.form?.querySelector<HTMLInputElement>('input[type="password"]')?.focus();
+                }}
+              />
+            </label>
+            <label className="field">
+              {t("Archive password (optional)")}
+              <input
+                type="password"
+                autoComplete="off"
+                maxLength={128}
+                value={password}
+                readOnly={busy}
+                onChange={(event) => { setPassword(event.target.value); setError(""); }}
                 onKeyDown={(event) => {
                   if (event.key !== "ArrowDown" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
                   event.preventDefault();

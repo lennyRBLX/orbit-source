@@ -209,7 +209,8 @@ static int file_format(Release *r, const char *name, bool community, const char 
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
     if (community && unsupported_label(name)) return 1;
     const char *suffix = strrchr(name, '.');
-    const char *excluded[] = {".7z", ".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
+    if (community && suffix && !strcasecmp(suffix, ".7z")) return 1;
+    const char *excluded[] = {".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; i++)
         if (suffix && !strcasecmp(suffix, excluded[i])) return 1;
     if (suffix && !strcasecmp(suffix, ".rar")) {
@@ -221,6 +222,7 @@ static int file_format(Release *r, const char *name, bool community, const char 
         suffix = detected;
     if (!suffix) return -1;
     const char *archive = compression(suffix);
+    if (community && !strcmp(archive, "7z")) return 1;
     bool fpkg = !strcasecmp(suffix, ".fpkg");
     bool pkg = !strcasecmp(suffix, ".pkg");
     const char *format = "Game folder";
