@@ -146,12 +146,19 @@ static const char *sample_suffix(const unsigned char *p, size_t length) {
     if (!memcmp(p, "7z\xbc\xaf\x27\x1c", 6)) return ".7z";
     if (!memcmp(p, "Rar!\x1a\x07", 6) && (p[6] == 0 || (p[6] == 1 && p[7] == 0))) return ".rar";
     if (!memcmp(p, "\x7f" "CNT", 4) || !memcmp(p, "\x7f" "FIH", 4)) return ".pkg";
+    if (!memcmp(p, "PFSC", 4)) return ".ffpfsc";
+    if (!memcmp(p + 3, "EXFAT", 5)) return ".exfat";
     return NULL;
 }
 
 bool download_file_magic(const Release *r, const unsigned char *p, size_t length) {
     const char *suffix = sample_suffix(p, length);
-    return suffix && !strcmp(suffix + 1, r->compression[0] ? r->compression : "pkg");
+    const char *expected = r->compression[0] ? r->compression : "pkg";
+    if (!r->compression[0] && !strcmp(r->remote_catalog_id, PADRINO_SOURCE)) {
+        if (!strcmp(r->format, "exFAT")) expected = "exfat";
+        else if (!strcmp(r->format, "FFPFSC")) expected = "ffpfsc";
+    }
+    return suffix && !strcmp(suffix + 1, expected);
 }
 
 static int file_from_response(Release *r, const Response *response, const char *url, const char *page_name) {

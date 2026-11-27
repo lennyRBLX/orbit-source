@@ -1,5 +1,6 @@
 #include "remote_sources.h"
 #include "provider_network.h"
+#include "padrino.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <zlib.h>
 
 #define REMOTE_PACKAGE_LIMIT 2048
 #define REMOTE_MIRROR_RESERVE 2048
@@ -46,6 +48,18 @@ static const char *compression(const char *suffix) {
     return "";
 }
 
+static cJSON *padrino_snapshot;
+static const cJSON **padrino_titles;
+static size_t padrino_title_count;
+
+static bool padrino_release(const Release *r) {
+    return !strcmp(r->remote_catalog_id, PADRINO_SOURCE);
+}
+
+static bool image_format(const Release *r) {
+    return padrino_release(r) && (!strcmp(r->format, "exFAT") || !strcmp(r->format, "FFPFSC"));
+}
+
 static int file_format(Release *r, const char *name, bool community, const char *detected);
 
 /* Include the full source id in the digest even when its displayed prefix is shortened. */
@@ -71,24 +85,31 @@ static bool valid(const Release *r) {
         (strcmp(r->platform, "ps4") && strcmp(r->platform, "ps5")) ||
         ((r->browser_url[0] || r->remote_page) && !remote_https_url(r->browser_url)) ||
         ((!r->remote_page || r->url[0]) && !remote_https_url(r->url))) return false;
+    if (r->archive_password[0] && (!padrino_release(r) || (!remote_page_pending(r) && !r->compression[0])))
+        return false;
     if (remote_page_pending(r) && !r->filename[0])
-        return (!r->compression[0] || !strcmp(r->compression, "zip") || !strcmp(r->compression, "rar")) &&
+        return (!r->compression[0] || !strcmp(r->compression, "zip") || !strcmp(r->compression, "rar") ||
+                (padrino_release(r) && !strcmp(r->compression, "7z"))) &&
             !r->extracted_size && !r->sha256[0] &&
             (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
-             !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG"));
+             !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG") || image_format(r));
     if (!filename_valid(r->filename) ||
-        (strcmp(r->format, "PKG") && strcmp(r->format, "FPKG") &&
+        (strcmp(r->format, "PKG") && strcmp(r->format, "FPKG") && !image_format(r) &&
          (strcmp(r->format, "Game folder") || !r->compression[0]))) return false;
     if (r->remote_page) {
         Release checked = *r;
         const char *suffix = !strcmp(r->compression, "zip") ? ".zip" :
-                             !strcmp(r->compression, "rar") ? ".rar" : !r->compression[0] ? ".pkg" : NULL;
+                             !strcmp(r->compression, "rar") ? ".rar" :
+                             !strcmp(r->compression, "7z") ? ".7z" :
+                             !r->compression[0] ? (!strcmp(r->format, "exFAT") ? ".exfat" :
+                                                   !strcmp(r->format, "FFPFSC") ? ".ffpfsc" : ".pkg") : NULL;
         if (!suffix || file_format(&checked, r->filename, true, suffix) ||
             strcmp(checked.compression, r->compression) || strcmp(checked.format, r->format)) return false;
     } else {
         const char *suffix = strrchr(r->filename, '.');
         if (!suffix || strcmp(compression(suffix), r->compression) ||
-            (!r->compression[0] && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg"))) return false;
+            (!r->compression[0] && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
+             !(image_format(r) && !strcasecmp(suffix + 1, r->format)))) return false;
     }
     if (!r->compression[0] && r->extracted_size) return false;
     return !r->sha256[0] || (strlen(r->sha256) == 64 &&
@@ -110,6 +131,7 @@ int remote_release_parse(const cJSON *entry, Release *r) {
         !FIELD("format", format) || !FIELD("filename", filename) || !FIELD("url", url) ||
         !FIELD("browserUrl", browser_url) || !FIELD("remoteLabel", remote_label) ||
         (r->remote_page && !*r->browser_url) || !FIELD("sha256", sha256) || !FIELD("compression", compression) ||
+        !FIELD("archivePassword", archive_password) ||
         !bytes(entry, "sizeBytes", &r->size) || !bytes(entry, "extractedBytes", &r->extracted_size) ||
         !bytes(entry, "sizeEstimateBytes", &r->display_size) ||
         !valid(r)) return -1;
@@ -192,16 +214,19 @@ static bool token(const char *label, const char *word) {
     return false;
 }
 
-static bool unsupported_label(const char *label) {
-    return token(label, "lz4") || token(label, "zstd") || token(label, "zst") ||
-           token(label, "exfat") || token(label, "ffpfsc") || token(label, "pfs") ||
-           token(label, "7z");
+static bool unsupported_label(const char *label, bool padrino) {
+    return token(label, "lz4") || token(label, "zstd") || token(label, "zst") || token(label, "pfs") ||
+           (padrino ? token(label, "zstandard") :
+               token(label, "exfat") || token(label, "ffpfsc") || token(label, "7z"));
 }
 
-static const char *label_format(const char *label) {
+static const char *label_format(const char *label, bool padrino) {
     if (token(label, "fpkg")) return "FPKG";
     if (token(label, "pkg")) return "PKG";
-    if (token(label, "folder") || token(label, "rar") || token(label, "zip")) return "Game folder";
+    if (padrino && token(label, "exfat")) return "exFAT";
+    if (padrino && token(label, "ffpfsc")) return "FFPFSC";
+    if (token(label, "folder") || token(label, "rar") || token(label, "zip") ||
+        (padrino && token(label, "7z"))) return "Game folder";
     return "";
 }
 
@@ -209,9 +234,9 @@ static const char *label_format(const char *label) {
  * describes what is inside a supported archive. Unlabeled archives are folders. */
 static int file_format(Release *r, const char *name, bool community, const char *detected) {
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
-    if (community && unsupported_label(name)) return 1;
+    bool padrino = community && padrino_release(r);
+    if (community && unsupported_label(name, padrino)) return 1;
     const char *suffix = strrchr(name, '.');
-    if (community && suffix && !strcasecmp(suffix, ".7z")) return 1;
     const char *excluded[] = {".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; i++)
         if (suffix && !strcasecmp(suffix, excluded[i])) return 1;
@@ -220,20 +245,24 @@ static int file_format(Release *r, const char *name, bool community, const char 
         while (volume > name && isdigit((unsigned char)volume[-1])) volume--;
         if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 1;
     }
-    if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg")))
+    if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
+        !(padrino && (!strcasecmp(suffix, ".exfat") || !strcasecmp(suffix, ".ffpfsc")))))
         suffix = detected;
     if (!suffix) return -1;
     const char *archive = compression(suffix);
-    if (community && !strcmp(archive, "7z")) return 1;
+    if (community && !padrino && !strcmp(archive, "7z")) return 1;
     bool fpkg = !strcasecmp(suffix, ".fpkg");
     bool pkg = !strcasecmp(suffix, ".pkg");
     const char *format = "Game folder";
-    if (fpkg || !strcmp(r->format, "FPKG")) format = "FPKG";
+    if (padrino && !strcasecmp(suffix, ".exfat")) format = "exFAT";
+    else if (padrino && !strcasecmp(suffix, ".ffpfsc")) format = "FFPFSC";
+    else if (fpkg || !strcmp(r->format, "FPKG")) format = "FPKG";
     else if (pkg || !strcmp(r->format, "PKG")) format = "PKG";
     memset(r->format, 0, sizeof r->format);
     copy_text(r->format, sizeof r->format, format);
     memset(r->compression, 0, sizeof r->compression);
     copy_text(r->compression, sizeof r->compression, archive);
+    if (padrino && !*archive) memset(r->archive_password, 0, sizeof r->archive_password);
     copy_text(r->filename, sizeof r->filename, name);
     return 0;
 }
@@ -308,14 +337,15 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     copy_text(r->remote_catalog_id, sizeof r->remote_catalog_id, source_id);
     copy_text(r->source, sizeof r->source, "remote");
 
+    bool padrino = padrino_release(r);
     const char *label = json_text(link, "name"), *kind = json_text(link, "format");
     const char *format = json_text(entry, "format"), *category = json_text(entry, "category");
-    if (unsupported_label(label) || unsupported_label(kind)) return 1;
-    const char *hint = label_format(kind);
-    if (!*hint) hint = label_format(label);
+    if (unsupported_label(label, padrino) || unsupported_label(kind, padrino)) return 1;
+    const char *hint = label_format(kind, padrino);
+    if (!*hint) hint = label_format(label, padrino);
     if (!*hint) {
-        if (unsupported_label(format) || unsupported_label(category)) return 1;
-        hint = label_format(*format ? format : category);
+        if (unsupported_label(format, padrino) || unsupported_label(category, padrino)) return 1;
+        hint = label_format(*format ? format : category, padrino);
         if (*format && !*hint && strcasecmp(format, "Unknown") && strcasecmp(format, "Unknown file type")) return 1;
     }
     copy_text(r->format, sizeof r->format, hint);
@@ -340,9 +370,10 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     if (strchr(url, '#')) return 1; /* Browser-only containers need a provider adapter. */
     if (!normalize_url(url, r->url, sizeof r->url)) return -1;
     bool has_path = remote_url_filename(r->url, path_name, sizeof path_name);
-    if (has_path && unsupported_label(path_name)) return 1;
+    if (has_path && unsupported_label(path_name, padrino)) return 1;
     if (!strcmp(r->url, "https://datanodes.to/download")) return 1;
-    bool hosted = remote_metadata_url(r->url) || *remote_browser_provider(r->url) ||
+    bool hosted = (padrino && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"))) ||
+                  remote_metadata_url(r->url) || *remote_browser_provider(r->url) ||
                   !strncmp(r->url, "https://www.mediafire.com/file/", 31);
     int result = remote_file_format(r, *filename ? filename : has_path ? path_name : "");
     if (result > 0) return result;
@@ -366,10 +397,13 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         const char *page = json_text(entry, "downloadSource");
         if (*page && strlen(page) < sizeof r->browser_url && remote_https_url(page))
             copy_text(r->browser_url, sizeof r->browser_url, page);
-        if (!valid(r)) return -1;
         for (char *p = r->sha256; *p; p++)
             if (*p >= 'A' && *p <= 'F') *p += 'a' - 'A';
     }
+    if (padrino && (!bytes(link, "sizeEstimateBytes", &r->display_size) ||
+        ((r->remote_page || r->compression[0]) &&
+         !field(link, "archivePassword", r->archive_password, sizeof r->archive_password)))) return -1;
+    if (!valid(r)) return -1;
     identify(r);
     return 0;
 }
@@ -388,6 +422,88 @@ int pegasus_entry_to_release(const cJSON *entry, const char *source_id, Release 
 
 static int compare_releases(const void *a, const void *b) {
     return strcmp(((const Release *)a)->id, ((const Release *)b)->id);
+}
+
+void padrino_catalog_clear(void) {
+    free(padrino_titles);
+    cJSON_Delete(padrino_snapshot);
+    padrino_titles = NULL;
+    padrino_snapshot = NULL;
+    padrino_title_count = 0;
+}
+
+const cJSON *padrino_game(const char *title_id) {
+    size_t first = 0, end = padrino_title_count;
+    while (first < end) {
+        size_t mid = first + (end - first) / 2;
+        const cJSON *game = padrino_titles[mid];
+        int order = strcmp(json_text(game, "titleId"), title_id);
+        if (!order) return game;
+        if (order < 0) first = mid + 1;
+        else end = mid;
+    }
+    return NULL;
+}
+
+int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at) {
+    *releases = NULL;
+    *count = 0;
+    unsigned long length = PADRINO_JSON_SIZE;
+    unsigned char *body = malloc(length + 1);
+    if (!body) return -1;
+    if (uncompress(body, &length, padrino_data, sizeof padrino_data) != Z_OK || length != PADRINO_JSON_SIZE) {
+        free(body);
+        return -1;
+    }
+    body[length] = 0;
+    cJSON *snapshot = cJSON_ParseWithLengthOpts((char *)body, length + 1, NULL, true);
+    free(body);
+    cJSON *games = cJSON_GetObjectItemCaseSensitive(snapshot, "packages"), *game;
+    int size = cJSON_GetArraySize(games);
+    const cJSON **titles = NULL;
+    Release *rows = NULL;
+    if (json_int(snapshot, "schemaVersion") != 1 || !cJSON_IsArray(games) || size < 1 || size > PADRINO_OPTION_LIMIT)
+        goto fail;
+    size_t options = 0, used = 0, title_count = 0;
+    const char *previous = "";
+    cJSON_ArrayForEach(game, games) {
+        const cJSON *links = cJSON_GetObjectItemCaseSensitive(game, "downloadLinks");
+        const char *id = json_text(game, "titleId");
+        if (!cJSON_IsArray(links) || strcmp(previous, id) >= 0) goto fail;
+        previous = id;
+        options += (size_t)cJSON_GetArraySize(links);
+        if (options > PADRINO_OPTION_LIMIT) goto fail;
+    }
+    if (!options) goto fail;
+    titles = malloc((size_t)size * sizeof *titles);
+    rows = calloc(options, sizeof *rows);
+    if (!titles || !rows) goto fail;
+    cJSON_ArrayForEach(game, games) {
+        cJSON *links = cJSON_GetObjectItemCaseSensitive(game, "downloadLinks"), *link;
+        size_t before = used;
+        cJSON_ArrayForEach(link, links)
+            if (!map_link(game, link, PADRINO_SOURCE, &rows[used])) used++;
+        if (before < used) titles[title_count++] = game;
+        cJSON_DeleteItemFromObjectCaseSensitive(game, "downloadLinks");
+    }
+    if (!used) goto fail;
+    qsort(rows, used, sizeof *rows, compare_releases);
+    for (size_t i = 0; i < used; i++) {
+        if (*count && !strcmp(rows[*count - 1].id, rows[i].id)) continue;
+        if (*count != i) rows[*count] = rows[i];
+        (*count)++;
+    }
+    padrino_snapshot = snapshot;
+    padrino_titles = titles;
+    padrino_title_count = title_count;
+    *releases = rows;
+    *snapshot_at = PADRINO_SNAPSHOT_AT;
+    return 0;
+fail:
+    cJSON_Delete(snapshot);
+    free(titles);
+    free(rows);
+    return -1;
 }
 
 static void mirror_hash(Release *r, const char *identity) {

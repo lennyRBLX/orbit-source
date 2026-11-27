@@ -340,7 +340,7 @@ function CommunityCatalogues({ paired, pair, canRefresh }: {
         </p>}
         <button
           type="button"
-          disabled={busy || !canRefresh || !snapshot?.sources.some((source) => source.enabled) || retryAfter > 0}
+          disabled={busy || !canRefresh || !snapshot?.sources.some((source) => source.enabled && !source.bundled) || retryAfter > 0}
           onClick={() => void change(refreshRemoteSources)}
         >
           {t("Refresh now")}

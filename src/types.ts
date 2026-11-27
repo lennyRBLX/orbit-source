@@ -107,6 +107,7 @@ export interface RemoteSource {
   url: string;
   enabled: boolean;
   builtIn: boolean;
+  bundled?: boolean;
   lastFetchedAt: number;
   lastError: string;
   entryCount: number;

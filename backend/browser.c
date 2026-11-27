@@ -296,6 +296,7 @@ static void community_file(Release *selected, const Release *file) {
     copy_text(selected->filename, sizeof selected->filename, file->filename);
     copy_text(selected->format, sizeof selected->format, file->format);
     copy_text(selected->compression, sizeof selected->compression, file->compression);
+    copy_text(selected->archive_password, sizeof selected->archive_password, file->archive_password);
     selected->size = file->size;
 }
 

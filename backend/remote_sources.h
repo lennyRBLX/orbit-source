@@ -1,6 +1,9 @@
 #ifndef ORBIT_REMOTE_SOURCES_H
 #define ORBIT_REMOTE_SOURCES_H
 
+#define PADRINO_SOURCE "padrino"
+#define PADRINO_OPTION_LIMIT 16384
+
 #include "orbit.h"
 
 /* Startup loads the durable settings and cache before queue state is read. */
@@ -49,5 +52,8 @@ cJSON *remote_metadata_json_locked(const char *ids);
 int remote_release_parse(const cJSON *entry, Release *release);
 int remote_catalog_parse(const char *body, size_t length, const char *source_id,
                          Release **releases, size_t *count, size_t *skipped);
+int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at);
+const cJSON *padrino_game(const char *title_id);
+void padrino_catalog_clear(void);
 
 #endif

@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = json.loads((ROOT / "tests/fixtures/pegasus-catalog.json").read_text())
 DRIVER = ROOT / "build/orbit-remote-catalog-test"
-DEFAULTS = {"dlps", "evox-coreos", "pfs", "pippo-exfat", "zer0"}
+DEFAULTS = {"dlps", "evox-coreos", "pfs", "pippo-exfat", "zer0", "padrino"}
 
 
 class SourceHandler(http.server.BaseHTTPRequestHandler):
@@ -124,6 +124,42 @@ class RemoteCatalogueTests(unittest.TestCase):
             if openssl:
                 args.append(f"LDFLAGS=-L{openssl}/lib")
         subprocess.run(args, cwd=ROOT, check=True)
+
+    def test_padrino_snapshot_adds_ps4_and_ps5_games_without_replacing_orbit(self):
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            state = source(service.command("show"), "padrino")
+            self.assertTrue(state["enabled"])
+            self.assertTrue(state["bundled"])
+            self.assertGreater(state["entryCount"], 10000)
+            service.command("policy", remote=True, notice=False)
+            self.assertFalse(service.command("view")["remote"])
+            service.command("policy", remote=True, notice=True)
+            view = service.command("view")
+            rows = view["remote"]
+            self.assertEqual(len(rows), state["entryCount"])
+            self.assertGreater(len({row["titleId"] for row in rows}), 3500)
+            self.assertEqual({row["platform"] for row in rows}, {"ps4", "ps5"})
+            self.assertTrue(view["sameAddons"])
+            self.assertTrue(any(row["gameId"] == service.first_game["gameId"] for row in rows))
+            self.assertTrue(any(row["gameId"].startswith("rs-padrino-") and row["cover"] for row in rows))
+            self.assertFalse(any(row.get("homebrew") or row.get("archivePassword") or
+                                 "zstd" in row["filename"].lower() for row in rows))
+            self.assertEqual(service.command("PATCH", id="padrino", enabled=False)["status"], 200)
+            self.assertTrue(service.command("view")["sameGames"])
+
+    def test_padrino_file_formats_and_zstd_filter(self):
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            def mapped(filename, **fields):
+                link = {"name": "Fixture", "url": "https://example.org/" + filename, **fields}
+                entry = {"title": "Example Game", "titleId": "PPSA12345", "downloadLinks": [link]}
+                return service.command("map", padrino=True, entry=entry)
+
+            self.assertEqual(mapped("game.exfat")["format"], "exFAT")
+            self.assertEqual(mapped("game.ffpfsc")["format"], "FFPFSC")
+            archive = mapped("game.7z", archivePassword="example")
+            self.assertEqual((archive["compression"], archive["archivePassword"]), ("7z", "example"))
+            self.assertEqual(mapped("game-ZSTD.rar"), 1)
+            self.assertEqual(mapped("game.rar", format="Zstandard"), 1)
 
     def test_pegasus_entry_mapping_and_format_filter(self):
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:

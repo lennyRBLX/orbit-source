@@ -8,7 +8,7 @@ PS5_PAYLOAD_SDK ?= /opt/ps5-payload-sdk
 PS5_CC := $(PS5_PAYLOAD_SDK)/bin/prospero-clang
 PS5_LIB := $(PS5_PAYLOAD_SDK)/target/user/homebrew
 PS5_STRIP := $(PS5_PAYLOAD_SDK)/bin/prospero-strip
-GENERATED := build/generated/assets.h build/generated/catalog.h build/generated/ca.h build/generated/network.h build/generated/launcher.h build/generated/messages.h
+GENERATED := build/generated/assets.h build/generated/catalog.h build/generated/ca.h build/generated/network.h build/generated/launcher.h build/generated/messages.h build/generated/padrino.h
 PAYLOAD_SOURCES := $(SOURCES) launcher/install.c launcher/platform_ps5.c
 PAYLOAD_CC = $(PS5_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_INSTALL_LAUNCHER -Wno-unreachable-code-generic-assoc -I$(PS5_LIB)/include
 # The SDK opens DT_NEEDED libraries in order. AppInst uses Ipmi internally;
@@ -54,6 +54,8 @@ build/orbit-host build/orbit-test build/orbit-api-recovery-test build/orbit-tran
 build/orbit_runtime.elf build/orbit_store.elf build/orbit_core.elf build/orbit_transfer_benchmark.elf: $(PS5_ARCHIVE_DEPS)
 build/generated/messages.h: tools/embed-messages.py backend/notify.c $(wildcard i18n/*.json)
 	python3 tools/embed-messages.py
+build/generated/padrino.h: tools/import_padrino.py catalog/padrino.json.gz
+	python3 tools/import_padrino.py --embed $@
 build/generated/network.h build/generated/launcher.h &: tools/embed-launcher.py config/network.json launcher/sce_sys/param.json launcher/sce_sys/icon0.png
 	python3 tools/embed-launcher.py
 host: build/orbit-host
@@ -280,6 +282,6 @@ test-concurrency: build/orbit-test
 	python3 tests/concurrency_integration.py
 
 REMOTE_TEST_SOURCES := backend/catalog.c backend/catalog_crypto.c backend/catalog_view.c backend/download_policy.c backend/favorites.c backend/providers.c backend/provider_network.c backend/remote_catalog.c backend/remote_download.c backend/remote_sources.c backend/saved_filters.c backend/sources.c backend/state.c backend/state_file.c .deps/cjson/cJSON.c tests/remote_catalog_driver.c
-build/orbit-remote-catalog-test: $(REMOTE_TEST_SOURCES) $(HEADERS) build/generated/catalog.h build/generated/ca.h build/generated/network.h
+build/orbit-remote-catalog-test: $(REMOTE_TEST_SOURCES) $(HEADERS) build/generated/catalog.h build/generated/ca.h build/generated/network.h build/generated/padrino.h
 	@mkdir -p build
 	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) -DORBIT_DESKTOP -DORBIT_TEST -DORBIT_REMOTE_TEST_CLOCK $(REMOTE_TEST_SOURCES) -o $@ $(LDFLAGS) -lcurl -lcrypto -lz -lpthread -lm

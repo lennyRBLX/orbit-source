@@ -32,8 +32,8 @@
  * the user's choices. Future defaults are merged by id, never by enabled state. */
 static const struct {
     unsigned schema_version, revision, onboarding_revision;
-    struct { const char *id, *name, *description, *url; bool default_enabled; } sources[5];
-} manifest = {1, 2, 1, {
+    struct { const char *id, *name, *description, *url; bool default_enabled; } sources[6];
+} manifest = {1, 3, 1, {
     {"dlps", "DLPS Catalog", "Games and DLCs from DLPSGAME in various formats",
      "https://pegasus-dl.dev/catalogs/dlps.json", true},
     {"pippo-exfat", "Pippo .exFAT", "Games and DLCs in .exfat and .pkg format",
@@ -44,6 +44,8 @@ static const struct {
      "https://raw.githubusercontent.com/nexgen999/evoX-CoreOS/refs/heads/main/json/pegasus-dl/catalog.json", true},
     {"zer0", "ZER0GAME Catalog", "Games and DLCs in .pkg format",
      "https://pegasus-dl.dev/catalogs/zer0.json", true},
+    {PADRINO_SOURCE, "Padrino Store", "Bundled PS4 and PS5 catalog snapshot, without ZSTD",
+     "https://github.com/B4ckd0orl/Padrino-Store", true},
 }};
 
 typedef struct {
@@ -100,7 +102,8 @@ static bool notice_acknowledged_locked(void) {
 
 static bool sources_available_locked(bool empty_only) {
     for (size_t i = 0; i < remote.count; i++)
-        if (remote.sources[i].enabled && (!empty_only || !remote.sources[i].entries)) return true;
+        if (remote.sources[i].enabled && strcmp(remote.sources[i].id, PADRINO_SOURCE) &&
+            (!empty_only || !remote.sources[i].entries)) return true;
     return false;
 }
 
@@ -261,6 +264,7 @@ static cJSON *sources_json(bool disk) {
             cJSON_AddNumberToObject(r, "skippedEntries", s->skipped);
         if (disk) ok = ok && cJSON_AddStringToObject(r, "cacheHash", s->cache_hash);
         else if (s->built_in) {
+            if (!strcmp(s->id, PADRINO_SOURCE)) ok = ok && cJSON_AddTrueToObject(r, "bundled");
             for (size_t j = 0; j < sizeof manifest.sources / sizeof *manifest.sources; j++) {
                 if (strcmp(s->id, manifest.sources[j].id)) continue;
                 ok = ok && cJSON_AddStringToObject(r, "description", manifest.sources[j].description) &&
@@ -388,7 +392,8 @@ static bool merge_manifest(void) {
  * available. A failed allocation or fetch leaves the old options visible. */
 static int reserve_locked(const RemoteSource *source, size_t count) {
     size_t total = orbit.remote_release_count - source->entries + count;
-    if (total > REMOTE_RELEASE_LIMIT) return -1;
+    const RemoteSource *padrino = find(PADRINO_SOURCE);
+    if (total > REMOTE_RELEASE_LIMIT + (padrino ? padrino->entries : 0)) return -1;
     if (total <= orbit.remote_release_count) return 0;
     Release *next = realloc(orbit.remote_releases, total * sizeof *next);
     if (!next) return -1;
@@ -469,8 +474,19 @@ int remote_sources_load(void) {
     remote.unavailable = remote.cache_fd < 0 || (!valid && !missing);
     if (!valid) remote.count = 0;
     bool changed = merge_manifest();
+    RemoteSource *padrino = find(PADRINO_SOURCE);
+    if (padrino) {
+        if (padrino_catalog_load(&orbit.remote_releases, &orbit.remote_release_count, &padrino->fetched))
+            padrino->error = "invalid-catalogue";
+        else {
+            padrino->entries = orbit.remote_release_count;
+            padrino->error = NULL;
+            invalidate_locked();
+        }
+    }
     if (!remote.unavailable) {
-        for (size_t i = 0; i < remote.count; i++) cache_load(&remote.sources[i]);
+        for (size_t i = 0; i < remote.count; i++)
+            if (&remote.sources[i] != padrino) cache_load(&remote.sources[i]);
         if (changed && save_locked()) remote.unavailable = true;
     }
     return remote.unavailable ? -1 : 0;
@@ -770,7 +786,7 @@ static void *worker(void *unused) {
         memcpy(snapshots, remote.sources, count * sizeof *snapshots);
         pthread_mutex_unlock(&orbit.mutex);
         for (size_t i = 0; i < count && !stopping(); i++)
-            if (snapshots[i].enabled && (full || !snapshots[i].entries) &&
+            if (snapshots[i].enabled && strcmp(snapshots[i].id, PADRINO_SOURCE) && (full || !snapshots[i].entries) &&
                 !progress(&snapshots[i], 0, 0, 0, 0)) refresh_one(&snapshots[i]);
         pthread_mutex_lock(&orbit.mutex);
         if (full) remote.next = time(NULL) + REFRESH_INTERVAL;
@@ -808,6 +824,7 @@ void remote_sources_stop(void) {
     if (remote.cache_fd >= 0) close(remote.cache_fd);
     pthread_mutex_lock(&orbit.mutex);
     free(orbit.remote_releases);
+    padrino_catalog_clear();
     orbit.remote_releases = NULL;
     orbit.remote_release_count = 0;
     pthread_mutex_unlock(&orbit.mutex);

@@ -183,6 +183,7 @@ static bool append_remote_locked(cJSON *out) {
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "mirrorKey");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remotePage");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "sha256");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "archivePassword");
         const cJSON *match = match_title(titles, count, r->title_id);
         if (match) {
             const char *const keys[] = {"gameId", "title", "genre", "tagline", "description", "cover", "hero",
@@ -199,6 +200,14 @@ static bool append_remote_locked(cJSON *out) {
                     break;
                 }
             }
+        } else if (!strcmp(r->remote_catalog_id, PADRINO_SOURCE)) {
+            const cJSON *game = padrino_game(r->title_id);
+            ok = cJSON_AddStringToObject(entry, "cover", json_text(game, "cover")) &&
+                 cJSON_AddStringToObject(entry, "hero", json_text(game, "hero")) &&
+                 cJSON_AddStringToObject(entry, "genre", json_text(game, "genre")) &&
+                 cJSON_AddStringToObject(entry, "publisher", json_text(game, "publisher")) &&
+                 cJSON_AddStringToObject(entry, "releaseDate", json_text(game, "releaseDate")) &&
+                 cJSON_AddStringToObject(entry, "artworkLayout", "ambient");
         } else {
             ok = cJSON_AddBoolToObject(entry, "homebrew", true) &&
                  cJSON_AddStringToObject(entry, "cover", "") &&

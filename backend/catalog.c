@@ -281,9 +281,9 @@ cJSON *release_json(const Release *r) {
     if (r->remote_label[0]) { FIELD("remoteLabel", remote_label); }
     if (r->remote_page) cJSON_AddTrueToObject(o, "remotePage");
     if (r->mirror_key[0]) { FIELD("mirrorKey", mirror_key); }
+    if (r->archive_password[0]) { FIELD("archivePassword", archive_password); }
     if (r->compression[0]) {
         FIELD("compression", compression);
-        if (r->archive_password[0]) { FIELD("archivePassword", archive_password); }
         if (r->archive_unverified) cJSON_AddStringToObject(o, "archiveContents", "unverified");
         else cJSON_AddNumberToObject(o, "extractedBytes", (double)r->extracted_size);
     }

@@ -110,7 +110,9 @@ int main(int argc, char **argv) {
         } else if (!strcmp(op, "map") || !strcmp(op, "resolve")) {
             Release release, saved;
             const cJSON *row = cJSON_GetObjectItemCaseSensitive(request, "entry");
-            int code = pegasus_entry_to_release(row, "evox-coreos", &release);
+            const char *source = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(request, "padrino"))
+                ? PADRINO_SOURCE : "evox-coreos";
+            int code = pegasus_entry_to_release(row, source, &release);
             if (!code && !strcmp(op, "resolve")) {
                 Release locator;
                 char error[256] = "";
