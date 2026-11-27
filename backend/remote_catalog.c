@@ -56,6 +56,26 @@ static bool padrino_release(const Release *r) {
     return !strcmp(r->remote_catalog_id, PADRINO_SOURCE);
 }
 
+static const char *pspkg_platform(const char *source_id) {
+    if (!strcmp(source_id, PSPKG_PS5_SOURCE)) return "PS5";
+    if (!strcmp(source_id, PSPKG_PS4_SOURCE)) return "PS4";
+    return NULL;
+}
+
+/* The scanner publishes one feed containing both general sections and a
+ * separate Arabic PS5 import. Match the original general listing URL so an
+ * Arabic entry cannot enter either built-in source by its category alone. */
+static bool source_package(const cJSON *entry, const char *source_id) {
+    const char *platform = pspkg_platform(source_id);
+    if (!platform) return true;
+    const char *id = json_text(entry, "id");
+    const char *description = json_text(entry, "description");
+    if (strncmp(id, "pspkg-", 6) || !strncmp(id, "pspkg-arabic-", 13) ||
+        strcmp(json_text(entry, "category"), platform)) return false;
+    return strstr(description, !strcmp(platform, "PS5")
+        ? "\nSource: https://pspkg.com/ps5/" : "\nSource: https://pspkg.com/ps4/") != NULL;
+}
+
 static bool image_format(const Release *r) {
     return padrino_release(r) && (!strcmp(r->format, "exFAT") || !strcmp(r->format, "FFPFSC"));
 }
@@ -355,11 +375,22 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     char filename[sizeof r->filename] = "", path_name[sizeof r->filename] = "";
     if (!field(entry, "title", r->title, sizeof r->title) ||
         !field(entry, "titleId", r->title_id, sizeof r->title_id) ||
-        !r->title[0] || !identifier(r->title_id) ||
+        !r->title[0] ||
         !field(link, "filename", filename, sizeof filename) ||
         (!*filename && !field(entry, "filename", filename, sizeof filename)) ||
         (*filename && !filename_valid(filename))) return -1;
+    const char *pspkg = pspkg_platform(source_id);
+    if (pspkg && !r->title_id[0]) {
+        /* Public PSPKG pages often omit a PSN title ID. Keep their scanner ID
+         * stable and separate from real CUSA/PPSA matches in Orbit's catalogue. */
+        const char *id = json_text(entry, "id");
+        if (strlen(id) != 18 || strncmp(id, "pspkg-", 6) ||
+            strspn(id + 6, "0123456789abcdef") != 12) return -1;
+        snprintf(r->title_id, sizeof r->title_id, "P%c%s", pspkg[2], id + 6);
+    }
+    if (!identifier(r->title_id)) return -1;
     const char *platform = json_text(entry, "platform");
+    if (!*platform && pspkg) platform = pspkg;
     if ((*platform && strcasecmp(platform, "PS4") && strcasecmp(platform, "PS5")) ||
         (!strcasecmp(platform, "PS4") && !strncmp(r->title_id, "PPSA", 4)) ||
         (!strcasecmp(platform, "PS5") && !strncmp(r->title_id, "CUSA", 4))) return -1;
@@ -734,6 +765,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
     if (!remaining || !origins) goto failed;
     size_t i = 0;
     cJSON_ArrayForEach(entry, packages) {
+        if (!source_package(entry, source_id)) { i++; continue; }
         const cJSON *links = cJSON_GetObjectItemCaseSensitive(entry, "downloadLinks"), *link;
         bool unsupported = false;
         if (cJSON_IsArray(links) && *count < REMOTE_PACKAGE_LIMIT) {
@@ -766,6 +798,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
         bool more = false;
         i = 0;
         cJSON_ArrayForEach(entry, packages) {
+            if (!source_package(entry, source_id)) { i++; continue; }
             const cJSON *link = remaining[i].next;
             for (; link; link = link->next) {
                 Release r;

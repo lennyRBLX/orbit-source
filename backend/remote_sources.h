@@ -2,12 +2,19 @@
 #define ORBIT_REMOTE_SOURCES_H
 
 #define PADRINO_SOURCE "padrino"
+#define PSPKG_PS5_SOURCE "pspkg-ps5"
+#define PSPKG_PS4_SOURCE "pspkg-ps4"
 #define PADRINO_OPTION_LIMIT 16384
 
 #include "orbit.h"
 
 /* Startup loads the durable settings and cache before queue state is read. */
 int remote_sources_load(void);
+#ifdef ORBIT_TEST
+cJSON *remote_pspkg_preview(const char *source_id, const char *url,
+                            unsigned listing_limit, size_t game_limit);
+cJSON *remote_pspkg_links_test(const char *html);
+#endif
 int remote_sources_start(void);
 void remote_sources_stop(void);
 void remote_sources_changed_locked(void);

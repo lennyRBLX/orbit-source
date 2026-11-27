@@ -22,6 +22,7 @@
 #define SOURCE_LIMIT 32
 #define CUSTOM_LIMIT 24
 #define REFRESH_INTERVAL (6 * 60 * 60)
+#define PSPKG_REFRESH_INTERVAL (24 * 60 * 60)
 #define REFRESH_COOLDOWN_MS 60000
 #define URL_LIMIT 2048
 #define REMOTE_RELEASE_LIMIT 12288
@@ -32,8 +33,8 @@
  * the user's choices. Future defaults are merged by id, never by enabled state. */
 static const struct {
     unsigned schema_version, revision, onboarding_revision;
-    struct { const char *id, *name, *description, *url; bool default_enabled; } sources[6];
-} manifest = {1, 3, 1, {
+    struct { const char *id, *name, *description, *url; bool default_enabled; } sources[8];
+} manifest = {1, 4, 1, {
     {"dlps", "DLPS Catalog", "Games and DLCs from DLPSGAME in various formats",
      "https://pegasus-dl.dev/catalogs/dlps.json", true},
     {"pippo-exfat", "Pippo .exFAT", "Games and DLCs in .exfat and .pkg format",
@@ -46,6 +47,10 @@ static const struct {
      "https://pegasus-dl.dev/catalogs/zer0.json", true},
     {PADRINO_SOURCE, "Padrino Store", "Bundled PS4 and PS5 catalog snapshot, without ZSTD",
      "https://github.com/B4ckd0orl/Padrino-Store", true},
+    {PSPKG_PS5_SOURCE, "PSPKG PS5", "Public links from the general PSPKG PS5 games catalogue",
+     "https://pspkg.com/ps5/", true},
+    {PSPKG_PS4_SOURCE, "PSPKG PS4", "Public links from the general PSPKG PS4 games catalogue",
+     "https://pspkg.com/ps4/", true},
 }};
 
 typedef struct {
@@ -103,6 +108,8 @@ static bool notice_acknowledged_locked(void) {
 static bool sources_available_locked(bool empty_only) {
     for (size_t i = 0; i < remote.count; i++)
         if (remote.sources[i].enabled && strcmp(remote.sources[i].id, PADRINO_SOURCE) &&
+            (!empty_only || (strcmp(remote.sources[i].id, PSPKG_PS5_SOURCE) &&
+                             strcmp(remote.sources[i].id, PSPKG_PS4_SOURCE))) &&
             (!empty_only || !remote.sources[i].entries)) return true;
     return false;
 }
@@ -496,6 +503,7 @@ typedef struct {
     char *data;
     size_t size, capacity;
     char etag[256];
+    char effective_url[URL_LIMIT + 1];
     bool oversized;
 } Response;
 
@@ -600,6 +608,9 @@ static const char *fetch(const RemoteSource *s, Response *response, long *status
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     CURLcode result = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
+    char *effective = NULL;
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effective);
+    if (effective) copy_text(response->effective_url, sizeof response->effective_url, effective);
     curl_easy_cleanup(curl);
     curl_slist_free_all(request_headers);
     if (response->oversized || result == CURLE_FILESIZE_EXCEEDED) return "too-large";
@@ -608,10 +619,274 @@ static const char *fetch(const RemoteSource *s, Response *response, long *status
     return "";
 }
 
+#define PSPKG_LISTING_PAGES 8
+#define PSPKG_GAME_PAGES 180
+
+static bool pspkg_source(const char *id) {
+    return !strcmp(id, PSPKG_PS5_SOURCE) || !strcmp(id, PSPKG_PS4_SOURCE);
+}
+
+static bool pspkg_word(const char *start, size_t length, const char *word) {
+    size_t size = strlen(word);
+    for (size_t i = 0; i + size <= length; i++)
+        if (!strncasecmp(start + i, word, size)) return true;
+    return false;
+}
+
+static bool pspkg_text(const char *start, size_t length, char *out, size_t cap) {
+    size_t used = 0;
+    bool tag = false;
+    for (size_t i = 0; i < length; i++) {
+        if (start[i] == '<') { tag = true; continue; }
+        if (tag) { if (start[i] == '>') tag = false; continue; }
+        const char *value = NULL;
+        char decoded = 0;
+        if (start[i] == '&') {
+            const struct { const char *name; char value; } entities[] = {
+                {"&amp;", '&'}, {"&quot;", '"'}, {"&apos;", '\''}, {"&#39;", '\''},
+                {"&lt;", '<'}, {"&gt;", '>'}, {"&nbsp;", ' '}, {"&#160;", ' '}
+            };
+            for (size_t j = 0; j < sizeof entities / sizeof *entities; j++)
+                if (strlen(entities[j].name) <= length - i &&
+                    !memcmp(start + i, entities[j].name, strlen(entities[j].name))) {
+                    value = entities[j].name;
+                    decoded = entities[j].value;
+                    break;
+                }
+        }
+        char c = value ? decoded : start[i];
+        if (value) i += strlen(value) - 1;
+        if (isspace((unsigned char)c)) {
+            if (!used || out[used - 1] == ' ') continue;
+            c = ' ';
+        }
+        if (used + 1 >= cap) return false;
+        out[used++] = c;
+    }
+    while (used && out[used - 1] == ' ') used--;
+    out[used] = 0;
+    return used && utf8_text(out);
+}
+
+static bool pspkg_attribute(const char *tag, const char *end, const char *key, char *out, size_t cap) {
+    size_t n = strlen(key);
+    for (const char *p = tag; p + n < end; p++) {
+        if (p != tag && !isspace((unsigned char)p[-1])) continue;
+        if (strncasecmp(p, key, n)) continue;
+        const char *q = p + n;
+        while (q < end && isspace((unsigned char)*q)) q++;
+        if (q == end || *q++ != '=') continue;
+        while (q < end && isspace((unsigned char)*q)) q++;
+        if (q == end || (*q != '"' && *q != '\'')) continue;
+        char quote = *q++;
+        const char *finish = memchr(q, quote, (size_t)(end - q));
+        return finish && pspkg_text(q, (size_t)(finish - q), out, cap);
+    }
+    return false;
+}
+
+static bool pspkg_game_url(const char *href, const char *platform, const char *base, char *out, size_t cap) {
+    const char *path = href;
+    if (!strncmp(path, "https://pspkg.com", 17)) path += 17;
+    else if (!strncmp(path, "https://www.pspkg.com", 21)) path += 21;
+    else if (*path != '/') return false;
+    char prefix[8];
+    snprintf(prefix, sizeof prefix, "/%s/", platform);
+    if (strncmp(path, prefix, strlen(prefix))) return false;
+    path += strlen(prefix);
+    if (!strncmp(path, "download-", 9) || strchr(path, '/') || strchr(path, '?') || strchr(path, '#')) return false;
+    const char *suffix = strstr(path, ".html");
+    if (!suffix || suffix[5] || suffix == path) return false;
+    const char *dash = suffix;
+    while (dash > path && isdigit((unsigned char)dash[-1])) dash--;
+    if (dash == suffix || dash == path || dash[-1] != '-') return false;
+    const char *origin_end = strstr(base, "://");
+    origin_end = origin_end ? strchr(origin_end + 3, '/') : NULL;
+    if (!origin_end) return false;
+    int size = snprintf(out, cap, "%.*s/%s/%s", (int)(origin_end - base), base, platform, path);
+    return size > 0 && (size_t)size < cap;
+}
+
+static const char *pspkg_page(const RemoteSource *snapshot, const char *url, Response *page) {
+    RemoteSource request = *snapshot;
+    copy_text(request.url, sizeof request.url, url);
+    request.etag[0] = request.cache_hash[0] = 0;
+    long status = 0;
+    const char *error = fetch(&request, page, &status);
+    if (*error) return error;
+    if (strncmp(page->effective_url, "https://pspkg.com/", 18) &&
+        strncmp(page->effective_url, "https://www.pspkg.com/", 22)
+#ifdef ORBIT_TEST
+        && strncmp(page->effective_url, "http://127.0.0.1:", 17)
+#endif
+        ) return "http";
+    return page->data ? "" : "invalid-catalogue";
+}
+
+static bool pspkg_download(const char *href) {
+    if (strncmp(href, "https://", 8) || !remote_https_url(href)) return false;
+    const char *host = href + 8, *path = strchr(host, '/');
+    size_t host_length = path ? (size_t)(path - host) : strlen(host);
+    if (!host_length || host_length >= 128 || memchr(host, '@', host_length)) return false;
+    const char *hosts[] = {"vikingfile.com", "vik1ngfile.site", "datanodes.to", "datanodes.co",
+        "1fichier.com", "pixeldrain.com", "gofile.io", "mediafire.com", "mega.nz"};
+    for (size_t i = 0; i < sizeof hosts / sizeof *hosts; i++) {
+        size_t n = strlen(hosts[i]);
+        if (host_length >= n && !strncasecmp(host + host_length - n, hosts[i], n) &&
+            (host_length == n || host[host_length - n - 1] == '.')) return true;
+    }
+    size_t length = path ? strcspn(path, "?#") : 0;
+    return length >= 4 && !strncasecmp(path + length - 4, ".pkg", 4);
+}
+
+static void pspkg_links(const char *html, cJSON *links) {
+    for (const char *tag = html; (tag = strstr(tag, "<a")); tag += 2) {
+        if (!isspace((unsigned char)tag[2])) continue;
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        char href[URL_LIMIT + 1];
+        if (!pspkg_attribute(tag, end, "href", href, sizeof href) || !pspkg_download(href)) continue;
+        const char *close = strstr(end + 1, "</a>");
+        if (!close || close - end > 600) continue;
+        const char *near = tag - html > 250 ? tag - 250 : html;
+        char label[512];
+        if (!pspkg_text(near, (size_t)(close - near), label, sizeof label) ||
+            (!pspkg_word(label, strlen(label), "game") && !pspkg_word(label, strlen(label), "pkg")) ||
+            pspkg_word(label, strlen(label), "dlc") || pspkg_word(label, strlen(label), "backport") ||
+            pspkg_word(label, strlen(label), "patch") || pspkg_word(label, strlen(label), "update")) continue;
+        bool duplicate = false;
+        const cJSON *link;
+        cJSON_ArrayForEach(link, links)
+            if (!strcmp(json_text(link, "url"), href)) { duplicate = true; break; }
+        if (duplicate) continue;
+        cJSON *item = cJSON_CreateObject();
+        if (!item || !cJSON_AddStringToObject(item, "name", "Game PKG") ||
+            !cJSON_AddStringToObject(item, "url", href) || !cJSON_AddItemToArray(links, item)) {
+            cJSON_Delete(item);
+            return;
+        }
+    }
+}
+
+static const char *pspkg_scan(const RemoteSource *snapshot, char **body, size_t *length,
+                              unsigned listing_limit, size_t game_limit, size_t *discovered) {
+    const char *platform = !strcmp(snapshot->id, PSPKG_PS5_SOURCE) ? "ps5" : "ps4";
+    char (*games)[URL_LIMIT + 1] = calloc(game_limit, URL_LIMIT + 1);
+    cJSON *root = cJSON_CreateObject();
+    cJSON *packages = root ? cJSON_AddArrayToObject(root, "packages") : NULL;
+    if (!games || !packages) { free(games); cJSON_Delete(root); return "limit"; }
+    size_t game_count = 0;
+    const char *error = "";
+    for (unsigned page_number = 1; page_number <= listing_limit && game_count < game_limit && !stopping(); page_number++) {
+        char url[URL_LIMIT + 1];
+        snprintf(url, sizeof url, "%s?page=%u", snapshot->url, page_number);
+        Response page = {0};
+        error = pspkg_page(snapshot, url, &page);
+        if (*error) { free(page.data); if (page_number == 1) goto done; break; }
+        size_t before = game_count;
+        for (const char *tag = page.data; (tag = strstr(tag, "<a")) && game_count < game_limit; tag += 2) {
+            if (!isspace((unsigned char)tag[2])) continue;
+            const char *end = strchr(tag, '>');
+            if (!end) break;
+            char href[URL_LIMIT + 1], game[URL_LIMIT + 1];
+            if (!pspkg_attribute(tag, end, "href", href, sizeof href) ||
+                !pspkg_game_url(href, platform, snapshot->url, game, sizeof game)) continue;
+            bool duplicate = false;
+            for (size_t i = 0; i < game_count; i++)
+                if (!strcmp(games[i], game)) { duplicate = true; break; }
+            if (!duplicate) copy_text(games[game_count++], URL_LIMIT + 1, game);
+        }
+        free(page.data);
+        if (before == game_count) break;
+#ifndef ORBIT_TEST
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 900000000};
+        nanosleep(&delay, NULL);
+#endif
+    }
+    if (!game_count) { error = "invalid-catalogue"; goto done; }
+    if (discovered) *discovered = game_count;
+    error = "";
+    for (size_t i = 0; i < game_count && !stopping(); i++) {
+        Response page = {0};
+        const char *failed = pspkg_page(snapshot, games[i], &page);
+        if (*failed) { free(page.data); continue; }
+        const char *heading = strstr(page.data, "<h1");
+        const char *begin = heading ? strchr(heading, '>') : NULL;
+        const char *end = begin ? strstr(begin + 1, "</h1>") : NULL;
+        char title[128];
+        cJSON *links = cJSON_CreateArray();
+        bool named = begin && end && end - begin < 512 &&
+                     pspkg_text(begin + 1, (size_t)(end - begin - 1), title, sizeof title);
+        if (links) pspkg_links(page.data, links);
+        if (named && links && cJSON_GetArraySize(links)) {
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256((const unsigned char *)games[i], strlen(games[i]), digest);
+            char id[32], description[URL_LIMIT + 100];
+            snprintf(id, sizeof id, "pspkg-%02x%02x%02x%02x%02x%02x",
+                     digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]);
+            snprintf(description, sizeof description, "Public PSPKG listing.\nSource: %s\nFirmware compatibility not verified.", games[i]);
+            cJSON *entry = cJSON_CreateObject();
+            bool ok = entry && cJSON_AddStringToObject(entry, "id", id) &&
+                      cJSON_AddStringToObject(entry, "title", title) &&
+                      cJSON_AddStringToObject(entry, "category", !strcmp(platform, "ps5") ? "PS5" : "PS4") &&
+                      cJSON_AddStringToObject(entry, "description", description);
+            if (ok && cJSON_AddItemToObject(entry, "downloadLinks", links)) {
+                links = NULL;
+                ok = cJSON_AddItemToArray(packages, entry);
+            } else ok = false;
+            if (!ok) { cJSON_Delete(entry); error = "limit"; }
+        }
+        cJSON_Delete(links);
+        free(page.data);
+        if (*error) goto done;
+#ifndef ORBIT_TEST
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 500000000};
+        nanosleep(&delay, NULL);
+#endif
+    }
+    *body = cJSON_PrintUnformatted(root);
+    if (!*body) error = "limit";
+    else *length = strlen(*body);
+done:
+    free(games);
+    cJSON_Delete(root);
+    return error;
+}
+
+#ifdef ORBIT_TEST
+cJSON *remote_pspkg_preview(const char *source_id, const char *url,
+                            unsigned listing_limit, size_t game_limit) {
+    cJSON *result = cJSON_CreateObject();
+    const RemoteSource *source = find(source_id);
+    RemoteSource snapshot;
+    if (source) snapshot = *source;
+    if (source && url && *url) copy_text(snapshot.url, sizeof snapshot.url, url);
+    char *body = NULL;
+    size_t length = 0, discovered = 0;
+    const char *error = !source || !pspkg_source(source_id) || !listing_limit ||
+        !game_limit || game_limit > PSPKG_GAME_PAGES ? "invalid-catalogue" :
+        pspkg_scan(&snapshot, &body, &length, listing_limit, game_limit, &discovered);
+    cJSON_AddStringToObject(result, "error", error);
+    cJSON_AddNumberToObject(result, "discovered", discovered);
+    cJSON *feed = body ? cJSON_ParseWithLength(body, length) : NULL;
+    if (feed) cJSON_AddItemToObject(result, "feed", feed);
+    free(body);
+    return result;
+}
+
+cJSON *remote_pspkg_links_test(const char *html) {
+    cJSON *links = cJSON_CreateArray();
+    if (links) pspkg_links(html, links);
+    return links;
+}
+#endif
+
 static void refresh_one(const RemoteSource *snapshot) {
     Response response = {0};
-    long status = 0;
-    const char *error = fetch(snapshot, &response, &status);
+    long status = 200;
+    const char *error = pspkg_source(snapshot->id)
+        ? pspkg_scan(snapshot, &response.data, &response.size, PSPKG_LISTING_PAGES, PSPKG_GAME_PAGES, NULL)
+        : fetch(snapshot, &response, &status);
     Release *releases = NULL;
     size_t count = 0, skipped = 0;
     if (!*error && status == 200 &&
@@ -624,7 +899,8 @@ static void refresh_one(const RemoteSource *snapshot) {
         if (!*error && status == 200) {
             char filename[32];
             snprintf(filename, sizeof filename, "%s.json", live->id);
-            if (!count && skipped) error = "invalid-entries";
+            if ((!count && skipped) || (pspkg_source(live->id) && !count && live->entries))
+                error = "invalid-entries";
             else if (reserve_locked(live, count)) error = "limit";
             else if (state_file_replace(remote.cache_fd, filename, "catalogue.tmp", response.data, response.size))
                 error = "storage";
@@ -770,6 +1046,7 @@ static void *worker(void *unused) {
             continue;
         }
         time_t now = time(NULL);
+        bool forced = remote.pending;
         bool full = remote.pending || now >= remote.next;
         if (!full && !remote.empty_pending) {
             struct timespec deadline = {.tv_sec = remote.next};
@@ -787,6 +1064,8 @@ static void *worker(void *unused) {
         pthread_mutex_unlock(&orbit.mutex);
         for (size_t i = 0; i < count && !stopping(); i++)
             if (snapshots[i].enabled && strcmp(snapshots[i].id, PADRINO_SOURCE) && (full || !snapshots[i].entries) &&
+                (!pspkg_source(snapshots[i].id) || forced || !snapshots[i].fetched ||
+                 now - snapshots[i].fetched >= PSPKG_REFRESH_INTERVAL) &&
                 !progress(&snapshots[i], 0, 0, 0, 0)) refresh_one(&snapshots[i]);
         pthread_mutex_lock(&orbit.mutex);
         if (full) remote.next = time(NULL) + REFRESH_INTERVAL;

@@ -16,7 +16,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = json.loads((ROOT / "tests/fixtures/pegasus-catalog.json").read_text())
 DRIVER = ROOT / "build/orbit-remote-catalog-test"
-DEFAULTS = {"dlps", "evox-coreos", "pfs", "pippo-exfat", "zer0", "padrino"}
+DEFAULTS = {"dlps", "evox-coreos", "pfs", "pippo-exfat", "zer0", "padrino",
+            "pspkg-ps5", "pspkg-ps4"}
 
 
 class SourceHandler(http.server.BaseHTTPRequestHandler):
@@ -465,6 +466,72 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertTrue(saved["acknowledged"])
                 self.assertEqual(saved["enabled"], ["archive"])
 
+    def test_pspkg_general_sources_exclude_arabic_and_keep_platforms_separate(self):
+        def package(identity, category, page, title_id=""):
+            return {"id": identity, "title": identity, "titleId": title_id,
+                    "category": category,
+                    "description": f"Public listing.\nSource: https://pspkg.com/{page}\nFirmware compatibility not verified.",
+                    "downloadLinks": [{"name": "PKG", "url": f"https://example.org/{identity}.pkg"}]}
+
+        ps5 = package("pspkg-012345abcdef", "PS5", "ps5/a-game-123.html")
+        ps4 = package("pspkg-abcdef012345", "PS4", "ps4/another-game-456.html", "CUSA12345")
+        arabic = package("pspkg-arabic-77e84b9af10e1f00", "PS5", "arabic-games/arabic-789.html")
+        mislabeled = package("pspkg-fedcba987654", "PS5", "arabic-games/other-789.html")
+        feed = {"packages": [ps5, ps4, arabic, mislabeled]}
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            manifest = service.command("show")
+            for source_id, platform, expected in (("pspkg-ps5", "ps5", "P5012345abcdef"),
+                                                  ("pspkg-ps4", "ps4", "CUSA12345")):
+                built_in = source(manifest, source_id)
+                self.assertTrue(built_in["builtIn"])
+                self.assertTrue(built_in["enabled"])
+                self.assertEqual(built_in["url"], f"https://pspkg.com/{platform}/")
+                parsed = service.command("parse", source=source_id, feed=feed)
+                self.assertEqual((parsed["code"], parsed["skipped"]), (0, 0))
+                self.assertEqual(len(parsed["releases"]), 1)
+                self.assertEqual(parsed["releases"][0]["titleId"], expected)
+                self.assertEqual(parsed["releases"][0]["platform"], platform)
+            self.assertEqual(service.command("parse", source="pspkg-ps5",
+                                             feed={"packages": [arabic]})["releases"], [])
+
+    def test_pspkg_public_game_links_exclude_update_and_backport_sections(self):
+        html = ("<div>Game PKG <a href=\"https://vikingfile.com/f/game123\">Download</a></div>"
+                "<div>Update PKG <a href=\"https://vikingfile.com/f/update123\">Download</a></div>"
+                "<div>Backport PKG <a href=\"https://example.org/backport.pkg\">Download</a></div>")
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            links = service.command("pspkg-links", html=html)
+            self.assertEqual([link["url"] for link in links], ["https://vikingfile.com/f/game123"])
+
+    def test_pspkg_scan_fetches_general_ps5_and_ps4_pages(self):
+        server = FixtureServer()
+        for platform in ("ps5", "ps4"):
+            server.downloads[f"/{platform}/?page=1"] = (200, {"Content-Type": "text/html"},
+                (f'<a href="/{platform}/sample-game-123.html">Sample</a>'
+                 '<a href="/arabic-games/arabic-game-456.html">Arabic</a>').encode())
+            server.downloads[f"/{platform}/sample-game-123.html"] = (200, {"Content-Type": "text/html"},
+                b'<h1>Sample &amp; Game</h1><div>Game PKG '
+                b'<a href="https://vikingfile.com/f/game123">Download</a></div>')
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                service.command("policy", remote=True, notice=True)
+                for platform in ("ps5", "ps4"):
+                    result = service.command("pspkg-scan", source=f"pspkg-{platform}",
+                                             url=server.url.replace("/catalogue.json", f"/{platform}/"),
+                                             listingLimit=1, gameLimit=3)
+                    self.assertEqual((result["error"], result["discovered"]), ("", 1))
+                    packages = result["feed"]["packages"]
+                    self.assertEqual(len(packages), 1)
+                    self.assertEqual(packages[0]["title"], "Sample & Game")
+                    self.assertEqual(packages[0]["category"], platform.upper())
+                    self.assertEqual(packages[0]["downloadLinks"][0]["url"],
+                                     "https://vikingfile.com/f/game123")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_manifest_revision_keeps_disabled_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             with Driver(directory) as service:
@@ -476,13 +543,16 @@ class RemoteCatalogueTests(unittest.TestCase):
             path = Path(directory) / "remote-sources-v1.json"
             settings = json.loads(path.read_text())
             settings["revision"] -= 1
-            settings["sources"] = [s for s in settings["sources"] if s["id"] != "zer0"]
+            settings["sources"] = [s for s in settings["sources"]
+                                   if s["id"] not in {"zer0", "pspkg-ps5", "pspkg-ps4"}]
             path.write_text(json.dumps(settings))
             with Driver(directory) as service:
                 snapshot = service.command("show")
                 self.assertEqual(snapshot["revision"], settings["revision"] + 1)
                 self.assertFalse(source(snapshot, "evox-coreos")["enabled"])
                 self.assertTrue(source(snapshot, "zer0")["enabled"])
+                self.assertTrue(source(snapshot, "pspkg-ps5")["enabled"])
+                self.assertTrue(source(snapshot, "pspkg-ps4")["enabled"])
 
     def test_tick_retries_enabled_empty_sources_and_cools_down_manual_refresh(self):
         server = FixtureServer()

@@ -107,6 +107,29 @@ int main(int argc, char **argv) {
             atomic_fetch_add(&scheduler_clock, json_int(request, "milliseconds"));
             if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(request, "tick"))) remote_sources_tick();
             puts("true");
+        } else if (!strcmp(op, "pspkg-scan")) {
+            print_json(remote_pspkg_preview(json_text(request, "source"), json_text(request, "url"),
+                                            (unsigned)json_int(request, "listingLimit"),
+                                            (size_t)json_int(request, "gameLimit")));
+        } else if (!strcmp(op, "pspkg-links")) {
+            print_json(remote_pspkg_links_test(json_text(request, "html")));
+        } else if (!strcmp(op, "parse")) {
+            const cJSON *feed = cJSON_GetObjectItemCaseSensitive(request, "feed");
+            char *body = cJSON_PrintUnformatted(feed);
+            Release *releases = NULL;
+            size_t count = 0, skipped = 0;
+            const char *source = json_text(request, "source");
+            int code = body ? remote_catalog_parse(body, strlen(body), source,
+                                                    &releases, &count, &skipped) : -1;
+            cJSON *result = cJSON_CreateObject();
+            cJSON_AddNumberToObject(result, "code", code);
+            cJSON_AddNumberToObject(result, "skipped", skipped);
+            cJSON *rows = cJSON_AddArrayToObject(result, "releases");
+            for (size_t i = 0; !code && i < count; i++)
+                cJSON_AddItemToArray(rows, release_json(&releases[i]));
+            print_json(result);
+            free(releases);
+            free(body);
         } else if (!strcmp(op, "map") || !strcmp(op, "resolve")) {
             Release release, saved;
             const cJSON *row = cJSON_GetObjectItemCaseSensitive(request, "entry");
