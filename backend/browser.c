@@ -5,7 +5,6 @@
 #include "viking_session.h"
 #include "viking_pass.h"
 #include "network.h"
-#include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +22,6 @@ static struct {
     char queued_job_id[sizeof ((Job *)0)->id];
     char mirror_page[128];
     char native_failure[256];
-    char archive_password[sizeof ((Job *)0)->archive_password];
     Release release;
     Storage storage;
     Job refresh_job;
@@ -85,7 +83,7 @@ static const char *native_failure_message(const char *failure) {
     return NULL;
 }
 static bool selected_locked(void) {
-    if (session.account || !strcmp(session.release.source, ORBIT_DIRECT_SOURCE)) return true;
+    if (session.account) return true;
     if (session.queued_job_id[0]) {
         const Job *j = job_find(session.queued_job_id);
         return j && j->browser_pending && !j->cancel && !j->pause &&
@@ -436,12 +434,9 @@ static void *worker(void *unused) {
             continue;
         }
         Release resolved = session.release;
-        bool direct = !strcmp(resolved.source, ORBIT_DIRECT_SOURCE);
         if (atomic_load(&session.cancel)) {
             /* The owner may report failure before this worker is scheduled. */
-        } else if (direct)
-            state_locked("validating", "Checking the download URL…");
-        else if (session.resolving)
+        } else if (session.resolving)
             state_locked("validating", remote_page_pending(&resolved)
                 ? "Reading the community catalogue download option…" : "Checking sign-in…");
         else if (session.native_dialog && !session.dialog_opened)
@@ -454,9 +449,7 @@ static void *worker(void *unused) {
         char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
         bool validated = false;
         bool ok = false;
-        if (direct) {
-            validated = ok = active() && !remote_download_verify(&resolved, resolved.url, &session.cancel, error, sizeof error);
-        } else if (remote_page_pending(&resolved)) {
+        if (remote_page_pending(&resolved)) {
             validated = ok = resolve_community(&resolved, etag, modified, error, sizeof error);
         } else {
             ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
@@ -495,7 +488,7 @@ static void *worker(void *unused) {
             int code = session.refresh_job.id[0]
                 ? job_refresh_link_locked(job, &resolved, &session.storage, etag, modified, error, sizeof error)
                 : job_create_captured_locked(&resolved, &session.storage, etag, modified,
-                                             session.archive_password, error, sizeof error, &job);
+                                             error, sizeof error, &job);
             if (code == 200 || code == 201) {
                 copy_text(session.job_id, sizeof session.job_id, job->id);
                 state_locked("queued", "Your verified file has been added to Downloads.");
@@ -520,7 +513,6 @@ static void *worker(void *unused) {
         /* No pending verification survives a restart. No browser bytes are saved. */
         memset(&resolved, 0, sizeof resolved);
         memset(&session.release, 0, sizeof session.release);
-        OPENSSL_cleanse(session.archive_password, sizeof session.archive_password);
         session.mirror_page[0] = 0;
         session.queued_job_id[0] = 0;
         memset(&session.refresh_job, 0, sizeof session.refresh_job);
@@ -636,8 +628,6 @@ cJSON *browser_status(void) {
     cJSON_AddStringToObject(o, "vikingNativeState", native_account);
     cJSON_AddStringToObject(o, "vikingPass", pass_account);
     cJSON_AddBoolToObject(o, "accountPage", session.account);
-    if (session.diagnostic_operation && !strcmp(session.diagnostic_operation, "direct-download"))
-        cJSON_AddTrueToObject(o, "directDownload");
     cJSON_AddBoolToObject(o, "nativeDialogAvailable", session.ready && available() && !session.stop);
     if (session.native_dialog) {
         cJSON_AddStringToObject(o, "clientId", session.client_id);
@@ -717,57 +707,12 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             if (session.native_failure[0]) state_locked("failed", session.native_failure);
             else state_locked("cancelled", "Verification cancelled. No download was added.");
         }
-    } else if (strcmp(action, "start") && strcmp(action, "refresh") && strcmp(action, "viking-account") && strcmp(action, "viking-check") && strcmp(action, ORBIT_DIRECT_SOURCE)) {
+    } else if (strcmp(action, "start") && strcmp(action, "refresh") && strcmp(action, "viking-account") && strcmp(action, "viking-check")) {
         copy_text(error, cap, "Unknown browser action."); code = 400;
     } else if (!session.ready || session.stop || !available()) {
         copy_text(error, cap, "Provider verification is available on the PS5 only."); code = 409;
     } else if (session.busy) {
         copy_text(error, cap, "Finish or cancel the current verification first."); code = 409;
-    } else if (!strcmp(action, ORBIT_DIRECT_SOURCE)) {
-        Release direct;
-        if (!direct_release_init(&direct, json_text(input, "url"))) {
-            copy_text(error, cap, "Enter a valid HTTP or HTTPS download URL without credentials or a fragment."); code = 400;
-            goto done;
-        }
-        const cJSON *password = cJSON_GetObjectItemCaseSensitive(input, "password");
-        const char *secret = json_text(input, "password");
-        if ((password && !cJSON_IsString(password)) || strlen(secret) >= sizeof session.archive_password) {
-            copy_text(error, cap, "Enter an archive password of up to 128 bytes."); code = 400;
-            goto done;
-        }
-        if (!utf8_text(secret)) {
-            copy_text(error, cap, "The archive password cannot contain control characters."); code = 400;
-            goto done;
-        }
-        Storage drives[ORBIT_MAX_STORAGE], *selected = NULL;
-        size_t count = storage_list(drives);
-        for (size_t i = 0; i < count; i++)
-            if (!strcmp(drives[i].id, json_text(input, "storageId"))) selected = &drives[i];
-        if (!selected) {
-            copy_text(error, cap, "Reconnect the selected drive first."); code = 409;
-            goto done;
-        }
-        if (start_worker_locked()) {
-            copy_text(error, cap, "Download URL verification could not start. Try again."); code = 503;
-            goto done;
-        }
-        session.account = session.check_account = session.native_dialog = session.dialog_opened = session.return_to_browser = false;
-        session.resolving = true;
-        session.release = direct;
-        copy_text(session.archive_password, sizeof session.archive_password, secret);
-        session.storage = *selected;
-        memset(&session.refresh_job, 0, sizeof session.refresh_job);
-        session.native_failure[0] = session.job_id[0] = session.client_id[0] = 0;
-        copy_text(session.title, sizeof session.title, "Direct URL download");
-        random_hex(session.id, 16);
-        session.started_ms = milliseconds();
-        session.capture_ms = session.link_ms = session.validation_ms = session.queued_ms = session.finished_ms = 0;
-        session.scanned_bytes = session.candidates = session.browser_processes = 0;
-        reset_diagnostics_locked(direct.source, "direct-download");
-        session.busy = session.pending = true;
-        atomic_store(&session.cancel, false);
-        state_locked("validating", "Checking the download URL…");
-        pthread_cond_signal(&session.changed);
     } else {
         const cJSON *target = cJSON_GetObjectItemCaseSensitive(input, "returnTarget");
         const cJSON *legacy = cJSON_GetObjectItemCaseSensitive(input, "returnToOrbit");
@@ -852,10 +797,6 @@ done:
 
 int browser_action(const cJSON *input, char *error, size_t cap) {
     return perform_action(input, json_text(input, "action"), error, cap);
-}
-
-int browser_direct_download(const cJSON *input, char *error, size_t cap) {
-    return perform_action(input, ORBIT_DIRECT_SOURCE, error, cap);
 }
 
 void browser_source_changed_locked(void) {

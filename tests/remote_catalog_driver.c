@@ -1,5 +1,6 @@
 #include "catalog_view.h"
 #include "firmware.h"
+#include "links.h"
 #include "orbit.h"
 #include "packages.h"
 #include "remote_sources.h"
@@ -25,6 +26,12 @@ bool job_active(const Job *j) { return !strcmp(j->status, "downloading"); }
 bool job_can_refresh_link(const Job *j) { (void)j; return false; }
 const char *notify_event_name(unsigned index) { (void)index; return NULL; }
 void browser_source_changed_locked(void) {}
+/* User-pasted links are covered by the full service integration test. */
+bool link_release_valid(const Release *r) { (void)r; return false; }
+bool link_url_allowed(const char *url) { (void)url; return false; }
+void link_host(const char *url, char *out, size_t cap) { (void)url; if (cap) out[0] = 0; }
+bool job_can_replace_link(const Job *j) { (void)j; return false; }
+
 static atomic_llong scheduler_clock;
 int64_t orbit_remote_test_clock(void) { return atomic_load(&scheduler_clock); }
 

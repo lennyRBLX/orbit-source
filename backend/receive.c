@@ -1323,7 +1323,7 @@ int receive_command(const char *action, const cJSON *input, const char *owner, c
             }
             pthread_mutex_lock(&orbit.mutex);
             /* Downloads keep running; Files actions take turns. */
-            bool occupied = orbit.files_storage_busy || orbit.stop;
+            bool occupied = orbit.files_storage_busy || orbit.library_storage_busy || orbit.stop;
             if (occupied) {
                 code = 409;
                 message = "Another file operation is running. Wait for it to finish, or cancel it.";
@@ -1490,7 +1490,7 @@ static int bundle_select(const char *sid, const char *name, Storage *out, int64_
     if (found) snprintf(destination, sizeof destination, "%s/homebrew/%s", out->root, name);
     pthread_mutex_lock(&orbit.mutex);
     /* Downloads keep running; Files actions take turns. */
-    bool occupied = orbit.files_storage_busy || orbit.stop;
+    bool occupied = orbit.files_storage_busy || orbit.library_storage_busy || orbit.stop;
     bool downloading = found && storage_path_downloading_locked(destination);
     uint64_t pending = found ? storage_pending_locked(out, NULL) : 0;
     if (occupied) *message = "Another file operation is running. Wait for it to finish, or cancel it.";

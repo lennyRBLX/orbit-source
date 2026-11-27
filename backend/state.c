@@ -1,6 +1,7 @@
 #include "network.h"
 #include "orbit.h"
 #include "remote_sources.h"
+#include "links.h"
 #include "packages.h"
 #include "firmware.h"
 #include "state_file.h"
@@ -103,6 +104,14 @@ static cJSON *job_json(const Job *j, bool private_fields) {
     S("verification", verification);
     firmware_describe_download(o, j, orbit.firmware);
     cJSON_AddBoolToObject(o, "canRefreshLink", job_can_refresh_link(j));
+    if (!strcmp(j->release.source, "link")) {
+        /* Never the link itself, which can carry a private token: only its host. */
+        char host[128];
+        link_host(j->release.url, host, sizeof host);
+        cJSON_AddStringToObject(o, "sourceId", "link");
+        cJSON_AddStringToObject(o, "linkHost", host);
+        cJSON_AddBoolToObject(o, "canReplaceLink", job_can_replace_link(j));
+    }
     cJSON_AddStringToObject(o, "delivery", j->delivery[0] ? j->delivery : "direct");
     S("deliveryPhase", delivery_phase);
     int64_t received = j->received;
@@ -251,6 +260,9 @@ static cJSON *state_json_locked(void) {
     for (size_t i = 0; i < orbit.job_count; i++)
         if (orbit.jobs[i].id[0] && orbit.jobs[i].segmented && !legacy_ranges(&orbit.jobs[i]) && !whole_range(&orbit.jobs[i]))
             schema = 7;
+    /* Older builds can't read a download from a pasted link and would drop the queue. */
+    for (size_t i = 0; i < orbit.job_count; i++)
+        if (orbit.jobs[i].id[0] && !strcmp(orbit.jobs[i].release.source, "link")) schema = 8;
     cJSON_AddNumberToObject(o, "schema", schema);
     cJSON_AddStringToObject(o, "preferredStorage", orbit.preferred_storage);
     cJSON_AddBoolToObject(o, "deleteArchives", orbit.delete_archives);
@@ -373,7 +385,7 @@ int state_load(void) {
     if (!cJSON_IsNumber(schema_value) ||
         (schema_value->valuedouble != 1 && schema_value->valuedouble != 2 && schema_value->valuedouble != 3 &&
          schema_value->valuedouble != 4 && schema_value->valuedouble != 5 && schema_value->valuedouble != 6 &&
-         schema_value->valuedouble != 7)) {
+         schema_value->valuedouble != 7 && schema_value->valuedouble != 8)) {
         free(s);
         cJSON_Delete(o);
         return -1;
@@ -573,7 +585,7 @@ int state_load(void) {
             const cJSON *web = cJSON_GetObjectItemCaseSensitive(x, "debridId"),
                         *file = cJSON_GetObjectItemCaseSensitive(x, "debridFile");
             const char *account = json_text(x, "debridAccount");
-            if ((schema != 3 && schema != 5 && schema != 6 && schema != 7) || strlen(account) != 64 || strspn(account, "0123456789abcdef") != 64 ||
+            if ((schema != 3 && schema != 5 && schema != 6 && schema != 7 && schema != 8) || strlen(account) != 64 || strspn(account, "0123456789abcdef") != 64 ||
                 !cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(x, "debridSubmitted")) ||
                 !cJSON_IsNumber(web) || !cJSON_IsNumber(file) ||
                 !(web->valuedouble >= -1 && web->valuedouble <= 9007199254740991.0) ||

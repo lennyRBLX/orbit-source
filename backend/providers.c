@@ -1,5 +1,6 @@
 #include "orbit.h"
 #include "provider_network.h"
+#include "links.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -281,6 +282,12 @@ bool provider_header_filename(const char *value, char *out, size_t cap) {
     }
     return false;
 }
+bool provider_content_filename(const char *disposition, char *out, size_t cap) {
+    return provider_header_filename(disposition, out, cap);
+}
+bool provider_percent_decode(const char *src, size_t n, char *out, size_t cap) {
+    return percent_decode(src, n, out, cap);
+}
 /* The file name a storage link's response-content-disposition asks for. The
  * value may be encoded once or twice. Also used for the kernel log. */
 bool provider_disposition_name(const char *url, char *out, size_t cap) {
@@ -348,6 +355,8 @@ static bool viking_storage_link(const Release *r) {
 /* Provider boundary: never turn metadata/page URLs into unverified downloads. */
 bool provider_url_supported(const Release *release) {
     if (!strcmp(release->source, "remote")) return remote_https_url(release->url);
+    /* A link the user pasted: any https host, guarded like provider downloads. */
+    if (!strcmp(release->source, "link")) return link_url_allowed(release->url);
     if (!strcmp(release->id, "orbit-network-check"))
         return !strcmp(release->url,
                        "https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.19/LICENSE");
@@ -409,7 +418,8 @@ bool provider_supported(const Release *release) {
     /* Test binaries may parse the catalogue, but may only transfer fixtures. */
     return !strncmp(release->url, "http://127.0.0.1:", 17) &&
            (!strcmp(release->source, "archive") || !strcmp(release->source, "remote") ||
-            !strcmp(release->source, ORBIT_DIRECT_SOURCE) || provider_browser_source(release->source));
+            !strcmp(release->source, ORBIT_DIRECT_SOURCE) ||
+            !strcmp(release->source, "link") || provider_browser_source(release->source));
 #else
     if (!strcmp(release->source, ORBIT_DIRECT_SOURCE)) return direct_http_url(release->url);
     return provider_url_supported(release);

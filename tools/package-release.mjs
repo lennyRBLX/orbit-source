@@ -99,7 +99,7 @@ Existing users can update the service through **App settings → Update / reinst
 
 Run \`shasum -a 256 -c <filename>.sha256\` beside each binary to verify it. Source-bundle contents have their own \`SOURCE-SHA256SUMS\`.
 
-Orbit Store is in **beta**. The game catalogue offers single-file FFPFSC, exFAT, FPKG and PKG options. After downloading or transferring a package to PS5, choose **Install on PS5**. For bundles, select each package explicitly; the downloaded files are retained. Keep the PS5 awake during downloads. Game folders and PS5 packages run with Kraken Mount. See the [guides](https://github.com/saawant12/orbit-store-ps5/tree/main/guides) for setup and troubleshooting.
+Orbit Store is in **beta**. The game catalogue offers single-file FFPFSC, exFAT, FPKG and PKG options. After downloading or transferring a package to PS5, choose **Install on PS5**. For bundles, select each package explicitly; the downloaded files are retained. Keep the PS5 awake during downloads. ShadowMountPlus installs packages and registers game images and folders. See the [guides](https://github.com/saawant12/orbit-store-ps5/tree/main/guides) for setup and troubleshooting.
 
 Orbit Store is free software under GPL-3.0-or-later. The application source is built from commit \`${commit}\`; component sources and licences are listed in \`THIRD-PARTY-NOTICES.md\` and \`SOURCES.json\`.
 `);

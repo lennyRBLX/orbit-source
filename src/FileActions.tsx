@@ -16,6 +16,7 @@ export const fileTypeName = (entry: FileEntry) =>
       game: /* i18n */ "Game folder",
       archive: /* i18n */ "Archive",
       package: /* i18n */ "Package",
+      image: /* i18n */ "Game image",
       file: /* i18n */ "File",
     }[entry.type],
   );
@@ -24,6 +25,7 @@ export const fileGlyph: Record<FileEntry["type"], GlyphName> = {
   game: "ps",
   archive: "archive",
   package: "box",
+  image: "layers",
   file: "list",
 };
 // Small files in kilobytes; Orbit's own sizes start at megabytes.
@@ -47,8 +49,8 @@ export const lockedText = (locked: string) =>
       drive: /* i18n */ "This is the top of the drive.",
       orbit: /* i18n */ "Orbit keeps its own settings and downloads list here.",
       download: /* i18n */ "A download or transfer is using this.",
+      game: /* i18n */ "ShadowMount is using this game. Unmount or uninstall it first.",
       install: /* i18n */ "The PS5 is installing from this.",
-      game: /* i18n */ "Kraken Mount is using this game. Remove it in Kraken Mount first.",
       busy: /* i18n */ "Another file operation is using this.",
     }[locked] || locked,
   );
@@ -77,9 +79,8 @@ export function fileActions(files: FilesModel, entry: FileEntry, consoleBrowser:
   if (entry.folder) list.push({ key: "open", label: t("Open"), glyph: "next", primary: true, run: () => files.open(files.storageId, files.pathOf(entry)) });
   if (entry.type === "archive")
     list.push({ key: "unpack", label: t("Unpack here"), glyph: "archive", primary: true, disabled: busy || written, run: () => go("unpack") });
-  // A game folder isn't installed: it runs with Kraken Mount (moved into homebrew if Kraken Mount wouldn't find it).
-  if (["package", "game"].includes(entry.type))
-    list.push({ key: "install", label: entry.type === "game" ? t("Add with Kraken Mount") : t("Install on PS5"), glyph: "down", primary: !entry.folder, disabled: busy || written || entry.locked === "install", run: () => go("install") });
+  if (["package", "image", "game"].includes(entry.type))
+    list.push({ key: "install", label: t("Install on PS5"), glyph: "down", primary: !entry.folder, disabled: busy || written || entry.locked === "install", run: () => go("install") });
   if (entry.type === "game") list.push({ key: "verify", label: t("Verify & Repair"), glyph: "check", disabled: busy || written, run: () => go("verify") });
   if (!entry.folder && !consoleBrowser)
     list.push({ key: "save", label: t("Save to this device"), glyph: "down", run: () => void files.save(entry).catch((e) => report((e as Error).message)) });

@@ -6,6 +6,8 @@ import { QueuePosition } from "./QueuePosition";
 import { Artwork } from "./Artwork";
 import { PowerJobDialog } from "./PowerSetting";
 import { HistoryRemoval } from "./HistoryRemoval";
+import { AddLinks } from "./AddLinks";
+import { openFreeSpace } from "./FreeSpace";
 import {
   bytes,
   formatLabel,
@@ -18,7 +20,7 @@ import { formatNumber, placeName, t, tn } from "./i18n";
 import { useInterfacePrefs } from "./interfaces/choice";
 import { CrossbarDownloads } from "./interfaces/CrossbarDownloads";
 import { PanoramaDownloads } from "./interfaces/PanoramaDownloads";
-import { powerJobAction, inactive, retryWait, statusLabels, timeLeft, waiting, type DownloadView } from "./jobs";
+import { powerJobAction, inactive, retryWait, statusLabels, timeLeft, unpackShort, waiting, type DownloadView } from "./jobs";
 export function Downloads({
   jobs,
   games,
@@ -31,6 +33,7 @@ export function Downloads({
   deletePackages = false,
   power,
   refresh,
+  preferredDrive,
 }: {
   jobs: Job[];
   power?: System["power"];
@@ -46,6 +49,8 @@ export function Downloads({
   // Whether the PS5 deletes a package once it is installed (App settings → Storage).
   deletePackages?: boolean;
   refresh: () => Promise<unknown>;
+  // The drive Download from links starts on (the default drive).
+  preferredDrive?: string;
 }) {
   const iface = useInterfacePrefs().prefs.name;
   const [view, setView] = useState<DownloadView>("Active");
@@ -58,6 +63,9 @@ export function Downloads({
   const [installationJob, setInstallationJob] = useState("");
   const [historyJobs, setHistoryJobs] = useState<Job[]>([]);
   const [passwordJob, setPasswordJob] = useState<Job | null>(null);
+  // Download from links: true to add links, a download to give it a fresh link.
+  const [links, setLinks] = useState<Job | true | null>(null);
+  const addLinks = () => { setError(""); setMessage(""); setLinks(true); };
   const [archivePassword, setArchivePassword] = useState("");
   async function retryExtraction() {
     if (!passwordJob || !archivePassword) return;
@@ -125,6 +133,17 @@ export function Downloads({
     if (name === "power" && powerJobAction(job, power)) { setMessage(""); setPowerJob({ job, enabled: !(power?.enabled && power.jobId === job.id) }); return; }
     if (name === "remove" || name === "forget") { setCancel(null); setHistoryJobs([job]); return; }
     if (name === "packages") { setError(""); setInstallationJob(job.id); return; }
+    if (name === "replace-link") { setError(""); setMessage(""); setLinks(job); return; }
+    if (name === "free-space") {
+      setError(""); setMessage("");
+      const room = job.extractTotal || 0;
+      openFreeSpace({
+        storageId: job.storageId,
+        need: room ? { sizeBytes: room, bytes: room + 16 * 1024 ** 2 } : undefined,
+        then: { kind: "resume", run: () => void run(job, "resume") },
+      });
+      return;
+    }
     setBusy(job.id);
     setError("");
     setMessage("");
@@ -144,6 +163,8 @@ export function Downloads({
   // The dialogs every layout shares: archive password, cancel or delete, clear history.
   const dialogs = (
     <>
+      {links && <AddLinks drives={drives} preferred={preferredDrive} replace={links === true ? undefined : links}
+        refresh={refresh} close={() => { setLinks(null); restoreFocus(); }} />}
       {powerJob && <PowerJobDialog {...powerJob} refresh={refresh} close={() => setPowerJob(null)} done={message => { setPowerJob(null); setMessage(message); restoreFocus(); }} />}
       {historyJobs.length > 0 && <HistoryRemoval key={historyJobs.map(job=>job.id).join(",")} jobs={historyJobs} close={()=>setHistoryJobs([])} done={async message=>{await refresh();setHistoryJobs([]);setMessage(message);restoreFocus();}}/>}
       {installationJob && jobs.find(j => j.id === installationJob) && <InstallationDialog
@@ -271,6 +292,7 @@ export function Downloads({
         }}
         clear={() => clearSelectedHistory()}
         browse={browse}
+        addLinks={addLinks}
         openLibrary={openLibrary}
         dialogs={dialogs}
       />
@@ -305,6 +327,7 @@ export function Downloads({
           clearSelectedHistory();
         }}
         browse={browse}
+        addLinks={addLinks}
         openLibrary={openLibrary}
         dialogs={dialogs}
       /></QueuePosition>
@@ -356,6 +379,11 @@ export function Downloads({
                 : t("Clear finished history")}
             </button>
           )}
+        {view === "Active" && groups.Active.length > 0 && (
+          <button className="add-links-button" disabled={!!busy} onClick={addLinks}>
+            <Icon name="link" /> {t("Download from links")}
+          </button>
+        )}
       </div>
       {error && (
         <p className="form-error" role="alert">
@@ -390,9 +418,16 @@ export function Downloads({
                     )
                   : t("Successfully completed downloads appear here.")}
           </p>
-          <button className="primary" onClick={browse}>
-            {t("Browse games")}
-          </button>
+          <div className="empty-actions">
+            <button className="primary" onClick={browse}>
+              {t("Browse games")}
+            </button>
+            {view === "Active" && (
+              <button onClick={addLinks}>
+                <Icon name="link" /> {t("Download from links")}
+              </button>
+            )}
+          </div>
         </div>
       ) : (
         <div className="queue">
@@ -452,6 +487,7 @@ export function Downloads({
                   <p>
                     {r && `${releaseProvider(r)} · `}
                     {`${formatLabel(j)} · `}
+                    {j.sourceId === "link" && `${j.linkHost || t("Your link")} · `}
                     {j.delivery === "torbox" && `${t("via TorBox")} · `}
                     {drive ? placeName(drive.label) : j.storageId}
                     {!drive && j.status !== "complete"
@@ -552,9 +588,19 @@ export function Downloads({
                         </button>
                       </>
                     ) : null}
+                    {unpackShort(j) && drive && (
+                      <button disabled={!!busy} onClick={() => void run(j, "free-space")}>
+                        {t("Free up space")}
+                      </button>
+                    )}
                     {j.canRefreshLink && (
                       <button disabled={!!busy} onClick={() => void run(j, "refresh-link")}>
                         {t("Refresh download link")}
+                      </button>
+                    )}
+                    {j.canReplaceLink && (
+                      <button disabled={!!busy} onClick={() => void run(j, "replace-link")}>
+                        {t("Replace link")}
                       </button>
                     )}
                     {waiting(j) && (

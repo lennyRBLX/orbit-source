@@ -4,6 +4,8 @@
 #include "packages.h"
 #include "files.h"
 #include "zero_link.h"
+#include "links.h"
+#include "space.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +71,7 @@ static bool unfinished(void) {
         if (j->id[0] && strcmp(j->status, "complete") && strcmp(j->status, "cancelled")) return true;
     }
     for (size_t i = 0; i < 16; i++) if (clients[i].busy || orbit.shutdown_holds[i][0]) return true;
-    return orbit.receiver_active || orbit.files_storage_busy;
+    return orbit.receiver_active || orbit.files_storage_busy || orbit.library_storage_busy;
 }
 cJSON *power_status(void) {
     bool available = power_available();
@@ -152,13 +154,12 @@ int power_client_work(const cJSON *input, const char *owner, char *error, size_t
     return 200;
 }
 static bool background_busy(void) {
-    bool busy = zero_link_busy();
+    bool busy = zero_link_busy() || links_busy() || space_busy();
     cJSON *status = packages_status(), *r, *p;
     cJSON_ArrayForEach(r, cJSON_GetObjectItemCaseSensitive(status, "downloads")) {
         const char *s = json_text(r, "state");
-        if (!strcmp(s, "checking")) busy = true;
-        /* Kraken Mount adding a game folder or package (packages.c kraken_receipt). */
-        if (!strcmp(json_text(r, "kraken"), "pending") || !strcmp(json_text(r, "kraken"), "requested")) busy = true;
+        const char *mount = json_text(r, "shadowMount");
+        if (!strcmp(s, "checking") || !strcmp(mount, "pending") || !strcmp(mount, "requested")) busy = true;
         cJSON_ArrayForEach(p, cJSON_GetObjectItemCaseSensitive(r, "packages")) {
             s = json_text(p, "state");
             if (!strcmp(s, "queued") || !strcmp(s, "installing") || !strcmp(s, "unconfirmed")) busy = true;

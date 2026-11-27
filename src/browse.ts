@@ -145,7 +145,7 @@ export function releaseMatches(r: Release, filters: BrowseFilters, torbox: Reado
         releaseHasTorboxHost(r, torbox)))
     return false;
   const formats = downloadFormats(filters.format);
-  if (formats.length && !formats.includes(releaseFormat(r))) return false;
+  if (formats.length && !formats.some(format => matchesDownloadFormat(r, format))) return false;
   if (filters.region && (r.region || "unknown") !== filters.region) return false;
   const gb = r.sizeBytes / 1e9;
   return (
@@ -159,15 +159,24 @@ export function releaseMatches(r: Release, filters: BrowseFilters, torbox: Reado
           : gb >= 100))
   );
 }
-export const releaseFormat = (r: Release): string => r.format;
-// The only formats Orbit downloads, archived or not; the service leaves every other one out of
-// the catalogue. Format's choices, in order, with their labels.
+export const releaseFormat = (r: Release) =>
+  r.assetCompression === "ZSTD" ? "ZSTD" : r.contentFormat === "LZ4" ? "LZ4" : r.format;
+
 export const DOWNLOAD_FORMATS: Record<string, string> = {
+  FFPFSC: "FFPFSC",
+  exFAT: "exFAT",
   PKG: "PKG",
   FPKG: "FPKG",
   "Game folder": /* i18n */ "Game folder",
+  LZ4: "LZ4",
+  ZSTD: "ZSTD",
+  ZIP: "ZIP",
+  RAR: "RAR",
+  "7z": "7z",
 };
 // A saved filter can name a format or archive type Orbit no longer offers: ignore it.
+export const matchesDownloadFormat = (release: Release, format: string) =>
+  releaseFormat(release) === format || release.compression?.toUpperCase() === format.toUpperCase();
 export const downloadFormats = (values: readonly string[] = []) =>
   values.filter((value) => Object.keys(DOWNLOAD_FORMATS).includes(value));
 // Any filter that narrows the options, not just the games.

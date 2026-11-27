@@ -1,12 +1,11 @@
 import type { Release, System } from "./types";
 import { t } from "./i18n";
 
-type Facts = Pick<Release, "firmwareIssue" | "maxFirmware" | "requiredFirmware" | "mounter">;
+type Facts = Pick<Release, "firmwareIssue" | "maxFirmware" | "requiredFirmware">;
 
 // What a download option needs from the console's firmware, for its row in a list.
 // Labels only: an option that won't run on this PS5 stays available, listed last.
 export function firmwareLabel(r: Facts) {
-  if (r.mounter === "kraken" && !r.firmwareIssue) return t("Runs with Kraken Mount");
   if (r.firmwareIssue === "ps5-package") return t("Needs firmware {version} or lower", { version: r.maxFirmware || "" });
   if (r.firmwareIssue === "newer-firmware") return t("Needs firmware {version} or later", { version: r.requiredFirmware || "" });
   return [
@@ -33,10 +32,9 @@ export function compatibleFirst<T extends Facts>(releases: T[]) {
 }
 
 export function downloadFirmwareNote(job: Facts & { firmwareSource?: string; consoleFirmware?: string; backport?: boolean; titleId?: string }) {
-  // Kraken Mount applies a backport only from <scan folder>/backports/<TITLE_ID>/ (or /data/homebrew/backports/),
-  // not from inside the game's folder (kraken-mount src/scan.rs backport_for).
+  // ShadowMount+ applies a backport only from backports/<TITLE_ID>/, not from inside the game's folder.
   if (job.backport && job.firmwareIssue === "newer-firmware")
-    return t("This download needs firmware {version} or later. This PS5 is on {current}. It includes a backport for older firmware. To use it with Kraken Mount, move the folder that contains fakelib to /data/homebrew/backports/ and name it {titleId}. You can do this in {place}.", {
+    return t("This download needs firmware {version} or later. This PS5 is on {current}. It includes a backport for older firmware. To use it with ShadowMount+, move the folder that contains fakelib to /data/homebrew/backports/ and name it {titleId}. You can do this in {place}.", {
       version: job.requiredFirmware || "", current: job.consoleFirmware || "", titleId: job.titleId || "",
       place: `${t("Library")} → ${t("Files")}`,
     });
@@ -44,5 +42,5 @@ export function downloadFirmwareNote(job: Facts & { firmwareSource?: string; con
   if (warning) return warning;
   if (job.firmwareSource === "param")
     return t("Game files declare firmware {version} or later. This does not confirm game compatibility.", { version: job.requiredFirmware || "" });
-  return job.maxFirmware || job.mounter ? firmwareLabel(job) : "";
+  return job.maxFirmware ? firmwareLabel(job) : "";
 }

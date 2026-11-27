@@ -1,7 +1,6 @@
 /* The console's firmware, and what it means for a download. Nothing here hides or blocks a
  * download: clients label the options that won't run on this console and list them last. */
 #include "firmware.h"
-#include "kraken.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,17 +62,10 @@ void firmware_describe(cJSON *entry, uint32_t raw) {
         cJSON_AddStringToObject(entry, "requiredFirmware", text);
         if (firmware_known(raw) && from_bcd(raw >> 24) < (unsigned)required) issue = "newer-firmware";
     }
-    /* Kraken Mount runs PS5 packages on any firmware it supports, without installing them. */
-    if (ps5_package(entry) && kraken_active()) cJSON_AddStringToObject(entry, "mounter", "kraken");
-    else if (ps5_package(entry)) {
+    if (ps5_package(entry)) {
         cJSON_AddStringToObject(entry, "maxFirmware", PS5_PACKAGE_LIMIT_TEXT);
         if (firmware_known(raw) && (raw & 0xffff0000u) > PS5_PACKAGE_LIMIT) issue = "ps5-package";
     }
-    /* A PS5 game folder runs with Kraken Mount: Orbit places it where Kraken Mount looks
-     * for games (packages.c kraken_place) and never installs it. */
-    else if (!*json_text(entry, "addonId") && !strcmp(json_text(entry, "platform"), "ps5") &&
-             !strcmp(json_text(entry, "format"), "Game folder"))
-        cJSON_AddStringToObject(entry, "mounter", "kraken");
     if (issue) cJSON_AddStringToObject(entry, "firmwareIssue", issue);
 }
 
@@ -126,9 +118,7 @@ uint32_t firmware_extracted(int parent, const char *name) {
     if (fstat(parent, &st)) return 0;
     return walk_params(parent, name, 0, &visited, st.st_dev);
 }
-/* Kraken Mount applies a backport from <scan folder>/backports/<TITLE_ID>/ (kraken-mount
- * src/scan.rs backport_for); one is found by its fakelib folder. Releases
- * name and nest the outer folder differently, so only that folder identifies one. */
+/* A backport is identified by its fakelib folder, independent of archive layout. */
 static bool walk_backport(int parent, const char *name, unsigned depth, unsigned *visited, dev_t device) {
     if (depth > 8 || ++*visited > 4096) return false;
     int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -166,7 +156,7 @@ void firmware_describe_download(cJSON *entry, const Job *job, uint32_t raw) {
                 cJSON_AddStringToObject(facts, "firmwareIssue", "newer-firmware");
         }
     }
-    const char *keys[] = {"requiredFirmware", "maxFirmware", "firmwareIssue", "mounter"};
+    const char *keys[] = {"requiredFirmware", "maxFirmware", "firmwareIssue"};
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         const cJSON *v = cJSON_GetObjectItemCaseSensitive(facts, keys[i]);
         if (v) cJSON_AddItemToObject(entry, keys[i], cJSON_Duplicate(v, true));

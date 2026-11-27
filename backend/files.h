@@ -5,6 +5,10 @@
 void files_stop(void);
 cJSON *files_download_plan(const Job *job, int *code, char *error, size_t cap);
 int files_delete_download(const Job *job, char *error, size_t cap);
+/* Free up space: the size of a completed download's archive kept after unpacking (-1:
+ * none, changed or in use), and deleting just that archive. */
+int64_t files_kept_archive_size(const Job *job);
+int files_delete_kept_archive(const Job *job, int64_t *freed, char *error, size_t cap);
 /* POST /api/v1/files/list: one folder of a drive. NULL with *code and error set. */
 cJSON *files_list(const cJSON *input, int *code, char *error, size_t cap);
 /* GET /api/v1/files/status: {"operation": the running or last one, or null}. */

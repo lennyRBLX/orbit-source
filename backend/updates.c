@@ -16,8 +16,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define FEED "https://raw.githubusercontent.com/saawant12/orbit-store-ps5/main/payloads.json"
-#define RELEASE_BASE "https://github.com/saawant12/orbit-store-ps5/releases/download/"
+#define FEED "https://raw.githubusercontent.com/lennyRBLX/orbit-store-ps5/main/payloads.json"
+#define RELEASE_BASE "https://github.com/lennyRBLX/orbit-store-ps5/releases/download/"
 #define AUTO_CHECK_INTERVAL (6 * 60 * 60)
 #define FIRST_CHECK_DELAY (10 * 60) /* Update notifications' first check, after Orbit starts. */
 #define MAX_ELF (64 * 1024 * 1024)
@@ -177,7 +177,7 @@ static int fetch(const char *url, Buffer *buffer, char *error, size_t cap) {
     copy_text(error, cap, "Too many release redirects.");
     return -1;
 }
-/* Releases use major.minor.patch or major.minor.patch-beta.number. */
+/* Compare community releases by their upstream service version. */
 static bool version_parts(const char *version, unsigned *parts) {
     if (*version == 'v')
         version++;
@@ -187,6 +187,11 @@ static bool version_parts(const char *version, unsigned *parts) {
         if (i == 3) {
             if (!*version)
                 return true;
+            if (!strncmp(version, "-community.", 11)) {
+                version += 11;
+                size_t digits = strspn(version, "0123456789");
+                return digits > 0 && digits <= 6 && !version[digits];
+            }
             if (strncmp(version, "-beta.", 6))
                 return false;
             version += 6;

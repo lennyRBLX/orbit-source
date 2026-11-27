@@ -5,7 +5,7 @@
 import { useState, type ReactNode } from "react";
 import { bytes, type LibraryGame, type Storage } from "../types";
 import type { LibraryModel } from "../useLibrary";
-import { placeName, t } from "../i18n";
+import { placeName, t, tn } from "../i18n";
 import { Artwork } from "../Artwork";
 import { GameActions } from "../LibraryActions";
 import { CrossbarList, type XbRow } from "./CrossbarList";
@@ -35,6 +35,8 @@ export function CrossbarLibrary({
   consoleBrowser,
   sections,
   filters,
+  freeUp,
+  fullest,
 }: {
   model: LibraryModel;
   games: LibraryGame[];
@@ -54,6 +56,9 @@ export function CrossbarLibrary({
   consoleBrowser: boolean;
   sections: ReactNode;
   filters: ReactNode;
+  // Free up space on the fullest drive (FreeSpace.tsx), when paired.
+  freeUp?: () => void;
+  fullest?: Storage;
 }) {
   const [current, setCurrent] = useState<string | undefined>();
   const folderRow = (key: string, label: string, sub: string, glyph: GlyphName, open: () => void): XbRow => ({
@@ -80,7 +85,7 @@ export function CrossbarLibrary({
     }
     return false;
   };
-  // Files works without Kraken Mount, so it comes before Library's own state.
+  // Files works without ShadowMount, so it comes before Library's own state.
   if (section === "files")
     return (
       <><div className="library-controls">{sections}</div><CrossbarFiles
@@ -103,8 +108,8 @@ export function CrossbarLibrary({
               <h2>{busy ? t("Finding your games") : t("Connect your library")}</h2>
               <p>
                 {busy
-                  ? t("Reading Kraken Mount’s games and the games installed on your PS5.")
-                  : t("Library lists the games Kraken Mount runs and the games installed on your PS5. Select Try again.")}
+                  ? t("Reading installed titles and drive availability from ShadowMount.")
+                  : t("Library uses ShadowMount’s local games API on your PS5. Start a version with that API enabled, then select Try again.")}
               </p>
               {error && <p className="warn">{error}</p>}
               {!busy && (
@@ -119,7 +124,6 @@ export function CrossbarLibrary({
       </section>
     );
   }
-  const focusedGame = rows.find((g) => `game-${g.titleId}` === current) || rows[0];
   const gameRows: XbRow[] = rows.map((g) => ({
     key: `game-${g.titleId}`,
     disabled: !g.onDrive,
@@ -140,7 +144,7 @@ export function CrossbarLibrary({
         </span>
       </>
     ),
-    actions: <GameActions game={g} model={model} />,
+    actions: <GameActions game={g} model={model} driveCards />,
   }));
   const allRows: XbRow[] = [
     ...gameRows,
@@ -149,13 +153,27 @@ export function CrossbarLibrary({
                 folderRow(
                   "scan",
                   t("Scan for games"),
-                  model.snapshot?.scanning ? t("Looking for new games…") : t("Search your drives with Kraken Mount"),
+                  model.snapshot?.scanning ? t("Looking for new games…") : t("Search your drives with ShadowMount"),
                   "scan",
                   openScan,
                 ),
               ]
             : []),
+    ...(freeUp && fullest
+      ? [
+          folderRow(
+            "space",
+            t("Free up space"),
+            `${placeName(fullest.label)} · ${t("{size} free", { size: bytes(fullest.freeBytes) })}`,
+            "drive",
+            freeUp,
+          ),
+        ]
+      : []),
   ];
+  // Scan for games and Free up space aren't games: beside them, the drives' free space.
+  const onGame = !current || !allRows.some((row) => row.key === current) || current.startsWith("game-");
+  const focusedGame = onGame ? rows.find((g) => `game-${g.titleId}` === current) || rows[0] : undefined;
   return (
     <section className="xb-page xb-library">
       <div className="library-controls">{sections}{filters}</div>
@@ -204,13 +222,36 @@ export function CrossbarLibrary({
                     ? bytes(focusedGame.sizeBytes)
                     : focusedGame.sizeStatus === "unavailable"
                       ? t("Unavailable")
-                      : t("Not measured")}
+                      : model.snapshot?.measuring
+                        ? t("Measuring…")
+                        : t("Not measured")}
                 </dd>
               </div>
               <div>
                 <dt>{t("Size reported by console")}</dt>
                 <dd>{focusedGame.installedSizeBytes === null ? t("Not reported") : bytes(focusedGame.installedSizeBytes)}</dd>
               </div>
+            </dl>
+            {focusedGame.foundByOrbit && (
+              <p className="xb-card-fine">
+                {t(
+                  "Orbit found this game itself because your ShadowMount version doesn’t list games installed from PKG files. For the most complete list, update ShadowMount to 1.7beta5 or newer.",
+                )}
+              </p>
+            )}
+            {error && <p className="xb-card-error">{error}</p>}
+          </aside>
+        )}
+        {!onGame && (
+          <aside className="xb-aside xb-card" aria-live="polite">
+            <p className="xb-card-kicker">{tn(rows.length, "{count} game", "{count} games")}</p>
+            <dl className="xb-facts">
+              {drives.map((drive) => (
+                <div key={drive.id}>
+                  <dt>{placeName(drive.label)}</dt>
+                  <dd>{t("{size} free", { size: bytes(drive.freeBytes) })}</dd>
+                </div>
+              ))}
             </dl>
             {error && <p className="xb-card-error">{error}</p>}
           </aside>

@@ -76,7 +76,9 @@ static bool valid(const Release *r) {
             !r->extracted_size && !r->sha256[0] &&
             (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
              !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG"));
-    if (!filename_valid(r->filename) || !orbit_format_allowed(r)) return false;
+    if (!filename_valid(r->filename) ||
+        (strcmp(r->format, "PKG") && strcmp(r->format, "FPKG") &&
+         (strcmp(r->format, "Game folder") || !r->compression[0]))) return false;
     if (r->remote_page) {
         Release checked = *r;
         const char *suffix = !strcmp(r->compression, "zip") ? ".zip" :

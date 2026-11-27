@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "links.h"
 #include "debrid.h"
 #include "extract.h"
 #include "remote_sources.h"
@@ -330,7 +331,7 @@ int history_clear_locked(const cJSON *input, char *err, size_t cap) {
 }
 static int create_locked(const Release *r, const char *sid, const Storage *pin,
                          const char *etag, const char *modified, bool dry_run, const char *delivery,
-                         const char *password, char *err, size_t cap, Job **result) {
+                         char *err, size_t cap, Job **result) {
     const char *rid = r ? r->id : "";
     if (orbit.stop) {
         copy_text(err, cap, "Orbit is stopping. Reconnect after restarting it.");
@@ -342,11 +343,6 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     }
     bool torbox = delivery && !strcmp(delivery, "torbox");
     bool pending_file = remote_page_pending(r);
-    /* The catalogue already leaves other formats out; refuse any that reaches here anyway. */
-    if (!pending_file && !orbit_format_allowed(r)) {
-        copy_text(err, cap, "Orbit downloads PKG, FPKG and game-folder options only.");
-        return 400;
-    }
     if (!source_enabled_locked(r)) {
         copy_text(err, cap,
                   "Enable this source and acknowledge the download notice in Sources first.");
@@ -456,6 +452,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
             copy_text(err, cap,
                       !strcmp(j->status, "cancelled")
                           ? "Open Downloads to resume this cancelled download, or reconnect its original drive and delete the partial file before downloading again."
+                          : !strcmp(r->source, "link") ? "This link is already in Downloads for that drive."
                           : "This release already has a job on that drive. Open Downloads to resume or retry it.");
             return 409;
         }
@@ -476,10 +473,6 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     Job j = delivery_job;
     j.release = *r;
     j.keep_packed = packed;
-    bool direct_url = !strcmp(r->source, ORBIT_DIRECT_SOURCE);
-    j.auto_install = direct_url;
-    if (direct_url && r->compression[0] && password)
-        copy_text(j.archive_password, sizeof j.archive_password, password);
     copy_text(j.etag, sizeof j.etag, etag ? etag : "");
     copy_text(j.modified, sizeof j.modified, modified ? modified : "");
     j.order = last_order + 1;
@@ -541,7 +534,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     copy_text(orbit.preferred_storage, sizeof orbit.preferred_storage, sid);
     char previous_delivery[sizeof orbit.last_delivery];
     copy_text(previous_delivery, sizeof previous_delivery, orbit.last_delivery);
-    if (!direct_url)
+    if (strcmp(r->source, "link"))
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, torbox ? "torbox" : "direct");
     if (state_save_locked()) {
         copy_text(orbit.last_delivery, sizeof orbit.last_delivery, previous_delivery);
@@ -567,21 +560,60 @@ int job_create_delivery_locked(const char *rid, const char *sid, const char *del
     const Release *r = release_find(rid);
     const char *method = delivery && *delivery ? delivery :
                          debrid_default_locked(r) ? "torbox" : "direct";
-    return create_locked(r, sid, NULL, NULL, NULL, false, method, NULL, err, cap, result);
+    return create_locked(r, sid, NULL, NULL, NULL, false, method, err, cap, result);
 }
 int job_check_capture_locked(const Release *r, const Storage *s, char *err, size_t cap) {
-    return create_locked(r, s->id, s, NULL, NULL, true, "direct", NULL, err, cap, NULL);
+    return create_locked(r, s->id, s, NULL, NULL, true, "direct", err, cap, NULL);
 }
 int job_create_captured_locked(const Release *r, const Storage *s, const char *etag,
-                               const char *modified, const char *password, char *err, size_t cap, Job **result) {
-    bool file_verified = (r->remote_page && !strcmp(r->source, "remote")) ||
-                         !strcmp(r->source, ORBIT_DIRECT_SOURCE);
+                               const char *modified, char *err, size_t cap, Job **result) {
+    bool file_verified = r->remote_page && !strcmp(r->source, "remote");
     if (file_verified ? (!provider_supported(r) || !r->filename[0] || r->size <= 0)
                   : (!provider_capture_url(r, r->url) || (!etag[0] && !modified[0]))) {
         copy_text(err, cap, "The provider file has not been validated.");
         return 409;
     }
-    return create_locked(r, s->id, s, etag, modified, false, "direct", password, err, cap, result);
+    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+}
+int job_create_link_locked(const Release *r, const Storage *s, const char *etag,
+                           const char *modified, char *err, size_t cap, Job **result) {
+    if (!link_release_valid(r)) {
+        copy_text(err, cap, "This link didn't give Orbit a file it can save."); return 400;
+    }
+    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+}
+bool job_can_replace_link(const Job *j) {
+    return j && !strcmp(j->release.source, "link") && !job_active(j) &&
+        (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&
+        !j->archive_ready && !(j->release.compression[0] && j->received >= j->total);
+}
+/* The fresh link must be the same file: the same size, and the same identity when both
+ * links give one and part of the file is already here. The download keeps its name. */
+int job_replace_link_locked(Job *j, const Release *r, const char *etag, const char *modified,
+                            char *err, size_t cap) {
+    if (orbit.stop || orbit.state_failed) {
+        copy_text(err, cap, "Queue state cannot be saved. Try again after restarting Orbit."); return 503;
+    }
+    if (!job_can_replace_link(j)) {
+        copy_text(err, cap, "Pause the download first, or wait until it stops."); return 409;
+    }
+    if (!link_url_allowed(r->url) || r->size != j->total) {
+        copy_text(err, cap, "This link is for a different file (its size differs). Your partial file was kept."); return 409;
+    }
+    if (j->received > 0 && ((j->etag[0] && etag[0] && strcmp(j->etag, etag)) ||
+                            (!j->etag[0] && !etag[0] && j->modified[0] && modified[0] && strcmp(j->modified, modified)))) {
+        copy_text(err, cap, "This link is for a different copy of the file. Your partial file was kept."); return 409;
+    }
+    Job previous = *j;
+    copy_text(j->release.url, sizeof j->release.url, r->url);
+    copy_text(j->etag, sizeof j->etag, etag);
+    copy_text(j->modified, sizeof j->modified, modified);
+    copy_text(j->status, sizeof j->status, "queued");
+    j->error[0] = 0; j->retry_at = 0; j->attempts = 0;
+    atomic_store(&j->pause, false); atomic_store(&j->cancel, false);
+    if (state_save_locked()) { *j = previous; copy_text(err, cap, "Could not persist the queue."); return 503; }
+    pthread_cond_broadcast(&orbit.changed);
+    return 200;
 }
 bool job_can_refresh_link(const Job *j) {
     return j && (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&

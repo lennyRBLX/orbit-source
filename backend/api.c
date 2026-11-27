@@ -10,6 +10,8 @@
 #include "receive.h"
 #include "zero_probe.h"
 #include "zero_link.h"
+#include "links.h"
+#include "space.h"
 #include "zero_companion.h"
 #include "firmware.h"
 #include "files.h"
@@ -17,7 +19,6 @@
 #include "announcements.h"
 #include "power.h"
 #include "history.h"
-#include "kraken.h"
 #include "bundle.h"
 #include <openssl/evp.h>
 #include <openssl/crypto.h>
@@ -481,6 +482,15 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         int code = zero_probe_request(json_text(input,"releaseId"),message,sizeof message); cJSON_Delete(input);
         return code >= 400 ? error(c,code,message) : json_response(c,code,zero_probe_status());
     }
+    if (!strcmp(url, "/api/v1/links")) {
+        if (!authorized(c)) return error(c, 401, "Pair this device first.");
+        if (get) return json_response(c, 200, links_status());
+        cJSON *input = cJSON_Parse((const char *)req->body);
+        char message[256] = {0};
+        int code = links_request(input, message, sizeof message);
+        cJSON_Delete(input);
+        return code == 202 ? json_response(c, 202, links_status()) : error(c, (unsigned)code, message);
+    }
     if (!strcmp(url, "/api/v1/zero/link")) {
         if (!authorized(c)) return error(c, 401, "Pair this device first.");
         if (get) return json_response(c, 200, zero_link_status());
@@ -545,6 +555,10 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         cJSON_AddBoolToObject(o, "stopping", orbit_is_stopping());
         cJSON_AddNumberToObject(o, "receiveProtocol", 1);
         cJSON_AddNumberToObject(o, "zeroLinkProtocol", 1);
+        /* POST /api/v1/links and replace-link: downloads from pasted links. */
+        cJSON_AddNumberToObject(o, "linksProtocol", 1);
+        /* /api/v1/space: Free up space. */
+        cJSON_AddNumberToObject(o, "spaceProtocol", 1);
         cJSON_AddNumberToObject(o, "packageInstallProtocol", 1);
         cJSON_AddNumberToObject(o, "packageStreamProtocol", 1);
         /* Folder transfers are an addition; protocol 1 clients are unaffected. */
@@ -566,11 +580,6 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         firmware_text(orbit.firmware, firmware, sizeof firmware);
         if (*firmware) cJSON_AddStringToObject(o, "firmware", firmware);
         cJSON_AddStringToObject(o, "ps5PackageFirmware", firmware_package_limit());
-        /* Kraken Mount, when it is adding games: PS5 packages then run on this firmware. */
-        char kraken[32];
-        kraken_version(kraken, sizeof kraken);
-        cJSON_AddBoolToObject(o, "krakenMount", kraken_active());
-        if (*kraken) cJSON_AddStringToObject(o, "krakenMountVersion", kraken);
         /* GET/POST /api/v1/bundles: Get everything (a game and its add-ons). */
         cJSON_AddNumberToObject(o, "bundleProtocol", 1);
         pthread_mutex_lock(&orbit.mutex);
@@ -802,6 +811,17 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
             int code = files_link(input, &o, e, sizeof e);
             cJSON_Delete(input);
             return o ? json_response(c, 200, o) : error(c, (unsigned)code, e);
+        }
+        if ((get || post) && !strcmp(url, "/api/v1/space")) {
+            char e[256] = {0}; int code = 200;
+            const char *action = post ? json_text(input, "action") : "";
+            cJSON *o = NULL;
+            if (!post) o = space_status();
+            else if (!strcmp(action, "list")) o = space_list(json_text(input, "storageId"), &code, e, sizeof e);
+            else if (!strcmp(action, "delete")) { code = space_delete(input, e, sizeof e); if (code == 202) o = space_status(); }
+            else { code = 400; copy_text(e, sizeof e, "Expected list or delete."); }
+            cJSON_Delete(input);
+            return o ? json_response(c, (unsigned)code, o) : error(c, (unsigned)code, e);
         }
         if (get && !strcmp(url, "/api/v1/history")) { cJSON_Delete(input); return json_response(c, 200, history_status()); }
         if (post && !strcmp(url, "/api/v1/history")) {
@@ -1143,14 +1163,6 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
             pthread_mutex_unlock(&orbit.mutex);
             return json_response(c, 200, o);
         }
-        if (post && !strcmp(url, "/api/v1/downloads/direct")) {
-            char e[256] = {0};
-            int code = browser_direct_download(input, e, sizeof e);
-            cJSON *password = cJSON_GetObjectItemCaseSensitive(input, "password");
-            if (cJSON_IsString(password)) OPENSSL_cleanse(password->valuestring, strlen(password->valuestring));
-            cJSON_Delete(input);
-            return code == 202 ? json_response(c, 202, browser_status()) : error(c, (unsigned)code, e);
-        }
         if (post && !strcmp(url, "/api/v1/downloads")) {
             const cJSON *delivery = cJSON_GetObjectItemCaseSensitive(input, "delivery");
             if (delivery && !cJSON_IsString(delivery)) {
@@ -1224,6 +1236,11 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
                 pthread_mutex_lock(&orbit.mutex); cJSON *jobs = jobs_json_locked(); pthread_mutex_unlock(&orbit.mutex);
                 return json_response(c, 200, jobs);
             }
+            if (!strcmp(action, "replace-link")) {
+                int code = links_replace_request(id, input, e, sizeof e);
+                cJSON_Delete(input);
+                return code == 202 ? json_response(c, 202, links_status()) : error(c, (unsigned)code, e);
+            }
             if (!strcmp(action, "refresh-link")) {
                 cJSON_Delete(input);
                 input = cJSON_CreateObject();
@@ -1274,6 +1291,10 @@ static enum MHD_Result handle(void *cls, struct MHD_Connection *c, const char *u
         r->limit = 4096;
         if (!strcmp(url,"/api/v1/receive/chunk") && authorized(c) && large_requests < 2) {
             r->large = true; large_requests++; r->limit = ORBIT_RECEIVE_CHUNK;
+        } else if (!strcmp(url, "/api/v1/links") && authorized(c)) {
+            r->limit = ORBIT_LINKS_BODY; /* Up to 20 pasted links. */
+        } else if (!strcmp(url, "/api/v1/space") && authorized(c)) {
+            r->limit = SPACE_BODY; /* Up to 128 items to delete. */
         }
         r->body = malloc(r->limit + 1);
         if (!r->body) { if(r->large)large_requests--; free(r); return MHD_NO; }

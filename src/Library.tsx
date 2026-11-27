@@ -7,7 +7,11 @@ import {
   type Storage,
 } from "./types";
 import type { LibraryModel } from "./useLibrary";
-import { GameActions, LibraryFeedback } from "./LibraryActions";
+import {
+  GameActions,
+  LibraryFeedback,
+  StorageProgress,
+} from "./LibraryActions";
 import { Artwork } from "./Artwork";
 import { Select } from "./Select";
 import { useInfiniteList } from "./infiniteList";
@@ -16,6 +20,7 @@ import { useInterfacePrefs } from "./interfaces/choice";
 import { CrossbarLibrary } from "./interfaces/CrossbarLibrary";
 import { PanoramaLibrary } from "./interfaces/PanoramaLibrary";
 import { Files } from "./Files";
+import { openFreeSpace } from "./FreeSpace";
 import { useFiles } from "./useFiles";
 import { libraryViews as views, matchesLibraryView as matches, libraryViewOptions, type LibraryView as View } from "./libraryStatus";
 
@@ -203,7 +208,7 @@ function Inventory({
           <h1>{t("Scan your drives?")}</h1>
           <p>
             {t(
-              "Kraken Mount will look for new games in homebrew and etaHEN/games, and at the top of M.2 and USB drives, and add them to the home screen. If a game is running, the scan waits until it closes.",
+              "ShadowMount will search its configured locations for games. It may register games on the console or mount detected sources. If a game is running, the scan may wait until it is safe.",
             )}
           </p>
           <div className="dialog-actions">
@@ -232,6 +237,9 @@ function Inventory({
       )}
     </>
   );
+  // Free up space (only shown paired) starts on the fullest drive; its screen can switch drives.
+  const fullest = [...drives].sort((a, b) => a.projectedFreeBytes - b.projectedFreeBytes)[0];
+  const freeUp = fullest ? () => openFreeSpace({ storageId: fullest.id }) : undefined;
   if (iface === "crossbar")
     return (
       <CrossbarLibrary
@@ -256,6 +264,8 @@ function Inventory({
         consoleBrowser={consoleBrowser}
         sections={sections}
         filters={filters}
+        freeUp={freeUp}
+        fullest={fullest}
       />
     );
   if (iface === "panorama")
@@ -291,6 +301,7 @@ function Inventory({
         consoleBrowser={consoleBrowser}
         sections={sections}
         statusOptions={statusOptions}
+        freeUp={freeUp}
       />
     );
   return (
@@ -319,6 +330,12 @@ function Inventory({
             >
               <Icon name="scan" />
               {t("Scan for games")}
+            </button>
+          )}
+          {section !== "files" && freeUp && (
+            <button onClick={freeUp}>
+              <Icon name="storage" />
+              {t("Free up space")}
             </button>
           )}
         </div>
@@ -373,10 +390,10 @@ function Inventory({
           <p>
             {busy
               ? t(
-                  "Reading Kraken Mount’s games and the games installed on your PS5.",
+                  "Reading installed titles and drive availability from ShadowMount.",
                 )
               : t(
-                  "Library lists the games Kraken Mount runs and the games installed on your PS5. Select Try again.",
+                  "Library uses ShadowMount’s local games API on your PS5. Start a version with that API enabled, then select Try again.",
                 )}
           </p>
           {!busy && (
@@ -389,6 +406,7 @@ function Inventory({
         </div>
       ) : (
         <>
+              <StorageProgress model={model} />
               {filters}
               {rows.length ? (
                 <div className="library-grid">
@@ -435,7 +453,9 @@ function Inventory({
                   <p>
                     {games.length
                       ? t("Try a different title, status or location.")
-                      : t("Kraken Mount hasn't added any games yet.")}
+                        : t(
+                          "ShadowMount has not reported any installed or on-drive games yet.",
+                        )}
                   </p>
                   {games.length > 0 && (
                     <button onClick={reset}>
@@ -479,6 +499,13 @@ function Inventory({
             <p className="notice">
               {t(
                 "Saved snapshot. These statuses may have changed.",
+              )}
+            </p>
+          )}
+          {current.foundByOrbit && (
+            <p className="notice">
+              {t(
+                "Orbit found this game itself because your ShadowMount version doesn’t list games installed from PKG files. For the most complete list, update ShadowMount to 1.7beta5 or newer.",
               )}
             </p>
           )}
@@ -531,7 +558,9 @@ function Inventory({
                   ? bytes(current.sizeBytes)
                   : current.sizeStatus === "unavailable"
                     ? t("Unavailable")
-                    : t("Not measured")}
+                    : snapshot?.measuring
+                      ? t("Measuring…")
+                      : t("Not measured")}
               </dd>
             </div>
             <div>

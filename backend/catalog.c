@@ -4,6 +4,7 @@
 #include "catalog_view.h"
 #include "ca.h"
 #include "orbit.h"
+#include "links.h"
 #include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
@@ -179,6 +180,15 @@ int release_parse(const cJSON *x, Release *r, bool diagnostic) {
         strchr(r->filename, '\\') || strstr(r->filename, ".."))
         return -1;
     r->size = (int64_t)size->valuedouble;
+    /* A download from a link the user pasted: only ever from the saved queue. */
+    if (!strcmp(r->source, "link")) {
+        const cJSON *contents = cJSON_GetObjectItemCaseSensitive(x, "archiveContents");
+        const cJSON *extracted = cJSON_GetObjectItemCaseSensitive(x, "extractedBytes");
+        r->archive_unverified = cJSON_IsString(contents) && !strcmp(contents->valuestring, "unverified");
+        if ((contents && !r->archive_unverified) || (extracted && !cJSON_IsNull(extracted)) ||
+            cJSON_GetObjectItemCaseSensitive(x, "requirements")) return -1;
+        return diagnostic && link_release_valid(r) ? 0 : -1;
+    }
     if (*r->sha256) {
         if (strlen(r->sha256) != 64)
             return -1;
@@ -285,60 +295,6 @@ cJSON *release_json(const Release *r) {
 void release_download_title(const Release *r, char *out, size_t cap) {
     if (r->addon_id[0]) snprintf(out, cap, "%s · %s · DLC", r->base_title, r->title);
     else copy_text(out, cap, r->title);
-}
-/* Orbit offers PKG, FPKG and game-folder downloads only, archived or not: the format names the
- * content and the compression only its container. FFPFSC and exFAT images, LZ4 and ZSTD game
- * folders, and archives whose contents are unverified ("Unknown") are never offered. */
-bool orbit_format_allowed(const Release *r) {
-    if (!strcmp(r->id, "orbit-network-check")) return true; /* The connection test, not a game. */
-    if (r->content_format[0] || r->asset_compression[0] || r->archive_unverified) return false;
-    return !strcmp(r->format, "PKG") || !strcmp(r->format, "FPKG") ||
-           (!strcmp(r->format, "Game folder") && r->compression[0]);
-}
-static int compare_text(const void *a, const void *b) {
-    return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
-/* Removes options in other formats from the parsed releases (games, then add-ons, then the
- * connection test) and from the feed arrays they mirror, so every list, count, filter and
- * source total sees the same set. A game left without options disappears, with its add-ons. */
-static bool keep_allowed_formats(cJSON *entries, cJSON *addons, Release *releases, size_t *count) {
-    size_t games = (size_t)cJSON_GetArraySize(entries), total = *count, offered = 0, kept = 0;
-    const char **ids = malloc((games ? games : 1) * sizeof *ids);
-    bool *keep = malloc((total ? total : 1) * sizeof *keep);
-    if (!ids || !keep) {
-        free(ids);
-        free(keep);
-        return false;
-    }
-    for (size_t i = 0; i < games; i++)
-        if (orbit_format_allowed(&releases[i])) ids[offered++] = releases[i].game_id;
-    qsort(ids, offered, sizeof *ids, compare_text);
-    for (size_t i = 0; i < total; i++) {
-        const char *base = releases[i].base_game_id;
-        keep[i] = orbit_format_allowed(&releases[i]) &&
-                  (i < games || i + 1 == total || bsearch(&base, ids, offered, sizeof *ids, compare_text));
-    }
-    free(ids); /* It points into releases, which are compacted below. */
-    cJSON *item = entries->child;
-    for (size_t i = 0; item; i++) {
-        cJSON *next = item->next;
-        if (!keep[i]) cJSON_Delete(cJSON_DetachItemViaPointer(entries, item));
-        item = next;
-    }
-    item = addons->child;
-    for (size_t i = games; item; i++) {
-        cJSON *next = item->next;
-        if (!keep[i]) cJSON_Delete(cJSON_DetachItemViaPointer(addons, item));
-        item = next;
-    }
-    for (size_t i = 0; i < total; i++)
-        if (keep[i]) {
-            if (kept != i) releases[kept] = releases[i];
-            kept++;
-        }
-    free(keep);
-    *count = kept;
-    return true;
 }
 static Release *parse_entries(cJSON *entries, size_t *count) {
     if (!cJSON_IsArray(entries) || cJSON_GetArraySize(entries) < 1 ||
@@ -450,11 +406,6 @@ static Release *parse_feed_entries(cJSON *entries, cJSON *addons, size_t *count)
     }
     Release *result = parse_entries(combined, count);
     cJSON_Delete(combined);
-    /* Validated as a whole first, so a feed is accepted or refused exactly as before. */
-    if (result && !keep_allowed_formats(entries, addons, result, count)) {
-        free(result);
-        result = NULL;
-    }
     return result;
 invalid:
     cJSON_Delete(combined);

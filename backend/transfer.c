@@ -10,6 +10,7 @@
 #include <openssl/crypto.h>
 #include "provider_network.h"
 #include "remote_sources.h"
+#include "links.h"
 #include "transfer_writer.h"
 #include <curl/curl.h>
 #include <ctype.h>
@@ -46,6 +47,7 @@ typedef struct Transfer {
     time_t retry_at;
     bool accepted, probe, range_probe, unsupported_range;
     bool capture_probe;
+    bool link_probe, link_answered; /* transfer_probe_link: stop at the file's headers. */
     atomic_bool *cancel_signal;
     CURL *handle;
     char disposition[512];
@@ -67,18 +69,24 @@ typedef struct Transfer {
     int64_t enqueued;
 #endif
 } Transfer;
+/* Orbit Zero's message for this case, with the PS5's button name. */
+#define TORBOX_UNREACHABLE "TorBox's download server could not be reached. Try a different CDN in your TorBox settings, then select Retry download."
+/* Fresh TorBox links asked for, the first included, before its server counts as unreachable. */
+#define TORBOX_SERVER_TRIES 3
 static bool torbox(const Transfer *t) { return !strcmp(t->job->delivery, "torbox"); }
+static bool pasted_link(const Transfer *t) { return !torbox(t) && !strcmp(t->release->source, "link"); }
 static bool remote_transfer(const Transfer *t) { return !strcmp(t->release->source, "remote"); }
 static bool direct_transfer(const Transfer *t) { return !strcmp(t->release->source, ORBIT_DIRECT_SOURCE); }
 static bool get_verified_file(const Transfer *t) {
     return direct_transfer(t) || (remote_transfer(t) && t->release->remote_page);
 }
 static bool guarded(const Transfer *t) {
-    return torbox(t) || remote_transfer(t) || direct_transfer(t) || provider_browser_source(t->release->source);
+    return torbox(t) || remote_transfer(t) || direct_transfer(t) || pasted_link(t) || provider_browser_source(t->release->source);
 }
 static bool address_allowed(const Transfer *t, const char *url) {
     if (torbox(t)) return debrid_transfer_url_allowed(url);
     if (direct_transfer(t)) return direct_http_url(url);
+    if (pasted_link(t)) return link_url_allowed(url);
     return remote_transfer(t) ? remote_https_url(url) : provider_transfer_url_allowed(url);
 }
 static double seconds(void) {
@@ -182,6 +190,15 @@ static bool controlled(Transfer *t) {
     }
     return false;
 }
+/* Waits up to ms, returning true as soon as the download is paused, cancelled or stopped. */
+static bool wait_controlled(Transfer *t, unsigned ms) {
+    for (unsigned waited = 0; waited < ms; waited += 100) {
+        if (controlled(t)) return true;
+        struct timespec step = {.tv_sec = 0, .tv_nsec = 100000000L};
+        nanosleep(&step, NULL);
+    }
+    return controlled(t);
+}
 static size_t headers(char *s, size_t a, size_t b, void *arg) {
     Transfer *t = arg;
     size_t n = a * b;
@@ -238,6 +255,12 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         t->retry_at = (end && !*end && wait >= 0 && wait < 31536000) ? now + (time_t)wait
                                                                      : curl_getdate(v, NULL);
     } else if ((n == 2 && s[0] == '\r') || (n == 1 && s[0] == '\n')) {
+        /* A link check needs only the final answer's headers, never the file. */
+        if (t->link_probe && !(t->status >= 100 && t->status < 200) &&
+            !(t->status >= 300 && t->status < 400)) {
+            t->link_answered = true;
+            return 0;
+        }
         /* Redirects commonly have an HTML body. Validate the file response,
          * after libcurl follows Location, rather than rejecting that page. */
         if (t->probe || (t->status >= 100 && t->status < 200) ||
@@ -249,7 +272,10 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
             return 0;
         }
         if (!t->capture_probe && guarded(t) && (t->status == 401 || t->status == 403 || t->status == 404 || t->status == 410)) {
-            copy_text(t->error, sizeof t->error, torbox(t)
+            if (pasted_link(t))
+                copy_text(t->error, sizeof t->error, "The link stopped working. It may have expired: "
+                          "choose Replace link and paste a fresh one. Your partial file is kept.");
+            else copy_text(t->error, sizeof t->error, torbox(t)
                 ? "TorBox rejected the download link. Resume to request a fresh link. Your partial file is kept."
                 : remote_transfer(t) ? "The community catalogue download link was rejected."
                 : direct_transfer(t) ? "The download URL was rejected. Check that the link is still valid."
@@ -491,8 +517,15 @@ static void set_range(CURL *c, int64_t offset, int64_t limit, struct curl_slist 
     curl_easy_setopt(c, CURLOPT_RANGE, range);
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, conditions);
 }
+/* The server refused or never took the connection, so no HTTP answer arrived. */
+static bool no_answer(CURLcode rc) {
+    return rc == CURLE_COULDNT_CONNECT || rc == CURLE_COULDNT_RESOLVE_HOST || rc == CURLE_OPERATION_TIMEDOUT ||
+           rc == CURLE_SSL_CONNECT_ERROR || rc == CURLE_SEND_ERROR || rc == CURLE_RECV_ERROR ||
+           rc == CURLE_GOT_NOTHING;
+}
 /* One bounded GET verifies actual range support, not an optional HEAD hint.
- * A valid full-file 200 means use the existing single-connection path. */
+ * A valid full-file 200 means use the existing single-connection path.
+ * 1 = ranges, 0 = no ranges, -1 = failed, -2 = the server never answered. */
 static int range_support(Transfer *owner, struct curl_slist *conditions, CURLcode *result) {
     Transfer probe = {
         .job = owner->job, .release = owner->release, .fd = -1, .limit = 1, .range_probe = true,
@@ -532,7 +565,7 @@ static int range_support(Transfer *owner, struct curl_slist *conditions, CURLcod
     else
         snprintf(owner->error, sizeof owner->error, "Range check failed (HTTP %ld, %s).",
                  probe.status, curl_easy_strerror(*result));
-    return -1;
+    return !probe.error[0] && !probe.status && no_answer(*result) ? -2 : -1;
 }
 int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
                               char *modified, char *error, size_t cap) {
@@ -554,6 +587,55 @@ int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
     }
     copy_text(etag, 256, strong ? owner.etag : "");
     copy_text(modified, 128, owner.modified);
+    return 0;
+}
+int transfer_probe_link(Release *release, atomic_bool *cancel, LinkProbe *out, char *error, size_t cap) {
+    memset(out, 0, sizeof *out);
+    if (!link_url_allowed(release->url)) {
+        copy_text(error, cap, "Paste a download link that starts with https://."); return -1;
+    }
+    Job job = {.release = *release};
+    Transfer t = {.job = &job, .release = release, .fd = -1, .limit = 1, .probe = true,
+                  .link_probe = true, .cancel_signal = cancel};
+    CURL *c = request(&t);
+    if (!c) { copy_text(error, cap, "Could not start the link check."); return -1; }
+    set_range(c, 0, 1, NULL);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    CURLcode rc = curl_easy_perform(c);
+    char *final = NULL;
+    if (curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &final) == CURLE_OK && final && strlen(final) < sizeof out->final_url)
+        copy_text(out->final_url, sizeof out->final_url, final);
+    curl_easy_cleanup(c);
+    if (!t.link_answered) {
+        if (t.error[0]) copy_text(error, cap, t.error);
+        else if (cancel && atomic_load(cancel)) copy_text(error, cap, "Orbit is stopping. Nothing was added to Downloads.");
+        else snprintf(error, cap, "Orbit couldn't reach this link (%s).", curl_easy_strerror(rc));
+        return -1;
+    }
+    if (t.status == 401 || t.status == 403 || t.status == 404 || t.status == 410) {
+        copy_text(error, cap, "The server refused this link. Check that it's a direct download link that hasn't expired.");
+        return -1;
+    }
+    if (t.status == 429 || t.status >= 500) {
+        copy_text(error, cap, "The server is busy. Try again shortly."); return -1;
+    }
+    if (t.status != 200 && t.status != 206) {
+        snprintf(error, cap, "The server answered HTTP %ld instead of a file.", t.status); return -1;
+    }
+    if (strstr(t.type, "text/") || strstr(t.type, "json") || strstr(t.type, "xml")) {
+        copy_text(error, cap, "This link opens a web page, not a file. Copy the file's direct download link instead.");
+        return -1;
+    }
+    /* 206 names the whole file; a server that ignores ranges sends all of it with 200. */
+    int64_t size = t.status == 206 && t.start == 0 ? t.total : t.status == 200 ? t.length : -1;
+    if (size < 1 || size > 9007199254740991LL) {
+        copy_text(error, cap, "The server didn't say how big the file is, so Orbit can't download it.");
+        return -1;
+    }
+    out->size = size;
+    if (strong_etag(t.etag)) copy_text(out->etag, sizeof out->etag, t.etag);
+    if (t.modified[0] && curl_getdate(t.modified, NULL) >= 0) copy_text(out->modified, sizeof out->modified, t.modified);
+    copy_text(out->disposition, sizeof out->disposition, t.disposition);
     return 0;
 }
 /* Shared validation/cancellation for full-file ranges and bounded USB windows. */
@@ -1464,7 +1546,18 @@ static void run_job(Job *j) {
     if (viking) {
         /* Test the saved captured URL with one byte first. No provider page is
          * opened by Resume; expired links get an explicit refresh action. */
-        if (range_support(&t, NULL, &rc) != 1) {
+        int checked = range_support(&t, NULL, &rc);
+        /* A TorBox server that takes no connection at all: ask TorBox again, as
+         * a fresh link can name another server. Orbit Zero does the same. */
+        for (int tries = 1; checked == -2 && torbox(&t) && tries < TORBOX_SERVER_TRIES; tries++) {
+            if (wait_controlled(&t, 3000)) goto finish;
+            t.error[0] = 0;
+            int prepared = prepare_torbox(&t, route);
+            if (prepared != 1) { debrid_waiting = prepared == 0; source_failed = !debrid_waiting; goto finish; }
+            checked = range_support(&t, NULL, &rc);
+        }
+        if (checked == -2 && torbox(&t)) copy_text(t.error, sizeof t.error, TORBOX_UNREACHABLE);
+        if (checked != 1) {
             source_failed = torbox(&t);
             if (!t.error[0])
                 copy_text(t.error, sizeof t.error, "Source did not return a valid byte range.");

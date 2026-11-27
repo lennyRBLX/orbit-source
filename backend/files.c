@@ -6,8 +6,8 @@
  * a rename happen at once; copying, moving, deleting, unpacking, installing
  * and measuring run one at a time on their own thread. Copies are written in
  * a private staging folder and appear only when complete, and nothing is ever
- * replaced. What a download, a transfer from a computer, the installer or
- * Orbit itself is using is locked. Saving a file to a phone or
+ * replaced. What a download, a transfer from a computer, the installer,
+ * ShadowMount or Orbit itself is using is locked. Saving a file to a phone or
  * computer uses a short-lived link: a browser's download can't send the
  * pairing token. */
 #include "files.h"
@@ -15,7 +15,6 @@
 #include "packages.h"
 #include "history.h"
 #include "game_verify.h"
-#include "kraken.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -79,7 +78,7 @@ static unsigned next_ticket;
 static atomic_bool holding_space;
 static bool storage_claim(void) {
     pthread_mutex_lock(&orbit.mutex);
-    bool busy = orbit.files_storage_busy || orbit.receiver_active || orbit.stop;
+    bool busy = orbit.files_storage_busy || orbit.library_storage_busy || orbit.receiver_active || orbit.stop;
     if (!busy) orbit.files_storage_busy = true;
     pthread_mutex_unlock(&orbit.mutex);
     return !busy;
@@ -172,10 +171,11 @@ static const char *file_type(const char *name) {
     const char *e = extension(name);
     if (!strcasecmp(e, ".zip") || !strcasecmp(e, ".7z") || !strcasecmp(e, ".rar")) return "archive";
     if (!strcasecmp(e, ".pkg") || !strcasecmp(e, ".fpkg")) return "package";
+    /* The images ShadowMount mounts, as the installer's check knows them (packages.c). */
+    if (!strcasecmp(e, ".exfat") || !strcasecmp(e, ".ffpkg") || !strcasecmp(e, ".ffpfsc") || !strcasecmp(e, ".ffpfs")) return "image";
     return "file";
 }
-/* A game folder for Verify & Repair: it has eboot.bin or sce_sys/param.json. Kraken
- * Mount runs one that has both (packages.c kraken_targets). */
+/* A folder ShadowMount can run: it has eboot.bin or sce_sys/param.json. */
 static bool game_folder(int dir, const char *name) {
     char probe[300];
     struct stat st;
@@ -238,8 +238,8 @@ static void guards_free(Guards *g) {
     for (size_t i = 0; i < g->count; i++) free(g->items[i].path);
     free(g->items);
 }
-/* Orbit's own folder, unfinished downloads, the games Kraken Mount lists, and the running
- * operation's source and destination. */
+/* Orbit's own folder, unfinished downloads, games ShadowMount has installed or
+ * mounted, and the running operation's source and destination. */
 static Guards guards_collect(void) {
     Guards g = {0};
     char path[1200];
@@ -270,13 +270,13 @@ static Guards guards_collect(void) {
         }
     }
     pthread_mutex_unlock(&orbit.mutex);
-    /* Kraken Mount mounts and prepares its games from these paths (kraken.c's last list).
-     * One that failed is left alone by it; duplicates are never listed. */
-    cJSON *games = kraken_games(), *game;
-    cJSON_ArrayForEach(game, games)
-        if (strcmp(json_text(game, "status"), "error") && strcmp(json_text(game, "status"), "duplicate"))
-            guard(&g, json_text(game, "path"), "game");
-    cJSON_Delete(games);
+    cJSON *library = library_snapshot(false), *game;
+    cJSON_ArrayForEach(game, cJSON_GetObjectItemCaseSensitive(library, "games")) {
+        if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(game, "installed")) &&
+            !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(game, "mounted"))) continue;
+        guard(&g, json_text(game, "path"), "game");
+    }
+    cJSON_Delete(library);
     return g;
 }
 /* One path inside the other, or the same. */
@@ -297,25 +297,11 @@ static const char *locked(const Guards *g, const char *path) {
         if (hit[k]) return order[k];
     return "";
 }
-/* Kraken Mount has a game at, inside or around path mounted (ready) or is preparing it
- * (checking, building): its files must not be rewritten then. */
-static bool kraken_mounting(const char *path) {
-    bool mounting = false;
-    cJSON *games = kraken_games(), *game;
-    cJSON_ArrayForEach(game, games) {
-        const char *status = json_text(game, "status");
-        if (related(path, json_text(game, "path")) &&
-            (!strcmp(status, "ready") || !strcmp(status, "checking") || !strcmp(status, "building")))
-            mounting = true;
-    }
-    cJSON_Delete(games);
-    return mounting;
-}
 /* The interfaces show these sentences for a locked entry (src/FileActions.tsx). */
 static const char *locked_text(const char *reason) {
     return !strcmp(reason, "orbit")      ? "Orbit keeps its own settings and downloads list here."
            : !strcmp(reason, "download") ? "A download or transfer is using this."
-           : !strcmp(reason, "game")     ? "Kraken Mount is using this game. Remove it in Kraken Mount first."
+           : !strcmp(reason, "game")     ? "ShadowMount is using this game. Unmount or uninstall it first."
            : !strcmp(reason, "install")  ? "The PS5 is installing from this."
                                          : "Another file operation is using this.";
 }
@@ -866,7 +852,7 @@ done:
     if (to >= 0) close(to);
     return rc;
 }
-/* Download removal uses the same drive, link and in-use guards as Files.
+/* Download removal uses the same drive, link and mounted-game guards as Files.
  * The queue supplies the names; no caller-provided filesystem path is used. */
 cJSON *files_download_plan(const Job *job, int *code, char *error, size_t cap) {
     *code = 409;
@@ -917,6 +903,40 @@ int files_delete_download(const Job *job, char *error, size_t cap) {
     }
     if (dir >= 0) { if (fsync(dir) && !rc) { copy_text(error, cap, "Files were removed, but the drive could not confirm the change."); rc = -1; } close(dir); }
     cJSON_Delete(items); storage_release();
+    return rc;
+}
+/* Free up space: a completed download's archive kept beside the files it unpacked.
+ * The name must be the job's own archive, a plain file on its drive that nothing is
+ * using; -1 when there is none to delete. */
+static int kept_archive(const Job *job, int dir, struct stat *st) {
+    if (!job->archive_kept || !job->output[0] || !strcmp(job->output, job->filename) ||
+        !extract_name_ok(job->filename) || strchr(job->filename, '/') || job->filename[0] == '.') return -1;
+    char path[1100]; snprintf(path, sizeof path, "%s/homebrew/%s", job->root, job->filename);
+    Guards guards = guards_collect();
+    bool busy = *locked(&guards, path);
+    guards_free(&guards);
+    if (busy || fstatat(dir, job->filename, st, AT_SYMLINK_NOFOLLOW) || !S_ISREG(st->st_mode) ||
+        st->st_dev != job->device || st->st_nlink != 1) return -1;
+    return 0;
+}
+int64_t files_kept_archive_size(const Job *job) {
+    int dir = storage_open(job);
+    if (dir < 0) return -1;
+    struct stat st;
+    int rc = kept_archive(job, dir, &st);
+    close(dir);
+    return rc ? -1 : (int64_t)st.st_size;
+}
+int files_delete_kept_archive(const Job *job, int64_t *freed, char *error, size_t cap) {
+    if (!storage_claim()) { copy_text(error, cap, "Another file operation is running. Wait for it to finish, or cancel it."); return -1; }
+    int dir = storage_open(job), rc = -1;
+    struct stat st;
+    if (dir < 0) copy_text(error, cap, "Reconnect the original drive before deleting downloaded files.");
+    else if (kept_archive(job, dir, &st)) copy_text(error, cap, "The kept archive changed or is in use. It was kept.");
+    else if (unlinkat(dir, job->filename, 0)) copy_text(error, cap, "The kept archive could not be deleted.");
+    else { rc = 0; *freed += (int64_t)st.st_size; fsync(dir); }
+    if (dir >= 0) close(dir);
+    storage_release();
     return rc;
 }
 static int run_delete(char *error, size_t cap) {
@@ -1037,9 +1057,8 @@ static int run_unpack(char *error, size_t cap) {
     return rc;
 }
 /* Hands the entry to the installer's receipts and follows them: packages
- * install, and a game folder goes to Kraken Mount (moved into homebrew when Kraken
- * Mount wouldn't find it where it is). It can't be stopped once the PS5 has it, so
- * it isn't cancelled; Orbit stopping leaves it running. */
+ * install, an image or game folder goes to ShadowMount. It can't be stopped
+ * once the PS5 has it, so it isn't cancelled; Orbit stopping leaves it running. */
 static int run_install(char *error, size_t cap) {
     char parent[PATH_LIMIT];
     const char *leaf;
@@ -1056,7 +1075,7 @@ static int run_install(char *error, size_t cap) {
         struct timespec wait = {.tv_sec = 0, .tv_nsec = 250000000};
         nanosleep(&wait, NULL);
         cJSON *r = packages_for_download(op.origin), *p;
-        const char *state = json_text(r, "state");
+        const char *state = json_text(r, "state"), *scan = json_text(r, "shadowMount");
         if (!cJSON_IsObject(r) || !strcmp(state, "error")) {
             copy_text(error, cap, *json_text(r, "message") ? json_text(r, "message") : "The installer couldn't check these files.");
             cJSON_Delete(r);
@@ -1068,13 +1087,10 @@ static int run_install(char *error, size_t cap) {
         }
         int64_t received = 0, total = 0;
         int packages = 0;
-        const char *kraken = json_text(r, "kraken");
-        bool busy = !strcmp(kraken, "pending") || !strcmp(kraken, "requested");
+        bool busy = !strcmp(scan, "pending") || !strcmp(scan, "requested");
         const char *failed = NULL;
         cJSON_ArrayForEach(p, cJSON_GetObjectItemCaseSensitive(r, "packages")) {
             const char *s = json_text(p, "state");
-            /* Kraken Mount runs this package without installing it (followed below). */
-            if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(p, "kraken"))) continue;
             packages++;
             received += json_int(p, "received");
             total += json_int(p, "total");
@@ -1093,12 +1109,12 @@ static int run_install(char *error, size_t cap) {
         if (failed) {
             copy_text(error, cap, *failed ? failed : "The package couldn't be installed.");
             rc = -1;
-        } else if (!strcmp(kraken, "error") || !strcmp(kraken, "unavailable") || !strcmp(kraken, "unconfirmed")) {
-            copy_text(error, cap, *json_text(r, "krakenMessage") ? json_text(r, "krakenMessage")
-                                                                 : "Kraken Mount couldn't add this game. Check Kraken Mount's page for details.");
+        } else if (!strcmp(scan, "unavailable") || !strcmp(scan, "unconfirmed")) {
+            copy_text(error, cap, *json_text(r, "shadowMountMessage") ? json_text(r, "shadowMountMessage")
+                                                                      : "ShadowMount couldn't add this game.");
             rc = -1;
-        } else if (!packages && strcmp(kraken, "registered")) {
-            copy_text(error, cap, "No package or game folder was found.");
+        } else if (!packages && strcmp(scan, "registered")) {
+            copy_text(error, cap, "No package, game image or game folder was found.");
             rc = -1;
         }
         cJSON_Delete(r);
@@ -1107,28 +1123,33 @@ static int run_install(char *error, size_t cap) {
     copy_text(error, cap, "Orbit stopped while following the installation. Check the PS5 home screen.");
     return -1;
 }
-/* After a copy, move or unpack: did a game folder land where Kraken Mount looks
- * for games (kraken_scan_place: homebrew or etaHEN/games, one folder below them,
- * or a USB or M.2 drive's top)? */
+/* A drive-relative folder ShadowMount scans: homebrew, or inside it. */
+static bool in_homebrew(const char *folder) {
+    return !strncmp(folder, "homebrew", 8) && (!folder[8] || folder[8] == '/');
+}
+/* After a copy, move or unpack: did a game land where a scan finds it? */
 static bool game_added(void) {
     char parent[PATH_LIMIT];
     const char *leaf;
     split(op.path, parent, sizeof parent, &leaf);
-    if (!strcmp(op.action, "unpack")) return kraken_scan_place(op.from.root, parent);
-    if (!kraken_scan_place(op.to.root, op.to_path)) return false;
+    if (!strcmp(op.action, "unpack")) return in_homebrew(parent);
+    if (!in_homebrew(op.to_path)) return false;
+    if (!strcmp(file_type(op.name), "image")) return true;
     int dir = open_place(&op.to, op.to_path);
     bool game = dir >= 0 && game_folder(dir, op.name);
     if (dir >= 0) close(dir);
     return game;
 }
+static bool mounted_path(const char *path) {
+    cJSON *snapshot = library_snapshot(false), *game; bool mounted = false;
+    cJSON_ArrayForEach(game, cJSON_GetObjectItemCaseSensitive(snapshot, "games"))
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(game, "mounted")) && related(path, json_text(game, "path"))) mounted = true;
+    cJSON_Delete(snapshot); return mounted;
+}
 static int run_verification(char *error, size_t cap) {
     char full[1200]; absolute(&op.from, op.path, full, sizeof full);
-    if (!strcmp(op.action, "repair") && packages_path_busy(full)) {
-        copy_text(error, cap, "Wait for its installation to finish before repairing this game."); return -1;
-    }
-    /* Checked again when it runs: Kraken Mount may have started preparing it since. */
-    if (!strcmp(op.action, "repair") && kraken_mounting(full)) {
-        copy_text(error, cap, locked_text("game")); return -1;
+    if (!strcmp(op.action, "repair") && (mounted_path(full) || packages_path_busy(full))) {
+        copy_text(error, cap, "Unmount this game and wait for its installation to finish before repairing it."); return -1;
     }
     int root = open_place(&op.from, op.path);
     if (root < 0) { copy_text(error, cap, "The game folder is no longer available."); return -1; }
@@ -1267,8 +1288,8 @@ static int start(const cJSON *input, const char *action, char *error, size_t cap
         copy_text(error, cap, "Choose a ZIP, 7z or RAR archive.");
         return 400;
     }
-    if (!strcmp(action, "install") && (folder ? !game : strcmp(file_type(e.leaf), "package"))) {
-        copy_text(error, cap, "Choose a PKG file or game folder.");
+    if (!strcmp(action, "install") && (folder ? !game : strcmp(file_type(e.leaf), "package") && strcmp(file_type(e.leaf), "image"))) {
+        copy_text(error, cap, "Choose a PKG file, game image or game folder.");
         return 400;
     }
     if (!strcmp(action, "measure") && !folder) {
@@ -1290,12 +1311,9 @@ static int start(const cJSON *input, const char *action, char *error, size_t cap
     if ((!strcmp(action, "verify") || !strcmp(action, "repair")) && !game) {
         copy_text(error, cap, "Choose an extracted game folder to check."); return 400;
     }
-    if ((!strcmp(action, "verify") || !strcmp(action, "repair")) && *reason && strcmp(reason, "game")) {
-        copy_text(error, cap, "Wait for active downloads or installations before checking this game."); return 409;
-    }
-    /* Verify only reads a game Kraken Mount lists; Repair rewrites files it has mounted or is preparing. */
-    if (!strcmp(action, "repair") && kraken_mounting(e.full)) {
-        copy_text(error, cap, locked_text("game")); return 409;
+    if ((!strcmp(action, "verify") && *reason && strcmp(reason, "game")) ||
+        (!strcmp(action, "repair") && ((*reason && strcmp(reason, "game")) || mounted_path(e.full)))) {
+        copy_text(error, cap, "Unmount this game and wait for active downloads or installations before checking it."); return 409;
     }
     bool reads = !strcmp(action, "copy") || !strcmp(action, "unpack") || !strcmp(action, "install") || !strcmp(action, "verify") || !strcmp(action, "repair");
     if ((changes && *reason) || (reads && (!strcmp(reason, "busy") || !strcmp(reason, "download") || !strcmp(reason, "orbit"))) ||

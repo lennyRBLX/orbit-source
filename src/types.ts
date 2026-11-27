@@ -35,7 +35,9 @@ export interface Release extends AddonIdentity {
   mirrorCount?: number;
   providerMetadata?: boolean;
   // An unresolved provider page can omit the file type.
-  format: "FPKG" | "PKG" | "Game folder" | "Unknown";
+  format: "FFPFSC" | "exFAT" | "FPKG" | "PKG" | "Game folder" | "Unknown";
+  contentFormat?: "LZ4";
+  assetCompression?: "ZSTD";
   // Downloaded as an archive and extracted on the drive; format is what's inside.
   compression?: "zip" | "7z" | "rar";
   archivePassword?: string;
@@ -62,8 +64,6 @@ export interface Release extends AddonIdentity {
   requiredFirmware?: string;
   maxFirmware?: string;
   firmwareIssue?: "ps5-package" | "newer-firmware";
-  /* Kraken Mount is running and runs this PS5 package without installing it. */
-  mounter?: "kraken";
 }
 // Get everything's Download all (GET/POST /api/v1/bundles): one at a time, items added in order.
 export interface BundleItem {
@@ -158,8 +158,6 @@ export interface Job extends AddonIdentity {
   requiredFirmware?: string;
   maxFirmware?: string;
   firmwareIssue?: "ps5-package" | "newer-firmware";
-  /* Kraken Mount is running and runs this PS5 package without installing it. */
-  mounter?: "kraken";
   firmwareSource?: string;
   consoleFirmware?: string;
   backport?: boolean;
@@ -195,6 +193,10 @@ export interface Job extends AddonIdentity {
   error: string;
   verification: string;
   canRefreshLink?: boolean;
+  // Downloads from a link the user pasted (sourceId "link"): its host, never the link.
+  sourceId?: "link";
+  linkHost?: string;
+  canReplaceLink?: boolean;
   compression?: string;
   canEnterArchivePassword?: boolean;
   extracted?: number;
@@ -220,11 +222,15 @@ export interface LibraryGame {
   installed: boolean;
   mounted: boolean;
   onDrive: boolean;
+  managed: boolean;
+  canManageSource: boolean;
   installedSizeBytes: number | null;
   sizeBytes: number | null;
   sizeStatus: "ready" | "unknown" | "unavailable";
   cover?: string;
   coverFallback?: string | null;
+  /** Listed by Orbit because the running ShadowMount doesn't list installed PKGs. */
+  foundByOrbit?: boolean;
 }
 export interface LibraryAction {
   id: string;
@@ -232,6 +238,22 @@ export interface LibraryAction {
   titleId: string;
   state: "queued" | "running" | "complete" | "error";
   message: string;
+}
+export interface StorageJob {
+  id: number;
+  operation: string;
+  state: string;
+  titleId: string;
+  source: string;
+  destination: string;
+  error: string;
+  result: number;
+  totalBytes: number;
+  processedBytes: number;
+  speed: number;
+  active: boolean;
+  cancellable: boolean;
+  cancelRequested: boolean;
 }
 export interface LibrarySnapshot {
   status: "idle" | "ready" | "unavailable" | "unsupported" | "error";
@@ -246,19 +268,26 @@ export interface LibrarySnapshot {
   games: LibraryGame[];
   capabilities: string[];
   action: LibraryAction | null;
-  // A scan Orbit asked Kraken Mount for.
+  storageJob: StorageJob | null;
+  storageError: string;
+  storageBusy: boolean;
+  // Automatic work: a scan ShadowMount is running, game sizes being measured.
   scanning?: boolean;
+  measuring?: boolean;
 }
 export interface LibraryDrive {
   id: string;
   path: string;
+  mountPoint: string;
   label: string;
+  filesystem: string;
+  readOnly: boolean;
   totalBytes: number;
   freeBytes: number;
   usedBytes: number;
 }
 // Files: what is on the PS5's drives, by drive and path relative to its top.
-export type FileType = "folder" | "game" | "archive" | "package" | "file";
+export type FileType = "folder" | "game" | "archive" | "package" | "image" | "file";
 export interface FileEntry {
   name: string;
   folder: boolean;
@@ -266,7 +295,7 @@ export interface FileEntry {
   // Files only; a folder's size is measured on request.
   sizeBytes: number | null;
   modifiedAt: number;
-  // Why it can't be changed: "", or drive, orbit, download, install or busy.
+  // Why it can't be changed: "", or drive, orbit, download, game, install or busy.
   locked: string;
 }
 export interface FileListing {
@@ -296,7 +325,11 @@ export interface FileOperation {
 }
 export interface LibraryStorage {
   drives: LibraryDrive[];
+  destinations: LibraryDrive[];
+  busy: boolean;
+  stale: boolean;
   updatedAt: number;
+  error: string;
 }
 export interface LibraryTarget {
   titleId?: string;
@@ -334,8 +367,6 @@ export interface System {
   targetFirmware: string;
   firmware?: string;
   ps5PackageFirmware?: string;
-  krakenMount?: boolean;
-  krakenMountVersion?: string;
   // 1: GET/POST /api/v1/bundles (Get everything). Unset on older services.
   bundleProtocol?: number;
   localSessionAvailable: boolean;
@@ -387,7 +418,6 @@ export const bytes = (n: number) => {
 
 export interface BrowserSession {
   accountPage?: boolean;
-  directDownload?: boolean;
   vikingAccountAvailable?: boolean;
   vikingBrowserState?: "signed-in" | "signed-out" | "unknown";
   vikingNativeState?: "signed-in" | "signed-out" | "unknown";

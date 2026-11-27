@@ -46,7 +46,6 @@ export interface ShellProps {
   active: number;
   paired: (action: () => void) => () => void;
   openSettings: () => void;
-  openDownloadUrl: () => void;
   // The settings page when it's open (it replaces the section's content).
   settings: ReactNode | null;
   // An Orbit update is available: Settings carries a dot.
@@ -154,14 +153,6 @@ function SectionNav({
   );
 }
 
-function UrlTool({ open }: { open: () => void }) {
-  const label = t("Download from URL");
-  return (
-    <button className="icon-button" aria-label={label} title={label} onClick={open}>
-      <Glyph name="link" size={20} />
-    </button>
-  );
-}
 
 const isBrowse = (p: ShellProps) => p.tab === "Browse" || p.tab === "Add-ons";
 const collectionLabel = (p: ShellProps) => t(p.tab === "Add-ons" ? "All add-ons" : "All games");
@@ -491,7 +482,6 @@ function PanoramaShell(props: ShellProps) {
           }
         />
         <div className="pn-tools">
-          <UrlTool open={props.openDownloadUrl} />
           <button className="icon-button" aria-label={t("Search games")} data-command="search" onClick={props.openSearch}>
             <Glyph name="search" size={20} />
           </button>
@@ -671,7 +661,6 @@ function CinemaShell(props: ShellProps) {
         </span>
         <SectionNav props={props} className="cn-chapters" />
         <div className="cn-tools">
-          <UrlTool open={props.openDownloadUrl} />
           {/* The search field opens from the icon and stays while there's a search. */}
           {isBrowse(props) && !props.game && !props.settings && (searching || props.filters.query) ? (
             props.nodes.browseSearch
@@ -904,7 +893,6 @@ function CrossbarShell(props: ShellProps) {
         />
         {/* Downloads show once, as the badge on Downloads (the design has no capsule). */}
         <div className="xb-tools">
-          <UrlTool open={props.openDownloadUrl} />
           <div onFocusCapture={() => !isBrowse(props) && !props.game && !props.settings && props.go("Browse")}>
             {props.nodes.browseSearch}
           </div>

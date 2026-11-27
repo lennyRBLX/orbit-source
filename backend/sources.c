@@ -23,6 +23,9 @@ bool source_enabled_locked(const Release *r) {
     if (!strcmp(r->id, "orbit-network-check") || !strcmp(r->source, ORBIT_DIRECT_SOURCE))
         return true;
     if (!strcmp(r->source, "remote")) return remote_source_enabled_locked(r);
+    /* A link the user pasted is not a catalogue source. */
+    if (!strcmp(r->source, "link"))
+        return true;
     return orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&
            orbit.sources.acknowledged_at > 0 && (orbit.sources.enabled & source_flag(r->source));
 }

@@ -5,6 +5,8 @@
 #include "receive.h"
 #include "zero_probe.h"
 #include "zero_link.h"
+#include "links.h"
+#include "space.h"
 #include "debrid.h"
 #include "archive_account.h"
 #include "viking_pass.h"
@@ -12,7 +14,6 @@
 #include "files.h"
 #include "power.h"
 #include "history.h"
-#include "kraken.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -345,6 +346,8 @@ int main(int argc, char **argv) {
     zero_probe_start();
     startup_result = zero_link_start();
     diagnostics_stage("zero-link", startup_result ? "error" : "ok", startup_result);
+    if (links_start())
+        puts("Link downloads could not start; the server remains available.");
     /* Before the API answers, so a Get everything sent at once isn't refused. */
     if (bundle_start())
         puts("Orbit Get everything could not start; the server remains available.");
@@ -420,9 +423,6 @@ int main(int argc, char **argv) {
     diagnostics_stage("browser", "started", 0);
     startup_result = browser_start();
     diagnostics_stage("browser", startup_result ? "error" : "ok", startup_result);
-    diagnostics_stage("kraken", "started", 0);
-    startup_result = kraken_start();
-    diagnostics_stage("kraken", startup_result ? "error" : "ok", startup_result);
     diagnostics_stage("library", "started", 0);
     startup_result = library_start();
     diagnostics_stage("library", startup_result ? "error" : "ok", startup_result);
@@ -467,6 +467,8 @@ int main(int argc, char **argv) {
     receive_stop();
     zero_probe_stop();
     zero_link_stop();
+    links_stop();
+    space_stop(); /* finishes the item it is deleting; the rest are kept */
     pthread_mutex_lock(&orbit.mutex);
     orbit.stop = true;
     pthread_cond_broadcast(&orbit.changed);
@@ -481,7 +483,6 @@ int main(int argc, char **argv) {
     files_stop(); /* before the installer it may be following */
     packages_stop();
     library_stop();
-    kraken_stop();
     updates_stop();
     remote_sources_stop();
     catalog_stop();

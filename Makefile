@@ -84,6 +84,10 @@ test-backend: build/orbit-host build/orbit-test
 test-zero-link: build/orbit-test
 	python3 tests/zero_link_integration.py
 
+.PHONY: test-links
+test-links: build/orbit-test
+	python3 tests/links_integration.py
+
 test-installation-history: build/orbit-test
 	python3 tests/installation_history_integration.py
 
@@ -216,10 +220,9 @@ test-library: build/orbit-host build/orbit-test
 	python3 tests/library_actions.py
 	python3 tests/library_verified_move.py
 
-.PHONY: test-kraken
-test-kraken: build/orbit-test
-	python3 tests/packages_integration.py
-	python3 tests/kraken_integration.py
+.PHONY: test-space
+test-space: build/orbit-host build/orbit-test
+	python3 tests/space_integration.py
 
 .PHONY: test-bundles
 test-bundles: build/orbit-test

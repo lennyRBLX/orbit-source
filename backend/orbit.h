@@ -20,7 +20,7 @@
 /* Connections per download: the setting's range (1–64), and its default. */
 #define ORBIT_MAX_RANGES 64
 #define ORBIT_DEFAULT_CONNECTIONS 8
-#define ORBIT_VERSION "1.9.6"
+#define ORBIT_VERSION "1.9.7"
 #define ORBIT_SOURCE_NOTICE_VERSION 1
 #define ORBIT_SOURCE_ARCHIVE 1U
 #define ORBIT_SOURCE_VIKINGFILE 2U
@@ -70,7 +70,7 @@ typedef struct {
     char path[1100];   /* What it creates or changes, absolute. */
     char source[1100]; /* What a move or delete takes away, absolute; may be empty. */
 } StorageHold;
-enum { HOLD_FILES, HOLD_RECEIVE, HOLD_COUNT };
+enum { HOLD_FILES, HOLD_RECEIVE, HOLD_LIBRARY, HOLD_COUNT };
 typedef struct {
     Release release; /* Immutable download identity, independent of catalogue refreshes. */
     char id[24], release_id[24], storage_id[24], root[512], filename[256];
@@ -112,7 +112,7 @@ typedef struct {
     int64_t extracted, inspected_size;
     char inspected_format[12]; /* Local result, never changes the release identity. */
     uint32_t extracted_firmware; /* Declared by extracted PS5 param.json; zero means unknown. */
-    bool extracted_backport; /* The extracted folder holds a backport (fakelib) for Kraken Mount's backports folder. */
+    bool extracted_backport; /* The extracted folder holds a ShadowMountPlus backport (fakelib). */
     bool archive_ready, archive_kept;
     bool keep_packed; /* Queued while extraction was off: the archive is the download. */
     /* Added by Get everything: install once checked, after install_after's download is in
@@ -173,6 +173,7 @@ typedef struct {
     bool queue_backup_created;
     atomic_bool stop;
     bool receiver_active; /* Local file receiver owns destination I/O. */
+    bool library_storage_busy; /* Serializes local file operations with ShadowMount storage jobs. */
     bool files_storage_busy; /* Files mutations reserve drives against other storage operations. */
     StorageHold holds[HOLD_COUNT]; /* Space and names the running storage operation uses. */
     int state_fd;
@@ -205,8 +206,6 @@ int state_load(void);
 Release *release_find(const char *id);
 int release_parse(const cJSON *entry, Release *release, bool diagnostic);
 int release_context_parse(const cJSON *x, Release *r);
-/* PKG, FPKG or game folder (archived or not): the only downloads Orbit offers or queues. */
-bool orbit_format_allowed(const Release *release);
 cJSON *release_context_json(const Release *r);
 cJSON *release_json(const Release *release);
 void release_download_title(const Release *release, char *out, size_t cap);
@@ -224,6 +223,10 @@ bool provider_browser_source(const char *source);
 const char *provider_torbox_url(const Release *release);
 bool provider_header_filename(const char *value, char *out, size_t cap);
 bool provider_disposition_name(const char *url, char *out, size_t cap);
+/* The file name in a Content-Disposition value. */
+bool provider_content_filename(const char *disposition, char *out, size_t cap);
+/* Percent-decodes n bytes; false for bad escapes or control characters. */
+bool provider_percent_decode(const char *src, size_t n, char *out, size_t cap);
 bool provider_viking_file_server(const char *host, size_t n);
 int browser_start(void);
 void browser_stop(void);
@@ -231,12 +234,19 @@ void browser_source_changed_locked(void);
 cJSON *browser_status(void);
 cJSON *browser_diagnostics_locked(void);
 int browser_action(const cJSON *input, char *error, size_t cap);
-int browser_direct_download(const cJSON *input, char *error, size_t cap);
 /* Under orbit.mutex. 1 = started, 0 = browser busy, -1 = cannot start. */
 int browser_start_queued_locked(Job *job, char *error, size_t cap);
 void browser_job_changed_locked(const char *id);
 int transfer_validate_capture(Release *release, atomic_bool *cancel, char *etag,
                               char *modified, char *error, size_t cap);
+/* What one small request to a pasted link said about its file (links.c). */
+typedef struct {
+    int64_t size;
+    char etag[256], modified[128], disposition[512];
+    char final_url[sizeof ((Release *)0)->url]; /* After redirects; private like the link. */
+} LinkProbe;
+/* One bounded request: a file with a size, not a page, and never its contents. */
+int transfer_probe_link(Release *release, atomic_bool *cancel, LinkProbe *out, char *error, size_t cap);
 unsigned source_flag(const char *id);
 bool source_enabled_locked(const Release *release);
 cJSON *sources_json_locked(void);
@@ -265,8 +275,16 @@ bool job_can_refresh_link(const Job *job);
 int job_refresh_link_locked(Job *job, const Release *release, const Storage *destination,
                             const char *etag, const char *modified, char *error, size_t cap);
 int job_create_captured_locked(const Release *release, const Storage *destination,
-                               const char *etag, const char *modified, const char *password, char *error,
+                               const char *etag, const char *modified, char *error,
                                size_t cap, Job **result);
+/* A file from a pasted link (links.c), checked by transfer_probe_link. */
+int job_create_link_locked(const Release *release, const Storage *destination,
+                           const char *etag, const char *modified, char *error,
+                           size_t cap, Job **result);
+/* A paused or failed link download that can take a fresh link and keep its partial. */
+bool job_can_replace_link(const Job *job);
+int job_replace_link_locked(Job *job, const Release *release, const char *etag,
+                            const char *modified, char *error, size_t cap);
 int job_action_locked(Job *job, const char *action, bool remove, char *error, size_t cap);
 int job_password_locked(Job *job, const char *password, char *error, size_t cap);
 int job_delete_partial_locked(Job *job, char *error, size_t cap);
@@ -326,7 +344,10 @@ void library_stop(void);
 cJSON *library_snapshot(bool refresh);
 cJSON *library_storage_snapshot(bool refresh);
 int library_action(const cJSON *input, char *error, size_t cap);
-/* Ask Kraken Mount to scan soon: Files put a game folder where it looks for games. */
+/* Free up space (space.c): deletable games on a drive, and a Library action's result. */
+cJSON *library_space_games(const char *root);
+cJSON *library_action_result(const char *request);
+/* Ask ShadowMount to scan soon: Files put a game image or folder in homebrew. */
 void library_auto_scan(void);
 int pairing_notify(void);
 int notify_console(const char *text);

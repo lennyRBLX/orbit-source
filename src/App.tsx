@@ -4,11 +4,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useOrbit } from "./useOrbit";
 import { useController } from "./controller";
 import { Backdrop, GameTile, Icon, Modal, StorageRows } from "./components";
+import { FreeSpaceHost } from "./FreeSpace";
 import { GameRail, type RailMemory } from "./GameRail";
 import { placeOf, restorePlace, type Place } from "./returnPlace";
 import { Details } from "./Details";
 import { Downloads } from "./Downloads";
-import { DirectDownload } from "./DirectDownload";
 import { Library } from "./Library";
 import { useLibrary } from "./useLibrary";
 import { StorageOverview } from "./LibraryActions";
@@ -30,7 +30,7 @@ import { HistorySetting } from "./HistoryRemoval";
 import { Sources } from "./Sources";
 import { Pairing } from "./Pairing";
 import type { Game, LibraryTarget } from "./types";
-import { browseGames, catalogueGenres, catalogueTags, choiceCounts, newOnOrbitPicks, newlyAddedGames, defaultFilters, downloadFormats, CATALOG_STEP, DOWNLOAD_FORMATS, TAGS, TORBOX_SOURCE, type BrowseFilters, type CountedFilter } from "./browse";
+import { browseGames, catalogueGenres, catalogueTags, choiceCounts, newOnOrbitPicks, newlyAddedGames, defaultFilters, downloadFormats, matchesDownloadFormat, CATALOG_STEP, DOWNLOAD_FORMATS, TAGS, TORBOX_SOURCE, type BrowseFilters, type CountedFilter } from "./browse";
 import { torboxSources, useDebrid } from "./Debrid";
 import { SavedFilters } from "./SavedFilters";
 import { useInfiniteList } from "./infiniteList";
@@ -132,7 +132,6 @@ export default function App() {
   const [storageOpen, setStorageOpen] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [zeroOpen, setZeroOpen] = useState(false),
-    [downloadUrlOpen, setDownloadUrlOpen] = useState(false),
     [sourcesOpen, setSourcesOpen] = useState(false),
     [autoOpen, setAutoOpen] = useState(false),
     [pairOpen, setPairOpen] = useState(false),
@@ -233,7 +232,6 @@ export default function App() {
     else if (storageOpen) setStorageOpen(false);
     else if (notificationsOpen) setNotificationsOpen(false);
     else if (zeroOpen) setZeroOpen(false);
-    else if (downloadUrlOpen) setDownloadUrlOpen(false);
     else if (autoOpen || settingsPage) closeSettings();
     else if (game) setGameId(null);
     else if (tab === "Add-ons" && addonBase) { setGameId(addonBase); setTab("Browse"); setAddonBase(""); }
@@ -244,7 +242,7 @@ export default function App() {
         first?.focus({ preventScroll: true });
       });
     }
-  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, downloadUrlOpen, autoOpen, settingsPage, pairOpen, savedOpen, sourcesOpen, closeSettings]);
+  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, autoOpen, settingsPage, pairOpen, savedOpen, sourcesOpen, closeSettings]);
   const consoleBrowser =
     orbit.system?.platform === "ps5" && !!orbit.system.localSessionAvailable;
   useController(back, consoleBrowser);
@@ -270,10 +268,10 @@ export default function App() {
     () => browseGames(pageGames, filters, favorites, installedGames, torbox),
     [pageGames, filters, favorites, installedGames, torbox],
   );
-  // PKG, FPKG and Game folder, the formats Orbit downloads, as far as the catalogue has them.
+  // Show formats and archive types that occur in the catalogue.
   const formatValues = useMemo(
     () => Object.keys(DOWNLOAD_FORMATS).filter((format) =>
-      catalogueGames.some((g) => g.releases.some((r) => r.format === format))),
+      catalogueGames.some((g) => g.releases.some((r) => matchesDownloadFormat(r, format)))),
     [catalogueGames],
   );
   // Desktop filters remain visible even when the narrow-screen filter panel is closed.
@@ -437,7 +435,7 @@ export default function App() {
         session={orbit.browser}
         cancel={orbit.cancelProvider}
         openQueue={openDownload}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen || (downloadUrlOpen && !!orbit.browser?.directDownload)}
+        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
       />
     </>
   );
@@ -687,6 +685,7 @@ export default function App() {
           onChange={(value) => filter("sort", value)}
           options={[
             { value: defaultSort, label: t(addonsPage ? "Recently added" : "Newest first") },
+            ...(!addonsPage ? [{ value: "added", label: t("Recently added") }] : []),
             { value: "title", label: t("Title A–Z") },
             { value: "title-desc", label: t("Title Z–A") },
             { value: "size", label: t("Smallest download") },
@@ -788,6 +787,7 @@ export default function App() {
       openLibrary={(job) => openLibrary({ titleId: job.titleId, path: job.path, title: job.title })}
       concurrent={orbit.system?.paired ? orbit.system.concurrentDownloads : undefined}
       deletePackages={orbit.system?.deletePackages === true}
+      preferredDrive={orbit.system?.preferredStorage}
     />
   );
   // Before games arrive (opening, unreachable, no sources), in every interface.
@@ -942,7 +942,6 @@ export default function App() {
           active={active}
           paired={paired}
           openSettings={paired(() => setSettingsPage("downloads"))}
-          openDownloadUrl={paired(() => setDownloadUrlOpen(true))}
           settings={autoOpen ? null : settingsNode}
           updateAvailable={updateAvailable}
           openSearch={showSearch}
@@ -1019,14 +1018,6 @@ export default function App() {
                 onClick={showSearch}
               >
                 <Icon name="search" />
-              </button>
-              <button
-                className="top-icon"
-                data-label={t("Download from URL")}
-                aria-label={t("Download from URL")}
-                onClick={paired(() => setDownloadUrlOpen(true))}
-              >
-                <Glyph name="link" size={26} />
               </button>
               <button
                 className="top-icon"
@@ -1250,21 +1241,11 @@ export default function App() {
           {storagePanel}
         </Modal>
       )}
+      {orbit.system?.paired && <FreeSpaceHost drives={orbit.storage} refresh={() => orbit.refresh()} />}
       {zeroOpen && (
         <Modal title="Orbit Zero" close={() => setZeroOpen(false)} className="storage-modal orbit-zero-modal">
           {zeroPanel}
         </Modal>
-      )}
-      {downloadUrlOpen && (
-        <DirectDownload
-          browser={orbit.browser}
-          storage={orbit.storage}
-          preferredStorage={orbit.system?.preferredStorage || ""}
-          download={orbit.downloadUrl}
-          cancel={orbit.cancelProvider}
-          close={() => setDownloadUrlOpen(false)}
-          view={(id) => { setDownloadUrlOpen(false); openDownload(id); }}
-        />
       )}
       {notificationsOpen && (
         <Modal

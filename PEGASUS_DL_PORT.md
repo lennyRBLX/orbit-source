@@ -119,7 +119,7 @@ Each `url` points at a plain-JSON catalogue. Before writing the adapter, fetch t
   source is fetched.
 - Remote entries that match a catalogue game by `title_id` attach to that game as extra download
   options. Unmatched entries appear as standalone titles under a **Homebrew** platform tag.
-- Downloads of remote releases go through the normal queue (`queue.c`), extraction and Kraken Mount
+- Downloads of remote releases go through the normal queue (`queue.c`), extraction and ShadowMountPlus
   handoff. No new download path.
 
 ### 5. API (`backend/api.c`)
