@@ -418,6 +418,8 @@ export const bytes = (n: number) => {
 };
 
 export interface BrowserSession {
+  pspkgReleaseId?: string;
+  pspkgLinks?: { id: string; label: "PSPKG"; number: number }[];
   accountPage?: boolean;
   vikingAccountAvailable?: boolean;
   vikingBrowserState?: "signed-in" | "signed-out" | "unknown";
@@ -432,6 +434,7 @@ export interface BrowserSession {
     | "waiting"
     | "waiting-link"
     | "validating"
+    | "links-ready"
     | "queued"
     | "failed"
     | "cancelled";

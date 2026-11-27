@@ -113,6 +113,14 @@ int main(int argc, char **argv) {
                                             (size_t)json_int(request, "gameLimit")));
         } else if (!strcmp(op, "pspkg-links")) {
             print_json(remote_pspkg_links_test(json_text(request, "html")));
+        } else if (!strcmp(op, "pspkg-candidate")) {
+            Release release = {0};
+            copy_text(release.source, sizeof release.source, "pspkg");
+            copy_text(release.remote_catalog_id, sizeof release.remote_catalog_id, PSPKG_PS5_SOURCE);
+            copy_text(release.title_id, sizeof release.title_id, "P5012345abcdef");
+            release.remote_page = true;
+            cJSON *answer = cJSON_CreateBool(provider_capture_url(&release, json_text(request, "url")));
+            print_json(answer);
         } else if (!strcmp(op, "parse")) {
             const cJSON *feed = cJSON_GetObjectItemCaseSensitive(request, "feed");
             char *body = cJSON_PrintUnformatted(feed);

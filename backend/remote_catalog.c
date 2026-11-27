@@ -1,6 +1,7 @@
 #include "remote_sources.h"
 #include "provider_network.h"
 #include "padrino.h"
+#include "pspkg.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -403,7 +404,19 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     bool has_path = remote_url_filename(r->url, path_name, sizeof path_name);
     if (has_path && unsupported_label(path_name, padrino)) return 1;
     if (!strcmp(r->url, "https://datanodes.to/download")) return 1;
-    bool hosted = (padrino && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"))) ||
+    bool gated = pspkg && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"));
+    if (gated) {
+        const char *source = strstr(json_text(entry, "description"), "\nSource: ");
+        if (!source) return -1;
+        source += strlen("\nSource: ");
+        const char *end = strchr(source, '\n');
+        char game[sizeof r->browser_url];
+        if (!end || end == source || end - source >= (ptrdiff_t)sizeof game) return -1;
+        memcpy(game, source, (size_t)(end - source));
+        game[end - source] = 0;
+        if (!pspkg_page_matches(game, r->url)) return -1;
+    }
+    bool hosted = gated || (padrino && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"))) ||
                   remote_metadata_url(r->url) || *remote_browser_provider(r->url) ||
                   !strncmp(r->url, "https://www.mediafire.com/file/", 31);
     int result = remote_file_format(r, *filename ? filename : has_path ? path_name : "");

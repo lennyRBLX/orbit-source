@@ -277,6 +277,8 @@ int job_refresh_link_locked(Job *job, const Release *release, const Storage *des
 int job_create_captured_locked(const Release *release, const Storage *destination,
                                const char *etag, const char *modified, char *error,
                                size_t cap, Job **result);
+int job_create_pspkg_torbox_locked(const Release *release, const Storage *destination,
+                                   char *error, size_t cap, Job **result);
 /* A file from a pasted link (links.c), checked by transfer_probe_link. */
 int job_create_link_locked(const Release *release, const Storage *destination,
                            const char *etag, const char *modified, char *error,

@@ -66,6 +66,8 @@ export function Details({
   openQueue,
   browser,
   openProvider,
+  fetchPspkgLinks,
+  downloadPspkgLink,
   favorite,
   setFavorite,
   configureDebrid,
@@ -97,6 +99,8 @@ export function Details({
   openQueue: (id?: string) => void;
   browser: BrowserSession | null;
   openProvider: (releaseId: string, storageId: string) => Promise<void>;
+  fetchPspkgLinks: (releaseId: string) => Promise<void>;
+  downloadPspkgLink: (releaseId: string, linkId: string, storageId: string) => Promise<void>;
   favorite: boolean;
   setFavorite: (value: boolean) => Promise<void>;
   configureDebrid: (onReturn: () => void) => void;
@@ -215,9 +219,11 @@ export function Details({
     planned = space?.planned,
     afterDownload = space?.after ?? 0,
     enough = space?.enough;
+  const isPspkg = release.sourceId === "remote" && release.provider === "PSPKG";
+  const pspkgLinks = browser?.pspkgReleaseId === release.id ? browser.pspkgLinks || [] : [];
   const canTorbox = torboxAvailable(debrid.status, release);
-  const torbox = canTorbox && deliveryChoice !== "direct";
-  const useBrowser = !!release.browserAvailable && !torbox;
+  const torbox = !isPspkg && canTorbox && deliveryChoice !== "direct";
+  const useBrowser = isPspkg || (!!release.browserAvailable && !torbox);
   const resolveCommunityOption = useBrowser && release.sourceId === "remote";
   // Get everything: this option with its DLC, on the drive Download uses.
   const everything = useEverything({ game, release, delivery: deliveryChoice ?? undefined, drive, jobs, library, system, catalog });
@@ -243,7 +249,7 @@ export function Details({
     !game.releases.some((option) => option.id === releaseId) ||
     pending ||
     !!browser?.active ||
-    !drive ||
+    (!drive && !isPspkg) ||
     !(
       system?.platform === "ps5" ||
       (system?.platform === "fixture" && release.id === "ppsa04029-ffpfsc")
@@ -311,6 +317,34 @@ export function Details({
       setPending(false);
     }
   }
+  async function fetchLinks() {
+    setPending(true);
+    setError("");
+    try {
+      await fetchPspkgLinks(release.id);
+      setSheet(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPending(false);
+    }
+  }
+  async function selectPspkgLink(linkId: string) {
+    if (!drive) {
+      setError(t("Connect a writable drive to your PS5."));
+      return;
+    }
+    setPending(true);
+    setError("");
+    try {
+      await downloadPspkgLink(release.id, linkId, drive.id);
+      setSheet(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setPending(false);
+    }
+  }
   function chooseRelease(id: string) {
     setReleaseId(id);
     setSheet("downloads");
@@ -343,6 +377,7 @@ export function Details({
     else if (!downloadAgain && collection?.job) openQueue(collection.job.id);
     else if (!downloadAgain && collection?.kind === "library" && libraryGame)
       viewLibrary();
+    else if (isPspkg) void fetchLinks();
     else {
       rememberChoice(release);
       const run = (id?: string) => void (useBrowser && deliveryChoice === "direct" ? verifyProvider(id) : start(id));
@@ -358,6 +393,8 @@ export function Details({
         ? t("View in Library")
         : pending
           ? t("Please wait…")
+          : isPspkg
+            ? pspkgLinks.length ? t("Refresh PSPKG links") : t("Fetch PSPKG links")
           : related && !downloadAgain
             ? t("Download anyway")
             : torbox
@@ -367,15 +404,36 @@ export function Details({
               : existing || downloadAgain
                 ? t("Download again")
                 : t("Download to PS5");
-  const methodLabel = torbox
+  const methodLabel = isPspkg
+    ? t("Automatic: TorBox or direct")
+    : torbox
     ? "TorBox"
     : t("{provider} directly", { provider: releaseProvider(release) });
-  const methodNote = !canTorbox
+  const methodNote = isPspkg
+    ? t("Orbit checks the selected provider and uses TorBox when supported, otherwise a verified direct file.")
+    : !canTorbox
     ? t("TorBox is unavailable for this option. Choose the original source or check App settings.")
     : torbox
       ? t("Uses your TorBox account. Preparation may take time; follow it in Downloads.")
       : t("TorBox is available for this option.");
-  const instructions = (
+  const instructions = isPspkg ? (
+    <div className="provider-browser-option" id="provider-browser-steps" role="region" aria-label={t("PSPKG download links")}>
+      <strong>{t("PSPKG download links")}</strong>
+      <p>{t("Fetch links for this game in the PS5 browser. Complete Cloudflare verification if shown, then return to Orbit and choose a link.")}</p>
+      {pspkgLinks.length > 0 && (
+        <div className="pspkg-link-list">
+          {pspkgLinks.map((link) => (
+            <button key={link.id} type="button" disabled={pending || !!browser?.active || !drive}
+              onClick={() => void selectPspkgLink(link.id)}>
+              {link.label} {link.number}
+            </button>
+          ))}
+        </div>
+      )}
+      {pspkgLinks.length > 0 && <p>{t("Orbit opens the selected link on PS5, then uses TorBox when it supports the provider. Otherwise, follow the provider's download steps for a direct file.")}</p>}
+      {!browser?.available && <p>{t("Connect to Orbit running on your PS5 to use this option.")}</p>}
+    </div>
+  ) : (
     <div
       className="provider-browser-option"
       id="provider-browser-steps"
@@ -474,7 +532,7 @@ export function Details({
       </button>
       {showDownload && (
         <>
-          <button
+          {!isPspkg && <button
             className="sheet-setting"
             data-setting="delivery"
             disabled={pending || browser?.active}
@@ -489,7 +547,7 @@ export function Details({
               {!torbox && canTorbox && <small>{t("TorBox available")}</small>}
             </span>
             <Icon name="chevron" />
-          </button>
+          </button>}
           {system?.paired && (
             <button
               className="sheet-setting"
@@ -713,7 +771,7 @@ export function Details({
           ]
         : []),
       valueRow("version", "layers", t("Version"), `${releaseProvider(release)} · ${formatLabel(release)}`, !pending && !browser?.active),
-      ...(showDownload ? [valueRow("using", "cloud", t("Download using"), methodLabel, !pending && !browser?.active)] : []),
+      ...(showDownload && !isPspkg ? [valueRow("using", "cloud", t("Download using"), methodLabel, !pending && !browser?.active)] : []),
       ...(showDownload && system?.paired
         ? [valueRow("save", "drive", t("Save to"), drive ? placeName(drive.label) : t("Select storage"), !pending && !browser?.active)]
         : []),
@@ -973,7 +1031,7 @@ export function Details({
             )}
           </PnGroup>
           {everything.available && <PanoramaEverything m={everything} />}
-          {showDownload && (
+          {showDownload && !isPspkg && (
             <PnGroup title={t("Download using")}>
               <PnTile
                 size="wide"
@@ -1283,7 +1341,7 @@ export function Details({
                   <GameInsights insights={game.insights} />
             <AddonInfo item={release} library={library} />
                   {release.notes && <p className="cn-note">{release.notes}</p>}
-                  {showDownload && (
+                  {showDownload && !isPspkg && (
                     <>
                       <p className="cn-section-label">{t("Download using")}</p>
                       <div className="cn-cards cn-choices">

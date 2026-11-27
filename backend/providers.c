@@ -1,13 +1,15 @@
 #include "orbit.h"
 #include "provider_network.h"
 #include "links.h"
+#include "remote_sources.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 bool provider_browser_source(const char *source) {
     return source && (!strcmp(source, "vikingfile") || !strcmp(source, "akirabox") ||
-                      !strcmp(source, "datanodes") || !strcmp(source, "1fichier"));
+                      !strcmp(source, "datanodes") || !strcmp(source, "1fichier") ||
+                      !strcmp(source, "pspkg"));
 }
 static bool browser_format(const Release *r) {
     if (r->archive_unverified && (strcmp(r->format, "Unknown") || r->extracted_size || !r->compression[0])) return false;
@@ -31,11 +33,18 @@ static bool browser_format(const Release *r) {
     return suffix && n > strlen(suffix) && !strcasecmp(r->filename + n - strlen(suffix), suffix);
 }
 static bool browser_file(const Release *r) {
-    if (!provider_browser_source(r->source) || strlen(r->title_id) != 9 ||
-        (strncmp(r->title_id, "PPSA", 4) && strncmp(r->title_id, "CUSA", 4)) || !r->filename[0] ||
+    bool pspkg = r->remote_page &&
+        ((!strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) && !strncmp(r->title_id, "P5", 2)) ||
+         (!strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE) && !strncmp(r->title_id, "P4", 2))) &&
+        strlen(r->title_id) == 14 &&
+        strspn(r->title_id + 2, "0123456789abcdef") == 12;
+    if (!provider_browser_source(r->source) ||
+        (!pspkg && (strlen(r->title_id) != 9 ||
+                    (strncmp(r->title_id, "PPSA", 4) && strncmp(r->title_id, "CUSA", 4)))) ||
+        !r->filename[0] ||
         strchr(r->filename, '/') || strchr(r->filename, '\\') || strstr(r->filename, ".."))
         return false;
-    for (size_t i = 4; i < 9; i++)
+    if (!pspkg) for (size_t i = 4; i < 9; i++)
         if (!isdigit((unsigned char)r->title_id[i])) return false;
     for (const unsigned char *p = (const void *)r->filename; *p; p++)
         if (*p < 32 || *p == 127) return false;
@@ -43,10 +52,12 @@ static bool browser_file(const Release *r) {
     if (!r->remote_page && !browser_format(r)) return false;
     /* A source may use a descriptive filename without its title ID. If an ID
      * is present it must agree with the catalogue; matching remains exact. */
-    const char *prefixes[] = {"PPSA", "CUSA"};
-    for (size_t i = 0; i < 2; i++)
-        for (const char *p = strstr(r->filename, prefixes[i]); p; p = strstr(p + 4, prefixes[i]))
-            if (strncmp(p, r->title_id, 9) || isdigit((unsigned char)p[9])) return false;
+    if (!pspkg) {
+        const char *prefixes[] = {"PPSA", "CUSA"};
+        for (size_t i = 0; i < 2; i++)
+            for (const char *p = strstr(r->filename, prefixes[i]); p; p = strstr(p + 4, prefixes[i]))
+                if (strncmp(p, r->title_id, 9) || isdigit((unsigned char)p[9])) return false;
+    }
     return true;
 }
 static bool browser_page(const Release *r, const char *url) {
@@ -466,8 +477,37 @@ static bool page_bound_filename(Release *r) {
     return percent_decode(encoded, n, r->filename, sizeof r->filename);
 }
 
+/* Some PSPKG hosts expose the file only after their browser steps, without a
+ * supported provider page. Accept a plausible file URL for later range and
+ * magic verification; this test alone never authorizes a download. */
+static bool pspkg_file_candidate(const char *url) {
+    if (!remote_https_url(url) || strchr(url, '#')) return false;
+    const char *scheme = strstr(url, "://");
+    const char *host = scheme ? scheme + 3 : url, *path = strchr(host, '/');
+    if (!path || ((size_t)(path - host) == strlen("pspkg.com") &&
+        !strncasecmp(host, "pspkg.com", strlen("pspkg.com")))) return false;
+    size_t length = strcspn(path, "?");
+    const char *suffixes[] = {".pkg", ".zip", ".7z", ".rar", ".ffpfsc", ".exfat"};
+    for (size_t i = 0; i < sizeof suffixes / sizeof *suffixes; i++) {
+        size_t n = strlen(suffixes[i]);
+        if (length > n && !strncasecmp(path + length - n, suffixes[i], n)) return true;
+    }
+    return false;
+}
+
 bool provider_capture_url(const Release *release, const char *candidate) {
     if (!provider_browser_source(release->source) || !candidate || strlen(candidate) >= sizeof release->url) return false;
+    if (!strcmp(release->source, "pspkg")) {
+        const char *provider = remote_browser_provider(candidate);
+        if (!*provider) return pspkg_file_candidate(candidate);
+        Release page = *release;
+        copy_text(page.source, sizeof page.source, provider);
+        copy_text(page.browser_url, sizeof page.browser_url, candidate);
+        copy_text(page.url, sizeof page.url, candidate);
+        page.remote_page = true;
+        page.filename[0] = 0;
+        return provider_browser_supported(&page);
+    }
     Release resolved = *release;
     strcpy(resolved.url, candidate);
     if (!resolved.filename[0] && !page_bound_filename(&resolved)) return false;

@@ -1,4 +1,5 @@
 #include "remote_sources.h"
+#include "pspkg.h"
 #include "catalog_view.h"
 #include "ca.h"
 #include "provider_network.h"
@@ -818,7 +819,19 @@ static const char *pspkg_scan(const RemoteSource *snapshot, char **body, size_t 
         bool named = begin && end && end - begin < 512 &&
                      pspkg_text(begin + 1, (size_t)(end - begin - 1), title, sizeof title);
         if (links) pspkg_links(page.data, links);
-        if (named && links && cJSON_GetArraySize(links)) {
+        char download_page[URL_LIMIT + 1];
+        bool gated = pspkg_download_page(games[i], download_page, sizeof download_page);
+        if (named && links && gated) {
+            cJSON *choice = cJSON_CreateObject();
+            if (!choice || !cJSON_AddStringToObject(choice, "name", "PSPKG") ||
+                !cJSON_AddStringToObject(choice, "url", download_page) ||
+                !cJSON_AddTrueToObject(choice, "page") || !cJSON_AddItemToArray(links, choice)) {
+                cJSON_Delete(choice);
+                cJSON_Delete(links);
+                free(page.data);
+                error = "limit";
+                goto done;
+            }
             unsigned char digest[SHA256_DIGEST_LENGTH];
             SHA256((const unsigned char *)games[i], strlen(games[i]), digest);
             char id[32], description[URL_LIMIT + 100];
