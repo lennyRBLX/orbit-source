@@ -52,7 +52,8 @@ void library_icon(hui::gfx::DrawList &list, float cx, float cy, bool scan, ui::C
 }
 
 void header_action(hui::gfx::DrawList &list, const ui::Type &type, const ui::Rect &r,
-                   std::string_view text, float focus, bool scan, bool enabled, bool folder = false, bool selected = false)
+                   std::string_view text, float focus, bool scan, bool enabled, bool folder = false, bool selected = false,
+                   icons::Icon icon = icons::Icon::books)
 {
     const ui::Color ink = (selected ? ui::Color::rgb(0x080808) : ui::color::text).with_alpha(enabled ? 1.0f : 0.4f);
     ui::focus_ring(list, r, r.h * 0.5f, focus);
@@ -64,7 +65,7 @@ void header_action(hui::gfx::DrawList &list, const ui::Type &type, const ui::Rec
     else if (scan)
         library_icon(list, r.cx() - width * 0.5f + 12.0f, r.cy(), scan, ink);
     else
-        icons::draw(list, icons::Icon::books, r.cx() - width * 0.5f + 12.0f, r.cy(), 24.0f, ink, 1.8f);
+        icons::draw(list, icon, r.cx() - width * 0.5f + 12.0f, r.cy(), 24.0f, ink, 1.8f);
     ui::text(list, type.medium, text, r.cx() - width * 0.5f + 40.0f, r.cy() + 7.0f, 20.0f, ink);
 }
 
@@ -173,7 +174,7 @@ std::string file_name(const std::string &path)
 
 } // namespace
 
-LibraryScreen::LibraryScreen(Context &context) : Screen(context)
+LibraryScreen::LibraryScreen(Context &context) : Screen(context), space_(context)
 {
     xb::keyboard_look(keyboard_.style, false);
     keyboard_.style.bindings = hui::ui::KeyboardBindings::standard();
@@ -351,6 +352,13 @@ std::vector<LibraryScreen::Control> LibraryScreen::page_controls() const
     int row = 0;
     // Header actions, then one compact row of status tabs, search and location.
     float right = 1920.0f - ui::kGutter;
+    if (section_ == 0 && fullest_drive() != nullptr)
+    {
+        const float w =
+            ui::button_width(type, tr("Free up space"), 20.0f, ui::ButtonKind::secondary) + 40.0f;
+        out.push_back({Kind::space, 0, row, {right - w, 112.0f, w, 66.0f}});
+        right -= w + 16.0f;
+    }
     if (library.can("rescan") && section_ == 0)
     {
         const float w =
@@ -525,12 +533,49 @@ void LibraryScreen::update_keyboard(const InputFrame &input, Feedback &feedback)
     }
 }
 
+const Drive *LibraryScreen::fullest_drive() const
+{
+    const Snapshot &state = ctx_.store.state();
+    if (!state.paired || state.system.space_protocol < 1)
+        return nullptr;
+    const Drive *fullest = nullptr;
+    for (const Drive &d : state.drives)
+        if (fullest == nullptr || d.projected_free_bytes < fullest->projected_free_bytes)
+            fullest = &d;
+    return fullest;
+}
+
+void LibraryScreen::show_free_space()
+{
+    Feedback feedback;
+    open_free_space(feedback);
+}
+
+void LibraryScreen::open_free_space(Feedback &feedback)
+{
+    const Drive *fullest = fullest_drive();
+    if (fullest == nullptr)
+        return;
+    FreeSpaceForm::Request request;
+    request.storage_id = fullest->id;
+    space_.open(std::move(request));
+    feedback.play(hui::audio::Cue::modal_open);
+}
+
 Intent LibraryScreen::update(const InputFrame &input, float dt, Feedback &feedback, bool focused)
 {
+    // The page is drawn behind Free up space too, so its rows must follow the games while that
+    // is open: a deleted game leaves the list, and an old row would point past its end.
+    if (serial_ != ctx_.store.state().serial)
+        refilter();
+    if (space_.active())
+    {
+        if (focused)
+            space_.update(input, dt, feedback);
+        return {};
+    }
     Intent intent;
     const Snapshot &state = ctx_.store.state();
-    if (serial_ != state.serial)
-        refilter();
     const LibrarySnapshot &library = state.library;
     if (ctx_.store.library_action().serial != action_serial_ && !ctx_.store.library_action().busy)
     {
@@ -821,6 +866,9 @@ Intent LibraryScreen::update(const InputFrame &input, float dt, Feedback &feedba
                 error_.clear();
                 feedback.play(hui::audio::Cue::modal_open);
                 break;
+            case Kind::space:
+                open_free_space(feedback);
+                break;
             case Kind::section:
                 if (focus_index_ == 1)
                 {
@@ -933,6 +981,12 @@ Intent LibraryScreen::update(const InputFrame &input, float dt, Feedback &feedba
 
 void LibraryScreen::draw(Frame &frame, bool focused) const
 {
+    draw_look(frame, focused);
+    space_.draw(frame);
+}
+
+void LibraryScreen::draw_look(Frame &frame, bool focused) const
+{
     (void)focused;
     if (look::is(look::Interface::crossbar))
     {
@@ -988,6 +1042,9 @@ void LibraryScreen::draw(Frame &frame, bool focused) const
     if (rect(Kind::scan, 0).w > 0.0f)
         header_action(list, type, rect(Kind::scan, 0), tr("Scan for games"), amount(Kind::scan, 0),
                       true, !library.working());
+    if (rect(Kind::space, 0).w > 0.0f)
+        header_action(list, type, rect(Kind::space, 0), tr("Free up space"), amount(Kind::space, 0), false, true,
+                      false, false, icons::Icon::drive);
     for (int section = 0; section < 2; ++section)
         header_action(list, type, rect(Kind::section, section), tr(kSections[section]),
                       amount(Kind::section, section), false, true, section == 1, section == section_);
@@ -1057,9 +1114,10 @@ void LibraryScreen::draw(Frame &frame, bool focused) const
             if (g.title_id == job.title_id)
                 title = g.title;
         }
-        const std::string what = std::string(job.operation == "copy"   ? tr("Copy")
-                                             : job.operation == "move" ? tr("Move")
-                                                                       : job.operation.c_str()) +
+        const std::string what = std::string(job.operation == "copy"     ? tr("Copy")
+                                             : job.operation == "move"   ? tr("Move")
+                                             : job.operation == "delete" ? tr("Delete")
+                                                                         : tr("Storage operation")) +
                                  " \xC2\xB7 " + title;
         ui::text_fit(list, type.medium, what, box.x + 18.0f, box.y + 23.0f, 16.0f, 360.0f,
                      ui::color::text);
@@ -1469,6 +1527,8 @@ void LibraryScreen::draw(Frame &frame, bool focused) const
 
 std::vector<hui::ui::Hint> LibraryScreen::hints() const
 {
+    if (space_.active())
+        return space_.hints();
     if (look::is(look::Interface::crossbar))
         return crossbar_hints();
     if (look::is(look::Interface::panorama))

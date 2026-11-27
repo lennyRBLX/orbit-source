@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <utility>
 #include <algorithm>
+#include <chrono>
 
 namespace orbit
 {
@@ -459,6 +460,7 @@ void Store::send_setting(Setting setting, std::string a, std::string b, bool fla
     setting_.busy = true;
     setting_.setting = setting;
     setting_.error.clear();
+    setting_.note.clear();
     {
         Lock lock(mutex_);
         Command command;
@@ -559,6 +561,12 @@ void Store::want_files(bool wanted)
         refresh_now();
 }
 
+void Store::want_space(bool wanted)
+{
+    if (!want_space_.exchange(wanted) && wanted)
+        refresh_now();
+}
+
 void Store::run_file_action(api::Client::FileRequest request)
 {
     files_.busy = true;
@@ -612,7 +620,7 @@ void Store::worker()
         const bool hurry = start_waiting_ || restart_ == Restart::stopping ||
                            restart_ == Restart::starting ||
                            system_failures_ > 0 ||
-                           (want_settings_.load() && settings_busy_);
+                           (want_settings_.load() && settings_busy_) || want_space_.load();
         next_poll = now_seconds() + (provider_poll_.load() ? 0.25 : hurry ? 0.5 : fast_.load() ? 1.0 : 3.0);
     }
 }
@@ -1056,15 +1064,22 @@ void Store::poll_once()
     const bool want_files = want_files_.load();
     if (want_files)
         operation = client_.files_status();
+    api::Result<SpaceDeletion> deletion;
+    const bool want_space = want_space_.load();
+    if (want_space)
+        deletion = client_.space_status();
     inbox_.post(
         [this, favourites = std::move(favourites), saved_filters = std::move(saved_filters), library = std::move(library),
-         storage = std::move(storage), want_storage, operation = std::move(operation), want_files]() mutable
+         storage = std::move(storage), want_storage, operation = std::move(operation), want_files,
+         deletion = std::move(deletion), want_space]() mutable
         {
             if (want_files && operation.ok())
             {
                 state_.have_file_operation = !operation.value.id.empty();
                 state_.file_operation = std::move(operation.value);
             }
+            if (want_space && deletion.ok())
+                state_.space.deletion = std::move(deletion.value);
             if (favourites.ok())
             {
                 state_.favourites = std::move(favourites.value);
@@ -1189,7 +1204,7 @@ void Store::poll_settings()
 // Settings commands: each reports to setting_ and refreshes what it changed.
 void Store::run_setting(Command &command)
 {
-    std::string error;
+    std::string error, note;
     switch (command.setting)
     {
     case Setting::zero:
@@ -1253,6 +1268,97 @@ void Store::run_setting(Command &command)
                 [this, account = std::move(result.value)]() mutable
                 {
                     state_.archive_account = std::move(account);
+                    ++state_.serial;
+                });
+        break;
+    }
+    case Setting::links_add:
+    case Setting::links_replace:
+    {
+        std::vector<std::string> urls;
+        for (std::size_t at = 0; at <= command.a.size();)
+        {
+            const std::size_t end = std::min(command.a.find('\n', at), command.a.size());
+            if (end > at)
+                urls.push_back(command.a.substr(at, end - at));
+            at = end + 1;
+        }
+        api::Result<api::LinksStatus> started = command.setting == Setting::links_add
+                                                    ? client_.add_links(urls, command.b)
+                                                    : client_.replace_link(command.b, urls.empty() ? std::string() : urls.front());
+        for (std::string &url : urls)
+            std::fill(url.begin(), url.end(), '\0');
+        std::fill(command.a.begin(), command.a.end(), '\0');
+        error = started.status == 404 ? tr("Update the download service to change this here.") : started.error;
+        if (!started.ok())
+            break;
+        // One small request per link, usually a second or two each.
+        api::LinksStatus status = started.value;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        while (status.state == "checking" && std::chrono::steady_clock::now() < deadline)
+        {
+            {
+                Lock lock(mutex_);
+                if (stopping_)
+                    break;
+                signal_.wait(mutex_, 0.5);
+            }
+            api::Result<api::LinksStatus> next = client_.links_status();
+            if (next.ok() && next.value.id == status.id)
+                status = std::move(next.value);
+        }
+        int added = 0;
+        std::string refused;
+        for (const api::LinkCheck &item : status.items)
+        {
+            if (item.state == "queued")
+                ++added;
+            else if (item.state == "failed" && refused.empty())
+                refused = tr(std::string_view(item.message));
+        }
+        if (status.state == "checking")
+            note = tr("Still checking. Your links appear in Downloads once they're added.");
+        else if (added == 0)
+            error = refused.empty() ? tr("The link wasn't added.") : refused;
+        else if (command.setting == Setting::links_replace)
+            note = tr("Link replaced. The download continues.");
+        else if (refused.empty())
+            note = trn(added, "{count} link added to Downloads.", "{count} links added to Downloads.");
+        else
+            note = trn(added, "{count} link added to Downloads.", "{count} links added to Downloads.") + " " + refused;
+        break;
+    }
+    case Setting::space_list:
+    {
+        api::Result<SpaceListing> result = client_.space_list(command.a);
+        error = result.error;
+        if (result.ok())
+            inbox_.post(
+                [this, listing = std::move(result.value)]() mutable
+                {
+                    state_.space = std::move(listing);
+                    state_.have_space = true;
+                    ++state_.serial;
+                });
+        break;
+    }
+    case Setting::space_delete:
+    {
+        std::vector<std::string> ids;
+        for (std::size_t at = 0; at <= command.b.size();)
+        {
+            const std::size_t end = std::min(command.b.find('\n', at), command.b.size());
+            if (end > at)
+                ids.push_back(command.b.substr(at, end - at));
+            at = end + 1;
+        }
+        api::Result<SpaceDeletion> result = client_.space_delete(command.a, ids);
+        error = result.error;
+        if (result.ok())
+            inbox_.post(
+                [this, deletion = std::move(result.value)]() mutable
+                {
+                    state_.space.deletion = std::move(deletion);
                     ++state_.serial;
                 });
         break;
@@ -1611,10 +1717,11 @@ void Store::run_setting(Command &command)
         poll_requested_ = true;
     }
     inbox_.post(
-        [this, error]
+        [this, error, note]
         {
             setting_.busy = false;
             setting_.error = error;
+            setting_.note = note;
             ++setting_.serial;
         });
 }

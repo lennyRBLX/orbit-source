@@ -501,9 +501,17 @@ TEST(App, GameDetailsQueuesTheSelectedEditionAndDrive)
     h.press(Action::confirm); // Return to Source setting
     h.frame(Direction::right);h.frame(Direction::right); // Save to
     h.press(Action::confirm);
-    h.frame(Direction::down); // Internal storage
+    h.frame(Direction::down); // Internal storage: too little room
     h.press(Action::confirm);
-    h.frame(Direction::down); // Disabled Download is skipped.
+    h.frame(Direction::down); // Download
+    h.press(Action::confirm); // opens Free up space for Internal storage, downloads nothing
+    EXPECT_FALSE(h.store.action().busy);
+    while (h.store.run_next_action())
+        h.settle(1);
+    h.settle(2);
+    EXPECT_EQ(h.transport.count("/api/v1/space"), 1);
+    h.press(Action::back); // Cancel
+    h.frame(Direction::up); // Save to
     h.press(Action::confirm); // Drive choices remain available.
     EXPECT_FALSE(h.store.action().busy);
     h.frame(Direction::up); // USB has enough room.
@@ -869,6 +877,46 @@ TEST(App, LibraryMountsAGameFromItsDetails)
     h.press(Action::back);
     h.settle();
     EXPECT_FALSE(h.app.library().details_open());
+}
+
+// Free up space over Library: the deleted game leaves the list while the dialog is still open,
+// and the page drawn behind it must follow. A 1.9.7 test build kept the old rows there and
+// crashed on the console, reading one game past the end of the shorter list.
+TEST(App, LibraryBehindFreeUpSpaceFollowsTheDeletedGame)
+{
+    AppHarness h;
+    h.app.show_tab(orbit::tab::library);
+    h.settle();
+    ASSERT_TRUE(h.store.state().library.ready());
+    const std::size_t before = h.store.state().library.games.size();
+    ASSERT_EQ(h.app.library().shown_games(), before);
+    h.app.library().show_free_space(); // Internal storage, the fullest drive
+    while (h.store.run_next_action())
+        h.settle(1);
+    h.settle(2);
+    ASSERT_TRUE(h.app.library().modal());
+    // Tick Homebrew UI Lab, the drive's one game (the row above the buttons), then Delete
+    // and confirm.
+    for (int i = 0; i < 4; ++i)
+        h.frame(Direction::down);
+    h.frame(Direction::up);
+    h.press(Action::confirm);
+    h.frame(Direction::down);
+    h.press(Action::confirm); // the confirmation
+    h.press(Action::confirm); // Delete
+    for (int i = 0; i < 12 && h.store.state().library.games.size() == before; ++i)
+    {
+        while (h.store.run_next_action())
+            h.settle(1);
+        h.store.poll_once();
+        h.settle(2);
+    }
+    ASSERT_EQ(h.store.state().library.games.size(), before - 1);
+    EXPECT_TRUE(h.app.library().modal()) << "Deleted {size}. stays on the dialog";
+    h.settle(10);
+    EXPECT_EQ(h.app.library().shown_games(), before - 1);
+    for (const LibraryGame &game : h.store.state().library.games)
+        EXPECT_NE(game.title_id, "PPSA99050");
 }
 
 // Files: a folder opens directly, its row menu offers actions, Circle goes back up,

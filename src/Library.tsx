@@ -20,6 +20,7 @@ import { useInterfacePrefs } from "./interfaces/choice";
 import { CrossbarLibrary } from "./interfaces/CrossbarLibrary";
 import { PanoramaLibrary } from "./interfaces/PanoramaLibrary";
 import { Files } from "./Files";
+import { openFreeSpace } from "./FreeSpace";
 import { useFiles } from "./useFiles";
 import { libraryViews as views, matchesLibraryView as matches, libraryViewOptions, type LibraryView as View } from "./libraryStatus";
 
@@ -236,6 +237,9 @@ function Inventory({
       )}
     </>
   );
+  // Free up space (only shown paired) starts on the fullest drive; its screen can switch drives.
+  const fullest = [...drives].sort((a, b) => a.projectedFreeBytes - b.projectedFreeBytes)[0];
+  const freeUp = fullest ? () => openFreeSpace({ storageId: fullest.id }) : undefined;
   if (iface === "crossbar")
     return (
       <CrossbarLibrary
@@ -260,6 +264,8 @@ function Inventory({
         consoleBrowser={consoleBrowser}
         sections={sections}
         filters={filters}
+        freeUp={freeUp}
+        fullest={fullest}
       />
     );
   if (iface === "panorama")
@@ -295,6 +301,7 @@ function Inventory({
         consoleBrowser={consoleBrowser}
         sections={sections}
         statusOptions={statusOptions}
+        freeUp={freeUp}
       />
     );
   return (
@@ -323,6 +330,12 @@ function Inventory({
             >
               <Icon name="scan" />
               {t("Scan for games")}
+            </button>
+          )}
+          {section !== "files" && freeUp && (
+            <button onClick={freeUp}>
+              <Icon name="storage" />
+              {t("Free up space")}
             </button>
           )}
         </div>

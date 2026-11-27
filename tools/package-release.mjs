@@ -24,15 +24,27 @@ if (!versionNotes || /Draft release notes|not published yet/i.test(versionNotes)
 const commit = git('rev-parse', 'HEAD');
 const artifact = path('build/orbit_store.elf');
 const tvArtifact = path('app/dist/PPSA99177.ffpkg');
-const payload = readFileSync(artifact), image = readFileSync(tvArtifact);
+// The same app folder, zipped by the same build, for Kraken Mount (it runs folders, not FFPKG).
+const tvFolder = path('app/dist/PPSA99177.zip');
+const payload = readFileSync(artifact), image = readFileSync(tvArtifact), folder = readFileSync(tvFolder);
 const verification = json('app/build/package-verification.json');
 const tvFeed = validateArtifacts({status, packageVersion:json('package.json').version,
   header:readFileSync(path('backend/orbit.h'),'utf8'), param:json('app/sce_sys/param.json'),
   commit, payload, image, verification});
-for (const file of [artifact, tvArtifact]) {
+for (const file of [artifact, tvArtifact, tvFolder]) {
   if (statSync(file).mtimeMs < Number(git('log', '-1', '--format=%ct')) * 1000)
     throw new Error(`${file} is older than the last commit. Rebuild the release first.`);
 }
+// The payload embeds the browser interface from build/generated/assets.h, which only
+// `npm run build` writes; building the payload alone reuses an older one.
+const newest = dir => readdirSync(path(dir), {recursive: true, withFileTypes: true})
+  .filter(entry => entry.isFile())
+  .reduce((latest, entry) => Math.max(latest, statSync(`${entry.parentPath}/${entry.name}`).mtimeMs), 0);
+const embedded = statSync(path('build/generated/assets.h')).mtimeMs;
+if (Math.max(newest('src'), newest('i18n'), newest('public'), statSync(path('index.html')).mtimeMs) > embedded)
+  throw new Error('The browser interface changed after its last build. Run npm run build, then rebuild the payload.');
+if (statSync(artifact).mtimeMs < embedded)
+  throw new Error(`${artifact} is older than the browser interface it should carry. Rebuild the payload.`);
 const upstream = json('tools/release-sources.json');
 mkdirSync(path('build/upstream'), {recursive:true});
 for (const dep of upstream) {
@@ -78,8 +90,10 @@ const sourceBundle = `orbit-store-${status.version}-source-bundle.zip`;
 execFileSync('zip', ['-q', `${out}${sourceBundle}`, ...sourceFiles, 'SOURCE-SHA256SUMS'], {cwd:out});
 copyFileSync(artifact, `${out}orbit_store.elf`);
 copyFileSync(tvArtifact, `${out}PPSA99177.ffpkg`);
+copyFileSync(tvFolder, `${out}PPSA99177.zip`);
 writeFileSync(`${out}orbit_store.elf.sha256`, `${sha256(payload)}  orbit_store.elf\n`);
 writeFileSync(`${out}PPSA99177.ffpkg.sha256`, `${sha256(image)}  PPSA99177.ffpkg\n`);
+writeFileSync(`${out}PPSA99177.zip.sha256`, `${sha256(folder)}  PPSA99177.zip\n`);
 writeFileSync(`${out}tv-app.json`, JSON.stringify(tvFeed,null,2)+'\n');
 const payloadFeed = {name:'Orbit Store',payloads:[{
   name:'Orbit Store (Beta)',filename:'orbit_store.elf',
@@ -91,7 +105,8 @@ writeFileSync(`${out}payloads.json`,JSON.stringify(payloadFeed,null,2)+'\n');
 writeFileSync(`${out}BUILD-INFO.json`,JSON.stringify({sourceCommit:commit,version:status.version,
   tvAppVersion:status.tvAppVersion,packageVerification:verification,
   binaries:[{name:'orbit_store.elf',size:payload.length,sha256:sha256(payload)},
-    {name:'PPSA99177.ffpkg',size:image.length,sha256:sha256(image)}]},null,2)+'\n');
+    {name:'PPSA99177.ffpkg',size:image.length,sha256:sha256(image)},
+    {name:'PPSA99177.zip',size:folder.length,sha256:sha256(folder)}]},null,2)+'\n');
 writeFileSync(`${out}RELEASE-NOTES.md`, `# Orbit Store ${status.version} (Beta)
 
 ${review ? `UNRELEASED REVIEW BUNDLE. Outstanding gates: ${blockers.join(', ') || 'none'}. Do not publish this review folder.\n\n` : ''}${versionNotes}
@@ -99,6 +114,8 @@ ${review ? `UNRELEASED REVIEW BUNDLE. Outstanding gates: ${blockers.join(', ') |
 ## Install the native TV app (Games)
 
 Download \`PPSA99177.ffpkg\` and its \`.sha256\` file, verify the checksum, then copy the FFPKG to \`/data/homebrew/\` on your PS5. Let ShadowMountPlus register it and open **Orbit Store** from the **Games row**. Discover opens first. Choose your sources in the native app's setup screen or **App settings → Download sources**.
+
+Using Kraken Mount instead of ShadowMountPlus? Download \`PPSA99177.zip\` and its \`.sha256\` file, verify the checksum, unzip it and copy the \`PPSA99177\` folder to \`/data/homebrew/\` on your PS5. Kraken Mount adds **Orbit Store** to the home screen.
 
 If an older Orbit service is already running, stop it deliberately before opening the app so its new bundled service can start. The app preserves a newer saved service. The native app version is **${status.tvAppVersion}**, bundled with Orbit service **${status.version}**.
 
@@ -114,6 +131,7 @@ In the browser, **App settings → TV app** installs the native app from the off
 
 - \`orbit_store.elf\` and \`orbit_store.elf.sha256\`: download service and browser interface.
 - \`PPSA99177.ffpkg\` and \`PPSA99177.ffpkg.sha256\`: native TV app, including the same ELF.
+- \`PPSA99177.zip\` and \`PPSA99177.zip.sha256\`: the same native TV app as a folder, for Kraken Mount.
 - \`${sourceBundle}\`: complete application source, corresponding dependency sources, licence notices and rebuild instructions for both programs.
 
 Run \`shasum -a 256 -c <filename>.sha256\` beside each binary to verify it. Source-bundle contents have their own \`SOURCE-SHA256SUMS\`.
@@ -123,4 +141,4 @@ Orbit Store is in **beta**. The game catalogue offers single-file FFPFSC, exFAT,
 Orbit Store is free software under GPL-3.0-or-later. The application source is built from commit \`${commit}\`; component sources and licences are listed in \`THIRD-PARTY-NOTICES.md\` and \`SOURCES.json\`.
 `);
 writeFileSync(`${out}SHA256SUMS`,checksums(filesIn(out)));
-console.log(`Staged ${out} from ${commit}. Nothing was uploaded. Publish the two binaries, their checksums, the source bundle and SHA256SUMS together; update both feeds only after verifying the release assets.`);
+console.log(`Staged ${out} from ${commit}. Nothing was uploaded. Publish the binaries, the app folder ZIP, their checksums, the source bundle and SHA256SUMS together; update both feeds only after verifying the release assets.`);

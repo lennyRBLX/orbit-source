@@ -4,6 +4,8 @@
 #include "receive.h"
 #include "zero_probe.h"
 #include "zero_link.h"
+#include "links.h"
+#include "space.h"
 #include "debrid.h"
 #include "archive_account.h"
 #include "viking_pass.h"
@@ -338,6 +340,8 @@ int main(int argc, char **argv) {
     zero_probe_start();
     startup_result = zero_link_start();
     diagnostics_stage("zero-link", startup_result ? "error" : "ok", startup_result);
+    if (links_start())
+        puts("Link downloads could not start; the server remains available.");
     /* Before the API answers, so a Get everything sent at once isn't refused. */
     if (bundle_start())
         puts("Orbit Get everything could not start; the server remains available.");
@@ -462,6 +466,8 @@ int main(int argc, char **argv) {
     receive_stop();
     zero_probe_stop();
     zero_link_stop();
+    links_stop();
+    space_stop(); /* finishes the item it is deleting; the rest are kept */
     pthread_mutex_lock(&orbit.mutex);
     orbit.stop = true;
     pthread_cond_broadcast(&orbit.changed);

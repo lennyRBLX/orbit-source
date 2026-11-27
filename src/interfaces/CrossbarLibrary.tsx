@@ -5,7 +5,7 @@
 import { useState, type ReactNode } from "react";
 import { bytes, type LibraryGame, type Storage } from "../types";
 import type { LibraryModel } from "../useLibrary";
-import { placeName, t } from "../i18n";
+import { placeName, t, tn } from "../i18n";
 import { Artwork } from "../Artwork";
 import { GameActions } from "../LibraryActions";
 import { CrossbarList, type XbRow } from "./CrossbarList";
@@ -35,6 +35,8 @@ export function CrossbarLibrary({
   consoleBrowser,
   sections,
   filters,
+  freeUp,
+  fullest,
 }: {
   model: LibraryModel;
   games: LibraryGame[];
@@ -54,6 +56,9 @@ export function CrossbarLibrary({
   consoleBrowser: boolean;
   sections: ReactNode;
   filters: ReactNode;
+  // Free up space on the fullest drive (FreeSpace.tsx), when paired.
+  freeUp?: () => void;
+  fullest?: Storage;
 }) {
   const [current, setCurrent] = useState<string | undefined>();
   const folderRow = (key: string, label: string, sub: string, glyph: GlyphName, open: () => void): XbRow => ({
@@ -119,7 +124,6 @@ export function CrossbarLibrary({
       </section>
     );
   }
-  const focusedGame = rows.find((g) => `game-${g.titleId}` === current) || rows[0];
   const gameRows: XbRow[] = rows.map((g) => ({
     key: `game-${g.titleId}`,
     disabled: !g.onDrive,
@@ -155,7 +159,21 @@ export function CrossbarLibrary({
                 ),
               ]
             : []),
+    ...(freeUp && fullest
+      ? [
+          folderRow(
+            "space",
+            t("Free up space"),
+            `${placeName(fullest.label)} · ${t("{size} free", { size: bytes(fullest.freeBytes) })}`,
+            "drive",
+            freeUp,
+          ),
+        ]
+      : []),
   ];
+  // Scan for games and Free up space aren't games: beside them, the drives' free space.
+  const onGame = !current || !allRows.some((row) => row.key === current) || current.startsWith("game-");
+  const focusedGame = onGame ? rows.find((g) => `game-${g.titleId}` === current) || rows[0] : undefined;
   return (
     <section className="xb-page xb-library">
       <div className="library-controls">{sections}{filters}</div>
@@ -221,6 +239,20 @@ export function CrossbarLibrary({
                 )}
               </p>
             )}
+            {error && <p className="xb-card-error">{error}</p>}
+          </aside>
+        )}
+        {!onGame && (
+          <aside className="xb-aside xb-card" aria-live="polite">
+            <p className="xb-card-kicker">{tn(rows.length, "{count} game", "{count} games")}</p>
+            <dl className="xb-facts">
+              {drives.map((drive) => (
+                <div key={drive.id}>
+                  <dt>{placeName(drive.label)}</dt>
+                  <dd>{t("{size} free", { size: bytes(drive.freeBytes) })}</dd>
+                </div>
+              ))}
+            </dl>
             {error && <p className="xb-card-error">{error}</p>}
           </aside>
         )}

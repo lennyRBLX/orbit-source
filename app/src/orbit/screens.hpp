@@ -431,6 +431,8 @@ class BrowseScreen final : public Screen
     // The choices a filter offers and which is current. Source and Format can
     // have several: checked has a flag per choice, and selected is the first.
     std::vector<std::string> filter_options(int filter, int *selected, std::vector<bool> *checked = nullptr) const;
+    // The Sort menu's choices in order; Add-ons keep "Recently added" on Sort::release.
+    std::vector<Sort> sort_choices() const;
     // Picking one of a multiple-choice filter's options ticks or unticks it.
     void choose(int filter, int option);
     std::string filter_value(int filter) const;
@@ -541,6 +543,93 @@ class BrowseScreen final : public Screen
     void keep_filters_in_range();
 };
 
+// Free up space (free_space_form.cpp), the browser's src/FreeSpace.tsx for a
+// controller. Opened when a download doesn't fit on its drive, when a download
+// paused without room to unpack, and from Library. It lists what Orbit can delete on
+// one drive, biggest first: its own leftovers (ticked) and the games ShadowMount can
+// delete (never ticked). The console deletes the chosen items one at a time; then
+// the caller starts the download or resumes the unpack.
+class FreeSpaceForm
+{
+  public:
+    explicit FreeSpaceForm(Context &context);
+    enum class Then : std::uint8_t
+    {
+        none,     // from Library: deletes and reports
+        download, // a download that didn't fit
+        resume,   // a download paused without room to unpack
+    };
+    struct Request
+    {
+        std::string storage_id;
+        // What didn't fit: its size, and the projected free space it needs (0: none).
+        double size_bytes = 0.0, need_bytes = 0.0;
+        Then then = Then::none;
+        std::vector<std::string> others; // drives where it fits, offered instead
+    };
+    void open(Request request);
+    bool active() const
+    {
+        return open_;
+    }
+    enum class Result : std::uint8_t
+    {
+        none,
+        closed,
+        freed,     // there's room now: start the download or resume
+        use_drive, // the user chose another drive (drive())
+    };
+    Result update(const InputFrame &input, float dt, Feedback &feedback);
+    void draw(Frame &frame) const;
+    std::vector<hui::ui::Hint> hints() const;
+    const std::string &drive() const
+    {
+        return chosen_drive_;
+    }
+
+  private:
+    enum class Step : std::uint8_t
+    {
+        shortfall,
+        list,
+        confirm,
+        deleting,
+    };
+    struct Row
+    {
+        int kind; // 0 drive, 1 item, 2 the buttons
+        const SpaceItem *item = nullptr;
+    };
+    std::vector<Row> rows() const;
+    float row_top(int index) const; // where a list row starts, from the list's top
+    std::vector<std::string> buttons() const;
+    const SpaceListing *listing() const; // the listing of this drive, once read
+    double projected_free() const;
+    double shortfall() const;
+    double chosen() const;
+    std::vector<const SpaceItem *> chosen_items() const;
+    void load(bool keep);
+    void close(Feedback &feedback, hui::audio::Cue cue);
+    void finish(const SpaceDeletion &done);
+
+    Context &ctx_;
+    bool open_ = false;
+    Request request_;
+    Step step_ = Step::list;
+    std::string storage_, chosen_drive_;
+    std::vector<std::string> selected_; // item IDs
+    int row_ = 0, button_ = 0;
+    // What the form is waiting for: 0 nothing, 1 a listing, 2 a listing after a
+    // deletion, 3 the deletion to start.
+    int waiting_ = 0;
+    bool keep_ = false;   // keep the ticks when the listing arrives
+    bool listed_ = false; // this drive's listing has arrived since the form opened
+    std::uint64_t serial_ = 0;
+    SpaceDeletion done_; // the deletion that ended, while its listing is read
+    std::string error_, notice_;
+    ui::Ease in_, scroll_;
+};
+
 // Library: ShadowMount's inventory as Orbit reports it (src/Library.tsx):
 // games installed on the console and sources on its drives, their details,
 // mount and unmount, copy and move between drives, and drive storage.
@@ -556,7 +645,7 @@ class LibraryScreen final : public Screen
     bool modal() const override
     {
         return keyboard_open_ || picker_.open || !selected_.empty() || scan_open_ || xb_menu_.open ||
-               pn_picker_ >= 0 || pn_bar_open_ || files_modal();
+               pn_picker_ >= 0 || pn_bar_open_ || files_modal() || space_.active();
     }
     bool page(int step) override;
     bool hints_high() const override
@@ -573,12 +662,20 @@ class LibraryScreen final : public Screen
     }
     // Opens Files at a drive's folder ("" lists the drives).
     void show_files(const std::string &storage, const std::string &path);
+    // Opens Free up space for the fullest drive, as its header button does.
+    void show_free_space();
+    // The games the page shows, after its filters.
+    std::size_t shown_games() const
+    {
+        return rows_.size();
+    }
 
   private:
     enum class Kind : std::uint8_t
     {
         refresh,
         scan,
+        space, // Free up space
         section, // index 0 games, 1 files
         view,    // the status views
         search,
@@ -635,6 +732,12 @@ class LibraryScreen final : public Screen
         char kind;
         int index;
     };
+    // Free up space, on the fullest drive (the form can switch drives); null when the
+    // console can't free space.
+    const Drive *fullest_drive() const;
+    void open_free_space(Feedback &feedback);
+    void draw_look(Frame &frame, bool focused) const;
+    FreeSpaceForm space_;
     std::vector<XbEntry> crossbar_entries() const;
     xb::List crossbar_list() const;
     xb::Band crossbar_band() const;
@@ -805,6 +908,55 @@ class LibraryScreen final : public Screen
     std::string file_request_;  // the action sent, until its answer
 };
 
+// Download from links (Downloads, links_form.cpp): a typed link and its drive, or
+// a fresh link for a paused or failed link download.
+class LinksForm
+{
+  public:
+    explicit LinksForm(Context &context);
+    // No job: a new download; a job: a fresh link for it.
+    void open(std::string replace_job = {}, std::string replace_title = {});
+    // Previews and tests: the link as if typed.
+    void fill(std::string link)
+    {
+        link_ = std::move(link);
+    }
+    bool active() const
+    {
+        return open_;
+    }
+    enum class Result : std::uint8_t
+    {
+        none,
+        closed,
+        added,
+    };
+    Result update(const InputFrame &input, float dt, Feedback &feedback);
+    void draw(Frame &frame) const;
+    std::vector<hui::ui::Hint> hints() const;
+    // What the PS5 said it added, once update() returns added.
+    const std::string &note() const
+    {
+        return note_;
+    }
+
+  private:
+    void close();
+    int button_row() const; // the link, the drive (new downloads only), then the buttons
+    Context &ctx_;
+    bool open_ = false;
+    std::string link_, replace_job_, replace_title_, note_;
+    int drive_ = 0;
+    int row_ = 0;
+    int button_ = 0; // Download, Cancel
+    bool typing_ = false;
+    hui::ui::Keyboard keyboard_;
+    bool waiting_ = false;
+    std::uint64_t serial_ = 0;
+    std::string error_;
+    ui::Ease in_;
+};
+
 class DownloadsScreen final : public Screen
 {
   public:
@@ -815,7 +967,8 @@ class DownloadsScreen final : public Screen
     std::vector<hui::ui::Hint> hints() const override;
     bool modal() const override
     {
-        return power_open_ || clear_open_ || install_open_ || dialog_open_ || password_open_ || xb_menu_.open || pn_bar_open_;
+        return power_open_ || clear_open_ || install_open_ || dialog_open_ || password_open_ || xb_menu_.open || pn_bar_open_ ||
+               links_.active() || space_.active();
     }
     // Shows one job: switches to its view and moves the focus to it.
     void show_job(const std::string &job_id);
@@ -865,6 +1018,15 @@ class DownloadsScreen final : public Screen
     bool password_open_ = false;
     std::string password_, password_job_;
     hui::ui::Keyboard password_keyboard_;
+    // Download from links, and the Store look's focus on its pill after the views.
+    LinksForm links_;
+    bool links_pill_ = false;
+    void open_links(Feedback &feedback, const Job *replace = nullptr);
+    // Free up space for a download paused without room to unpack; it resumes once
+    // there's room.
+    FreeSpaceForm space_;
+    std::string space_job_;
+    void open_free_space(const Job &job, Feedback &feedback);
     ui::Ease scroll_;
     ui::Ease dialog_in_;
 
@@ -960,7 +1122,7 @@ class GamePage final : public Screen
     }
     std::vector<hui::ui::Hint> hints() const override;
 
-    bool modal() const override { return sheet_ != Sheet::none || ev_open_; }
+    bool modal() const override { return sheet_ != Sheet::none || ev_open_ || space_.active(); }
     // Previews and tests: Get everything is showing (the checklist, or what Download all added).
     bool everything_open() const { return ev_open_; }
     void show_everything(); // as its button opens it, in the current look
@@ -994,6 +1156,13 @@ class GamePage final : public Screen
     std::string addon_label() const;
     Offer offer(const Release &release) const;
     bool primary_enabled(const Release &release, const Offer &offer) const;
+    // Starts the download (or the provider's page) on a drive; Free up space calls it
+    // once there's room.
+    Intent start_download(const Release &release, const std::string &drive_id);
+    void open_free_space(const Release &release, const Offer &now);
+    void draw_look(Frame &frame, bool focused) const;
+    FreeSpaceForm space_;
+    std::string space_release_, space_drive_; // the option Free up space was opened for, and its drive
     Layout compose(hui::gfx::DrawList *list, Sheet sheet, bool focused) const;
     void show_sheet(Sheet sheet, Slot preferred = Slot::primary, int index = 0);
     void back_sheet();

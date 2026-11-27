@@ -3,6 +3,7 @@ import { GameInsights } from "./GameInsights";
 import { AddonInfo } from "./AddonInfo";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./components";
+import { openFreeSpace } from "./FreeSpace";
 import { GameSheet, PadSymbol, type SheetView } from "./GameSheet";
 import { useDebrid, torboxAvailable, preferredDelivery, alwaysTorbox } from "./Debrid";
 import {
@@ -203,11 +204,13 @@ export function Details({
     pending ||
     (torbox && !canTorbox) ||
     !!browser?.active ||
-    !enough ||
+    !drive ||
     !(
       system?.platform === "ps5" ||
       (system?.platform === "fixture" && release.id === "ppsa04029-ffpfsc")
     );
+  // Download doesn't fit on this drive: it opens Not enough space instead.
+  const short = !!drive && !enough;
   useEffect(() => {
     setError("");
     setDownloadAgain(false);
@@ -220,12 +223,28 @@ export function Details({
       ?.querySelector<HTMLElement>(".hub-primary")
       ?.focus({ preventScroll: true });
   }, [game.id, initialSelection]);
-  async function start() {
+  // Not enough space: free some up on this drive, or use another drive with room.
+  // Either way the download carries on by itself.
+  function freeSpace(run: (driveId?: string) => void) {
+    if (!drive) return;
+    openFreeSpace({
+      storageId: drive.id,
+      need: { sizeBytes: release.sizeBytes, bytes: (planned ? 0 : release.sizeBytes) + 16 * 1024 ** 2 },
+      then: { kind: "download", run: () => run() },
+      others: drives.filter((d) => d.id !== drive.id && downloadSpacePlan(release, d, jobs).enough),
+      useDrive: (id) => { setDestination(id); run(id); },
+    });
+  }
+  function startDirect() {
+    if (short) freeSpace((id) => void start(id));
+    else void start();
+  }
+  async function start(driveId = drive?.id) {
     setPending(true);
     setError("");
     try {
-      if (!drive) return;
-      await download(release.id, drive.id, delivery);
+      if (!driveId) return;
+      await download(release.id, driveId, delivery);
       openQueue();
     } catch (e) {
       setError((e as Error).message);
@@ -233,12 +252,12 @@ export function Details({
       setPending(false);
     }
   }
-  async function verifyProvider() {
-    if (!drive) return;
+  async function verifyProvider(driveId = drive?.id) {
+    if (!driveId) return;
     setPending(true);
     setError("");
     try {
-      await openProvider(release.id, drive.id);
+      await openProvider(release.id, driveId);
       setSheet(null);
       requestAnimationFrame(() => {
         document
@@ -287,7 +306,9 @@ export function Details({
       viewLibrary();
     else {
       rememberChoice(release);
-      void (useBrowser ? verifyProvider() : start());
+      const run = (id?: string) => void (useBrowser ? verifyProvider(id) : start(id));
+      if (short) freeSpace(run);
+      else run();
     }
   }
   const actionLabel = !system?.paired
@@ -555,9 +576,7 @@ export function Details({
       : []),
     ...(showDownload && system?.paired && system.platform !== "desktop" && !drive
       ? [{ key: "no-drive", warn: true, text: t("Connect a writable drive to your PS5.") }]
-      : showDownload && system?.paired && system.platform !== "desktop" && !enough
-        ? [{ key: "space", warn: true, text: t("Not enough space after unfinished downloads. Free space or cancel an item in Downloads.") }]
-        : []),
+      : []),
     ...(error ? [{ key: "error", warn: true, text: error }] : []),
   ];
   // What the main button does, under its label: size and drive, or the handoff.
@@ -628,7 +647,7 @@ export function Details({
               <button onClick={() => setDownloadAgain(true)}>{t("Download another copy")}</button>
             )}
             {showDownload && system?.paired && !torbox && release.browserAvailable && release.directAvailable !== false && (
-              <button onClick={() => void start()} disabled={downloadUnavailable}>
+              <button onClick={startDirect} disabled={downloadUnavailable}>
                 {t("Download directly")}
               </button>
             )}
@@ -912,7 +931,7 @@ export function Details({
               <PnTile size="wide" tone="dark" glyph="copy" title={t("Download another copy")} onClick={() => setDownloadAgain(true)} />
             )}
             {showDownload && system?.paired && !torbox && release.browserAvailable && release.directAvailable !== false && (
-              <PnTile size="wide" tone="dark" glyph="down" title={t("Download directly")} disabled={downloadUnavailable} onClick={() => void start()} />
+              <PnTile size="wide" tone="dark" glyph="down" title={t("Download directly")} disabled={downloadUnavailable} onClick={startDirect} />
             )}
           </PnGroup>
           {everything.available && <PanoramaEverything m={everything} />}
@@ -1160,15 +1179,9 @@ export function Details({
                 <div className="cn-sheet-left">
                   {showDownload && useBrowser && instructions}
                   {showDownload && (torbox || (debrid.status?.connected && !canTorbox)) && <p className="cn-note">{methodNote}</p>}
-                  {showDownload && system?.paired && system.platform !== "desktop" && (!drive ? (
+                  {showDownload && system?.paired && system.platform !== "desktop" && !drive && (
                     <p className="cn-note warn">{t("Connect a writable drive to your PS5.")}</p>
-                  ) : (
-                    !enough && (
-                      <p className="cn-note warn">
-                        {t("Not enough space after unfinished downloads. Free space or cancel an item in Downloads.")}
-                      </p>
-                    )
-                  ))}
+                  )}
                   {error && (
                     <p className="cn-note warn" role="alert">
                       {error}
@@ -1185,7 +1198,7 @@ export function Details({
                       {actionLabel}
                     </button>
                     {showDownload && system?.paired && !torbox && release.browserAvailable && release.directAvailable !== false && (
-                      <button className="cn-button" onClick={() => void start()} disabled={downloadUnavailable}>
+                      <button className="cn-button" onClick={startDirect} disabled={downloadUnavailable}>
                         {t("Download directly")}
                       </button>
                     )}
@@ -1709,28 +1722,18 @@ export function Details({
                       release.directAvailable !== false && (
                         <div className="provider-direct-option">
                           <button
-                            onClick={() => void start()}
+                            onClick={startDirect}
                             disabled={downloadUnavailable}
                           >
                             {t("Download directly")}
                           </button>
                         </div>
                       )}
-                    {showDownload &&
-                      system.platform !== "desktop" &&
-                      (!drive ? (
-                        <p className="notice">
-                          {t("Connect a writable drive to your PS5.")}
-                        </p>
-                      ) : (
-                        !enough && (
-                          <p className="notice">
-                            {t(
-                              "Not enough space after unfinished downloads. Free space or cancel an item in Downloads.",
-                            )}
-                          </p>
-                        )
-                      ))}
+                    {showDownload && system.platform !== "desktop" && !drive && (
+                      <p className="notice">
+                        {t("Connect a writable drive to your PS5.")}
+                      </p>
+                    )}
                   </>
                 )}
               </>

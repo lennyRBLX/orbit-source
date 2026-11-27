@@ -4,6 +4,7 @@
 #include "catalog_view.h"
 #include "ca.h"
 #include "orbit.h"
+#include "links.h"
 #include <ctype.h>
 #include <curl/curl.h>
 #include <errno.h>
@@ -179,6 +180,15 @@ int release_parse(const cJSON *x, Release *r, bool diagnostic) {
         strchr(r->filename, '\\') || strstr(r->filename, ".."))
         return -1;
     r->size = (int64_t)size->valuedouble;
+    /* A download from a link the user pasted: only ever from the saved queue. */
+    if (!strcmp(r->source, "link")) {
+        const cJSON *contents = cJSON_GetObjectItemCaseSensitive(x, "archiveContents");
+        const cJSON *extracted = cJSON_GetObjectItemCaseSensitive(x, "extractedBytes");
+        r->archive_unverified = cJSON_IsString(contents) && !strcmp(contents->valuestring, "unverified");
+        if ((contents && !r->archive_unverified) || (extracted && !cJSON_IsNull(extracted)) ||
+            cJSON_GetObjectItemCaseSensitive(x, "requirements")) return -1;
+        return diagnostic && link_release_valid(r) ? 0 : -1;
+    }
     if (*r->sha256) {
         if (strlen(r->sha256) != 64)
             return -1;

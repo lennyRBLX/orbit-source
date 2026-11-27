@@ -20,6 +20,9 @@ bool source_enabled_locked(const Release *r) {
     /* The pinned connection diagnostic is not a game source. */
     if (!strcmp(r->id, "orbit-network-check"))
         return true;
+    /* A link the user pasted is not a catalogue source. */
+    if (!strcmp(r->source, "link"))
+        return true;
     return orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&
            orbit.sources.acknowledged_at > 0 && (orbit.sources.enabled & source_flag(r->source));
 }

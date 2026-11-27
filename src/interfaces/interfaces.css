@@ -4077,10 +4077,21 @@ html:not(.pointer) .pn-flyout button:focus {
   color: rgba(255, 255, 255, 0.85);
   font-size: 1.05rem;
 }
-.pn-hero-empty .primary {
+.pn-hero-empty .primary,
+.pn-hero-actions button {
   min-height: 2.8rem;
   padding: 0 1.4rem;
   border-radius: 0;
+}
+.pn-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+}
+.pn-hero-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 .pn-empty-cards {
   display: grid;

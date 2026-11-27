@@ -17,6 +17,10 @@ int packages_stream(const cJSON *input, const char *peer, char *error, size_t ca
 int packages_action(const cJSON *input, char *error, size_t cap);
 int packages_download_action(const char *origin, const char *action, char *error, size_t cap);
 bool packages_path_busy(const char *path);
+/* Free up space: installed packages still on a drive ([{receipt, package, title, name,
+ * sizeBytes}]), and deleting one of them when it is unchanged. */
+cJSON *packages_space_leftovers(const char *storage_id);
+int packages_space_delete(const char *receipt, const char *package, int64_t *freed, char *error, size_t cap);
 /* Files: install the package, game image or game folder at root/folder/output
  * (folder "." is the drive's top). */
 int packages_install_path(const Job *pin, const char *folder, const char *output, const char *origin,

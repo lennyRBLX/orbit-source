@@ -1210,3 +1210,45 @@ void packages_stop(void) {
     if (started) pthread_join(worker, NULL);
     pthread_mutex_lock(&lock); started = false; pthread_mutex_unlock(&lock);
 }
+/* Free up space: packages the PS5 has installed whose file is still on this drive,
+ * unchanged since Orbit recorded it. A computer copy streamed by Zero isn't here. */
+cJSON *packages_space_leftovers(const char *storage_id) {
+    cJSON *out = cJSON_CreateArray(), *r, *p;
+    pthread_mutex_lock(&lock);
+    cJSON_ArrayForEach(r, receipts) {
+        if (strcmp(json_text(r, "storageId"), storage_id) || yes(r, "stream") || yes(r, "removingFiles")) continue;
+        cJSON_ArrayForEach(p, cJSON_GetObjectItemCaseSensitive(r, "packages")) {
+            if (strcmp(json_text(p, "state"), "installed")) continue;
+            struct stat st;
+            int fd = open_file(r, json_text(p, "filename"), &st);
+            if (fd < 0) continue;
+            close(fd);
+            if (!stamp_matches(p, &st)) continue;
+            cJSON *item = cJSON_CreateObject();
+            text(item, "receipt", json_text(r, "id"));
+            text(item, "package", json_text(p, "id"));
+            text(item, "title", json_text(r, "title"));
+            const char *name = strrchr(json_text(p, "filename"), '/');
+            text(item, "name", name ? name + 1 : json_text(p, "filename"));
+            number(item, "sizeBytes", (double)st.st_size);
+            cJSON_AddItemToArray(out, item);
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return out;
+}
+int packages_space_delete(const char *receipt, const char *package, int64_t *freed, char *error, size_t cap) {
+    pthread_mutex_lock(&lock);
+    cJSON *r = find(receipt), *p = find_package(r, package);
+    bool ok = p && !yes(r, "stream") && !yes(r, "removingFiles") && !strcmp(json_text(p, "state"), "installed");
+    cJSON *rc = ok ? cJSON_Duplicate(r, true) : NULL, *pc = ok ? cJSON_Duplicate(p, true) : NULL;
+    pthread_mutex_unlock(&lock);
+    if (!ok) { copy_text(error, cap, "This item changed. Check the list again."); return -1; }
+    int64_t size = json_int(pc, "sizeBytes");
+    bool deleted = delete_installed(rc, pc);
+    cJSON_Delete(rc); cJSON_Delete(pc);
+    if (!deleted) { copy_text(error, cap, "The package changed or could not be deleted. It was kept."); return -1; }
+    package_result(receipt, package, "installed", "Installed on PS5. The downloaded package was deleted.", NULL, NULL);
+    *freed += size;
+    return 0;
+}

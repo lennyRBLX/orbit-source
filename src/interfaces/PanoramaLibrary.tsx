@@ -42,6 +42,7 @@ export function PanoramaLibrary({
   consoleBrowser,
   sections,
   statusOptions,
+  freeUp,
 }: {
   model: LibraryModel;
   games: LibraryGame[];
@@ -70,6 +71,8 @@ export function PanoramaLibrary({
   consoleBrowser: boolean;
   sections: ReactNode;
   statusOptions: { value: string; label: string; count: number }[];
+  // Free up space on the fullest drive (FreeSpace.tsx), when paired.
+  freeUp?: () => void;
 }) {
   const search = useRef<HTMLInputElement>(null);
   const tabs = sections;
@@ -266,9 +269,12 @@ export function PanoramaLibrary({
           </PnGroup>
         )}
         {/* The games' own tool: the scan, for games Orbit didn't add (Files is its own tab). */}
-        {model.can("rescan") && (
+        {(model.can("rescan") || freeUp) && (
           <PnGroup title={t("Storage")}>
-            <PnTile tone="dark" glyph="scan" title={t("Scan for games")} disabled={model.working} onClick={openScan} />
+            {model.can("rescan") && (
+              <PnTile tone="dark" glyph="scan" title={t("Scan for games")} disabled={model.working} onClick={openScan} />
+            )}
+            {freeUp && <PnTile tone="dark" glyph="drive" title={t("Free up space")} onClick={freeUp} />}
           </PnGroup>
         )}
       </div>

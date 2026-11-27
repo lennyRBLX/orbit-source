@@ -409,12 +409,27 @@ std::vector<std::string> BrowseScreen::filter_options(int filter, int *selected,
         break;
     }
     default:
-        for (int i = 0; i < static_cast<int>(Sort::count); ++i)
-            options.push_back(addons_ && i == static_cast<int>(Sort::release) ? tr("Recently added") : sort_label(static_cast<Sort>(i)));
-        *selected = static_cast<int>(filters_.sort);
+    {
+        const std::vector<Sort> choices = sort_choices();
+        for (std::size_t i = 0; i < choices.size(); ++i)
+        {
+            options.push_back(addons_ && choices[i] == Sort::release ? tr("Recently added") : sort_label(choices[i]));
+            if (choices[i] == filters_.sort)
+                *selected = static_cast<int>(i);
+        }
         break;
     }
+    }
     return options;
+}
+
+std::vector<Sort> BrowseScreen::sort_choices() const
+{
+    std::vector<Sort> choices;
+    for (int i = 0; i < static_cast<int>(Sort::count); ++i)
+        if (!addons_ || static_cast<Sort>(i) != Sort::added)
+            choices.push_back(static_cast<Sort>(i));
+    return choices;
 }
 
 std::string BrowseScreen::filter_value(int filter) const
@@ -506,8 +521,11 @@ void BrowseScreen::choose(int filter, int option)
         filters_.hide_installed = option == 1;
         break;
     default:
-        filters_.sort = static_cast<Sort>(std::clamp(option, 0, static_cast<int>(Sort::count) - 1));
+    {
+        const std::vector<Sort> choices = sort_choices();
+        filters_.sort = choices[static_cast<std::size_t>(std::clamp(option, 0, static_cast<int>(choices.size()) - 1))];
         break;
+    }
     }
     index_ = 0;
     refilter();

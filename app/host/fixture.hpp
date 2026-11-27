@@ -25,6 +25,7 @@ enum class FixtureMode
     offline, // Orbit is not running
     setup,   // sources not chosen yet
     updates, // as normal, with newer releases of Orbit and the TV app
+    full,    // as normal, with both drives nearly full and a download paused without room to unpack
 };
 
 class Fixture final : public http::Transport
@@ -50,9 +51,21 @@ class Fixture final : public http::Transport
         double total = 0.0;
         double speed = 0.0;
         double retry_at = 0.0;
+        double extract_total = 0.0; // room an archive needs to unpack
         std::string delivery = "direct";
+        std::string link_host; // set: a download from a pasted link, which can take a fresh one
     };
     std::string jobs_json() const;
+    // Free up space (/api/v1/space): what Orbit could delete on a drive, and a
+    // deletion that takes a few reads to finish.
+    std::string space_json(const std::string &storage) const;
+    std::string space_status_json() const;
+    std::vector<std::string> space_deleted_;
+    std::vector<std::string> library_removed_; // title IDs a finished deletion took out
+    std::string space_state_ = "idle", space_storage_, space_current_;
+    std::vector<std::pair<std::string, double>> space_queue_; // titles and sizes still to delete
+    int space_total_ = 0, space_done_ = 0;
+    double space_freed_ = 0.0;
     std::string art(const std::string &game, bool hero) const;
 
     std::string library_json() const;

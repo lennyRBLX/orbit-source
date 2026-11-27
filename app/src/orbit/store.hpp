@@ -103,6 +103,10 @@ struct Snapshot
     std::string files_error;
     bool have_file_operation = false;
     FileOperation file_operation;
+    // Free up space: the drive last listed, and the console's deletion (followed while
+    // want_space() is on).
+    bool have_space = false;
+    SpaceListing space;
 
     // Settings: the console session's pairing code and address, the catalogue,
     // and updates for the download service (Orbit) and this app.
@@ -166,6 +170,10 @@ enum class Setting : std::uint8_t
     archive_sign_out,
     viking_pass_forget,
     extraction,
+    links_add,
+    links_replace,
+    space_list,   // a = drive
+    space_delete, // a = drive, b = the chosen IDs, one per line
 };
 
 struct SettingResult
@@ -173,6 +181,7 @@ struct SettingResult
     bool busy = false;
     Setting setting = Setting::none; // the last one sent
     std::string error;
+    std::string note; // what a finished command did, when it says (Download from links)
     std::uint64_t serial = 0; // changes when a command finishes
 };
 
@@ -329,6 +338,31 @@ class Store
     }
     void sign_out_archive() { send_setting(Setting::archive_sign_out); }
     void forget_viking_pass() { send_setting(Setting::viking_pass_forget); }
+    // Download from links: the PS5 checks each link, then adds it to Downloads; the
+    // result's note or error says how it went.
+    void add_links(std::vector<std::string> urls, std::string storage_id)
+    {
+        std::string joined;
+        for (const std::string &url : urls)
+            joined += (joined.empty() ? "" : "\n") + url;
+        send_setting(Setting::links_add, std::move(joined), std::move(storage_id));
+    }
+    // Free up space: lists what Orbit can delete on a drive (Snapshot::space), and
+    // deletes the chosen items; want_space() follows the deletion until it ends.
+    void list_space(std::string storage_id) { send_setting(Setting::space_list, std::move(storage_id)); }
+    void delete_space(std::string storage_id, const std::vector<std::string> &ids)
+    {
+        std::string joined;
+        for (const std::string &id : ids)
+            joined += (joined.empty() ? "" : "\n") + id;
+        send_setting(Setting::space_delete, std::move(storage_id), std::move(joined));
+    }
+    void want_space(bool wanted);
+    // A fresh link for a paused or failed link download; its partial file is kept.
+    void replace_link(std::string job_id, std::string url)
+    {
+        send_setting(Setting::links_replace, std::move(url), std::move(job_id));
+    }
     // Reads the console session again (a fresh pairing code after a restart).
     void refresh_session();
     // The frame has shown a finished restart.
@@ -435,6 +469,7 @@ class Store
     std::atomic<bool> provider_poll_{false};
     std::atomic<bool> want_storage_{false};
     std::atomic<bool> want_files_{false};
+    std::atomic<bool> want_space_{false};
     std::atomic<bool> storage_refresh_{false};
     std::atomic<bool> want_settings_{false};
     std::atomic<bool> session_refresh_{false};

@@ -110,7 +110,7 @@ static cJSON *read_api(int port, const char *route, const char *body,
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 750L);
     /* app.db and drive availability checks can take several seconds on a console.
      * This is a cancellable background read, not an HTTP request-thread wait. */
-    bool mutation = !strcmp(route, "scan") || !strcmp(route, "manual/add") || !strcmp(route, "manual/remove") || !strcmp(route, "sources/delete") || !strcmp(route, "games/mount") ||
+    bool mutation = !strcmp(route, "scan") || !strcmp(route, "manual/add") || !strcmp(route, "manual/remove") || !strcmp(route, "sources/delete") || !strcmp(route, "games/delete") || !strcmp(route, "games/uninstall") || !strcmp(route, "games/mount") ||
         !strcmp(route, "games/unmount") || !strcmp(route, "games/move") || !strcmp(route, "games/copy");
     curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, mutation || !strcmp(route, "games/info") ||
         (!strcmp(route, "games") && strstr(body, "true")) ? 60000L :
@@ -651,7 +651,7 @@ static const char *capability(const char *action) {
     return !strcmp(action, "scan") ? "rescan" : !strcmp(action, "mount") ? "mount_game" :
         !strcmp(action, "unmount") ? "unmount_game" : !strcmp(action, "copy") ? "copy_game_source" :
         !strcmp(action, "move") ? "move_game_source" : !strcmp(action, "cancel") ? "storage_job_cancel" :
-        !strcmp(action, "measure") ? "list_games" : "";
+        !strcmp(action, "measure") ? "list_games" : !strcmp(action, "delete") ? "delete_game_source" : "";
 }
 /* Copies and moves take turns with Files actions and Zero transfers. Downloads
  * keep running: they leave room for the copy and keep away from its names. */
@@ -700,9 +700,9 @@ static void follow_scan(void) {
  * stops between stages, the original survives unless verification completed. */
 static atomic_bool verified_move_active, verified_move_cancel;
 static bool verified_move_finalizing;
-static void show_move_job(cJSON *next) {
+static void show_move_job(cJSON *next, bool deleting) {
     pthread_mutex_lock(&lock);
-    if (!strcmp(json_text(next, "operation"), "delete") && storage_job &&
+    if (!deleting && !strcmp(json_text(next, "operation"), "delete") && storage_job &&
         !strcmp(json_text(storage_job, "operation"), "move")) {
         const char *fields[] = {"titleId", "destination", "totalBytes", "processedBytes"};
         for (size_t i = 0; i < sizeof fields / sizeof *fields; i++)
@@ -711,14 +711,15 @@ static void show_move_job(cJSON *next) {
         cJSON_ReplaceItemInObjectCaseSensitive(next, "state", cJSON_CreateString("finalizing"));
         cJSON_ReplaceItemInObjectCaseSensitive(next, "cancellable", cJSON_CreateBool(false));
     }
-    cJSON_ReplaceItemInObjectCaseSensitive(next, "operation", cJSON_CreateString("move"));
+    cJSON_ReplaceItemInObjectCaseSensitive(next, "operation", cJSON_CreateString(deleting ? "delete" : "move"));
     cJSON_ReplaceItemInObjectCaseSensitive(next, "active", cJSON_CreateBool(true));
     cJSON_Delete(storage_job); storage_job = next;
     pthread_mutex_unlock(&lock);
     hold_left(next);
 }
+/* deleting: the job deletes a game's source on its own (Free up space), not a move's. */
 static int wait_move_job(int port, cJSON *response, const char *source, const char *destination,
-                         char *error, size_t cap) {
+                         bool deleting, char *error, size_t cap) {
     cJSON *job = response ? normalize_job(response) : NULL;
     int64_t expected = json_int(job, "id");
     bool sent_cancel = false;
@@ -726,7 +727,8 @@ static int wait_move_job(int port, cJSON *response, const char *source, const ch
         if (!job || !expected || json_int(job, "id") != expected || strcmp(json_text(job, "source"), source) ||
             (destination && strcmp(json_text(job, "destination"), destination))) {
             cJSON_Delete(job);
-            copy_text(error, cap, "Cannot confirm the storage operation. Check Library before trying again. The verified destination, if complete, is kept.");
+            copy_text(error, cap, deleting ? "Cannot confirm the storage operation. Check Library before trying again."
+                : "Cannot confirm the storage operation. Check Library before trying again. The verified destination, if complete, is kept.");
             pthread_mutex_lock(&lock); monitor_job = true; job_poll_at = 0; pthread_mutex_unlock(&lock);
             return -2;
         }
@@ -734,10 +736,12 @@ static int wait_move_job(int port, cJSON *response, const char *source, const ch
         int64_t result = json_int(job, "result");
         bool complete = !strcmp(json_text(job, "state"), "complete") || !strcmp(json_text(job, "state"), "completed");
         if (!active && (!complete || result)) {
-            copy_text(error, cap, *json_text(job, "error") ? json_text(job, "error") : "Move stopped. Check both drives; no further files were removed.");
-            show_move_job(job); return -1;
+            copy_text(error, cap, *json_text(job, "error") ? json_text(job, "error") : deleting
+                ? "ShadowMount stopped deleting the game. Check Library before trying again."
+                : "Move stopped. Check both drives; no further files were removed.");
+            show_move_job(job, deleting); return -1;
         }
-        show_move_job(job);
+        show_move_job(job, deleting);
         if (!active) return 0;
         if (atomic_load(&verified_move_cancel) && !sent_cancel) {
             char body[80]; snprintf(body, sizeof body, "{\"job_id\":%lld}", (long long)expected);
@@ -778,7 +782,7 @@ static int verified_move(int port, const cJSON *body, const char *source, const 
     char *encoded = cJSON_PrintUnformatted(body);
     cJSON *response = encoded ? read_api(port, "games/copy", encoded, error, cap) : NULL;
     free(encoded);
-    int rc = wait_move_job(port, response, source, destination, error, cap); cJSON_Delete(response);
+    int rc = wait_move_job(port, response, source, destination, false, error, cap); cJSON_Delete(response);
     if (rc) goto done;
     verify_move_progress(0, NULL);
     rc = library_verify_copy(source, destination, original.st_dev, original.st_ino,
@@ -811,7 +815,7 @@ static int verified_move(int port, const cJSON *body, const char *source, const 
     response = encoded ? read_api(port, "sources/delete", encoded, error, cap) : NULL; free(encoded);
     if (response && !success(response)) {
         copy_text(error, cap, "The copy is verified, but ShadowMount could not remove the original. Both locations are kept; update ShadowMount or check its storage status."); rc = -1;
-    } else rc = wait_move_job(port, response, source, NULL, error, cap);
+    } else rc = wait_move_job(port, response, source, NULL, false, error, cap);
     cJSON_Delete(response);
     if (!rc && !manual_path(port, "manual/remove", source, error, cap)) {
         copy_text(error, cap, "The verified game has moved, but ShadowMount's old source entry could not be removed. The new copy is kept."); rc = -1;
@@ -830,9 +834,64 @@ done:
     return rc;
 }
 
+/* Free up space: delete one game's source. Orbit unmounts it first when needed, ShadowMount
+ * deletes the title's source (its job must name this exact path), then Orbit forgets it as a
+ * manual source, uninstalls it so its icon goes too, and scans again. 0 deleted,
+ * -1 kept, -2 unconfirmed (the storage job is still being followed). *icon_left: deleted, but
+ * ShadowMount didn't take the icon off the home screen. */
+static int delete_game(int port, const cJSON *caps, const cJSON *g, bool *icon_left, char *error, size_t cap) {
+    const char *path = json_text(g, "path"), *id = json_text(g, "titleId");
+    struct stat original;
+    if (library_source_identity(path, &original)) {
+        copy_text(error, cap, "This game's source is not on an available Orbit drive. Reconnect the drive and try again."); return -1;
+    }
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "mounted"))) {
+        if (!has(caps, "unmount_game")) { copy_text(error, cap, "Update ShadowMount to delete a mounted game."); return -1; }
+        cJSON *body = cJSON_CreateObject(); cJSON_AddStringToObject(body, "title_id", id);
+        char *encoded = cJSON_PrintUnformatted(body); cJSON_Delete(body);
+        cJSON *r = encoded ? read_api(port, "games/unmount", encoded, error, cap) : NULL; free(encoded);
+        bool unmounted = success(r) && !strcmp(json_text(r, "title_id"), id) &&
+                         cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(r, "mounted"));
+        cJSON_Delete(r);
+        if (!unmounted) { copy_text(error, cap, "ShadowMount couldn't unmount this game, so it was kept. Close the game and try again."); return -1; }
+    }
+    if (!library_source_unchanged(path, &original)) { copy_text(error, cap, "This game's source changed. Select it again."); return -1; }
+    /* games/delete, as ShadowMount's own Delete source: its sources/delete is for the file
+     * browser and refuses an image inside a scan folder, where most games are. */
+    cJSON *remove = cJSON_CreateObject();
+    cJSON_AddStringToObject(remove, "title_id", id); cJSON_AddBoolToObject(remove, "confirm", true);
+    char *encoded = cJSON_PrintUnformatted(remove); cJSON_Delete(remove);
+    if (cap) *error = 0;
+    cJSON *response = encoded ? read_api(port, "games/delete", encoded, error, cap) : NULL; free(encoded);
+    int rc;
+    /* ShadowMount answers a refusal with an HTTP error and its reason: nothing started. */
+    if ((response && !success(response)) || (!response && !strncmp(error, "ShadowMount: ", 13))) {
+        copy_text(error, cap, "ShadowMount could not delete this game. It was kept."); rc = -1;
+    }
+    else rc = wait_move_job(port, response, path, NULL, true, error, cap);
+    cJSON_Delete(response);
+    if (rc) return rc;
+    /* Only a source added by hand has an entry to forget; a scanned one has none. */
+    if (has(caps, "remove_manual_source")) (void)manual_path(port, "manual/remove", path, NULL, 0);
+    /* Deleting a game takes its icon off the home screen too: ShadowMount's Uninstall, the PS5's
+     * own, which leaves saved data in the console's Saved Data. The files are already gone, so a
+     * refusal only leaves the icon. */
+    *icon_left = false;
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "installed"))) {
+        cJSON *body = cJSON_CreateObject(); cJSON_AddStringToObject(body, "title_id", id);
+        char *text = has(caps, "uninstall_game") ? cJSON_PrintUnformatted(body) : NULL; cJSON_Delete(body);
+        cJSON *r = text ? read_api(port, "games/uninstall", text, NULL, 0) : NULL; free(text);
+        *icon_left = !success(r);
+        cJSON_Delete(r);
+    }
+    cJSON_Delete(read_api(port, "scan", "{\"reset_attempts\":false}", NULL, 0));
+    follow_scan();
+    return 0;
+}
 static void execute_command(cJSON *input) {
     const char *action = json_text(input, "action"), *id = json_text(input, "titleId");
     bool transfer = !strcmp(action, "copy") || !strcmp(action, "move"), gate = false;
+    bool deleting = !strcmp(action, "delete");
     char error[256] = {0}, ok[256] = "Library updated.";
     cJSON *v = NULL, *response = NULL, *rows = NULL, *body = NULL, *drives = NULL;
     int port = api_port();
@@ -856,7 +915,7 @@ static void execute_command(cJSON *input) {
         copy_text(ok, sizeof ok, "Game sizes updated. Unavailable sizes are shown separately.");
         goto succeeded;
     }
-    if (transfer || !strcmp(action, "cancel")) {
+    if (transfer || deleting || !strcmp(action, "cancel")) {
         if (!has(cJSON_GetObjectItemCaseSensitive(v, "capabilities"), "storage_job_status")) {
             copy_text(error, sizeof error, "ShadowMount cannot report storage progress. Update it before managing files."); goto done;
         }
@@ -891,11 +950,28 @@ static void execute_command(cJSON *input) {
         }
         if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "managed")) ||
             !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "onDrive")) ||
-            (transfer && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "canManageSource")))) {
+            ((transfer || deleting) && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "canManageSource")))) {
             copy_text(error, sizeof error, "This source is missing or does not support that action."); goto done;
         }
         if (transfer && packages_path_busy(json_text(g, "path"))) {
             copy_text(error, sizeof error, "Wait for package installation to finish before moving or copying its source."); goto done;
+        }
+        if (deleting) {
+            const char *path = json_text(g, "path");
+            if (packages_path_busy(path)) { copy_text(error, sizeof error, "Wait for package installation to finish before deleting this game."); goto done; }
+            if (storage_taken()) { copy_text(error, sizeof error, "Another file operation is running. Wait for it to finish, or cancel it."); goto done; }
+            gate = true;
+            storage_hold_paths(HOLD_LIBRARY, "", path);
+            pthread_mutex_lock(&orbit.mutex);
+            bool downloading = storage_path_downloading_locked(path);
+            pthread_mutex_unlock(&orbit.mutex);
+            if (downloading) { copy_text(error, sizeof error, "A download or transfer is using this."); goto done; }
+            bool icon_left = false;
+            int deleted = delete_game(port, cJSON_GetObjectItemCaseSensitive(v, "capabilities"), g, &icon_left, error, sizeof error);
+            if (deleted == -2) gate = false;
+            if (deleted) goto done;
+            copy_text(ok, sizeof ok, icon_left ? "Game deleted. Delete its icon from the PS5 home screen." : "Game deleted.");
+            goto succeeded;
         }
         bool mounted = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "mounted"));
         if ((!strcmp(action, "mount") && mounted) || (!strcmp(action, "unmount") && !mounted)) {
@@ -1379,6 +1455,46 @@ cJSON *library_snapshot(bool refresh) {
     return out;
 }
 
+/* Free up space: games whose source is on the drive at root and that ShadowMount can
+ * delete for Orbit (a game installed from a package isn't one). */
+cJSON *library_space_games(const char *root) {
+    cJSON *out = cJSON_CreateArray(), *g;
+    size_t n = strlen(root);
+    pthread_mutex_lock(&lock);
+    bool able = started && !stopping && !strcmp(status, "ready") && has(capabilities, "delete_game_source") &&
+                has(capabilities, "storage_job_status");
+    cJSON *list = able ? games : NULL;
+    cJSON_ArrayForEach(g, list) {
+        const char *path = json_text(g, "path");
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(g, "sizeBytes");
+        bool mounted = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "mounted"));
+        /* Orbit's own TV app is never offered: deleting it would remove the app in use. */
+        if (!strcmp(json_text(g, "titleId"), "PPSA99177") ||
+            strncmp(path, root, n) || path[n] != '/' || !cJSON_IsNumber(size) || size->valuedouble <= 0 ||
+            !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "onDrive")) ||
+            !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "managed")) ||
+            !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "canManageSource")) ||
+            (mounted && !has(capabilities, "unmount_game"))) continue;
+        cJSON *item = cJSON_CreateObject();
+        const char *keys[] = {"titleId", "title", "sourceKey", "format", "cover"};
+        for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
+            cJSON_AddStringToObject(item, keys[i], json_text(g, keys[i]));
+        cJSON_AddNumberToObject(item, "sizeBytes", size->valuedouble);
+        cJSON_AddBoolToObject(item, "installed", cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "installed")));
+        cJSON_AddBoolToObject(item, "mounted", mounted);
+        cJSON_AddItemToArray(out, item);
+    }
+    pthread_mutex_unlock(&lock);
+    return out;
+}
+/* The Library action with this request ID: {state, message}, or NULL when another
+ * action has replaced it. */
+cJSON *library_action_result(const char *request) {
+    pthread_mutex_lock(&lock);
+    cJSON *out = action_result && !strcmp(json_text(action_result, "id"), request) ? cJSON_Duplicate(action_result, true) : NULL;
+    pthread_mutex_unlock(&lock);
+    return out;
+}
 cJSON *library_storage_snapshot(bool refresh) {
     cJSON_Delete(library_snapshot(false));
     pthread_mutex_lock(&lock);
@@ -1410,7 +1526,7 @@ int library_action(const cJSON *input, char *error, size_t cap) {
         (!strcmp(action, "cancel") && (!number(input, "jobId") || json_int(input, "jobId") <= 0))) {
         copy_text(error, cap, "Expected a supported action and its current Library identifiers."); return 400;
     }
-    if ((!strcmp(action, "scan") || !strcmp(action, "move") || !strcmp(action, "unmount")) &&
+    if ((!strcmp(action, "scan") || !strcmp(action, "move") || !strcmp(action, "unmount") || !strcmp(action, "delete")) &&
         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(input, "confirmed"))) {
         copy_text(error, cap, "Confirm this action first."); return 400;
     }

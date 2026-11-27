@@ -109,7 +109,7 @@ float location_height(const std::vector<std::string> &lines)
 
 } // namespace
 
-DownloadsScreen::DownloadsScreen(Context &context) : Screen(context)
+DownloadsScreen::DownloadsScreen(Context &context) : Screen(context), links_(context), space_(context)
 {
     xb::keyboard_look(password_keyboard_.style, false);
     password_keyboard_.style.bindings = hui::ui::KeyboardBindings::standard();
@@ -163,9 +163,16 @@ std::vector<DownloadsScreen::RowAction> DownloadsScreen::actions_for(const Job &
         return {{tr("Enter archive password"), "archive-password"}, {primary, action}, {tr("Cancel"), "dialog"}};
     if (job.can_refresh_link)
         return {{primary, action}, {tr("Refresh download link"), "refresh-link"}, {tr("Cancel"), "dialog"}};
+    if (job.can_replace_link)
+        return {{primary, action}, {tr("Replace link"), "replace-link"}, {tr("Cancel"), "dialog"}};
     return {{primary, action}, {tr("Cancel"), "dialog"}};
     };
     auto actions = original();
+    // Paused without room to unpack: Free up space on its drive, then it resumes.
+    const Snapshot &now = ctx_.store.state();
+    if (job.status == "paused" && job.error.rfind("Not enough free space to unpack", 0) == 0 && now.system.space_protocol >= 1 &&
+        std::any_of(now.drives.begin(), now.drives.end(), [&](const Drive &d) { return d.id == job.storage_id; }))
+        actions.push_back({tr("Free up space"), "free-space"});
     if (ctx_.store.state().system.has_power && job.delivery != "zero" && job.status != "cancelled")
         actions.push_back({ctx_.store.state().system.power_enabled && ctx_.store.state().system.power_job == job.id
             ? tr("Cancel automatic shutdown") : tr("Shut down when finished"), "power"});
@@ -257,12 +264,75 @@ void DownloadsScreen::sync_queue_position(bool restore)
     }
 }
 
+void DownloadsScreen::open_links(Feedback &feedback, const Job *replace)
+{
+    if (replace != nullptr)
+    {
+        const Game *game = game_for(ctx_.store.state(), *replace);
+        links_.open(replace->id, game != nullptr ? game->title : !replace->title.empty() ? replace->title : replace->filename);
+    }
+    else
+        links_.open();
+    feedback.play(hui::audio::Cue::modal_open);
+}
+
+void DownloadsScreen::open_free_space(const Job &job, Feedback &feedback)
+{
+    xb_menu_.open = false;
+    pn_bar_open_ = false;
+    FreeSpaceForm::Request request;
+    request.storage_id = job.storage_id;
+    if (job.extract_total > 0.0)
+    {
+        request.size_bytes = job.extract_total;
+        request.need_bytes = job.extract_total + kSpaceMargin;
+    }
+    request.then = FreeSpaceForm::Then::resume;
+    space_job_ = job.id;
+    space_.open(std::move(request));
+    feedback.play(hui::audio::Cue::modal_open);
+}
+
 Intent DownloadsScreen::update(const InputFrame &input, float dt, Feedback &feedback, bool focused)
 {
+    // With a form or dialog over the screen, the Crossbar menu or Panorama bar it
+    // came from still fades out behind it.
+    const auto settle_menus = [this, dt]
+    {
+        xb_menu_.animate(dt);
+        pn_bar_in_.target = pn_bar_open_ ? 1.0f : 0.0f;
+        pn_bar_in_.update(dt, look::prefs().reduced_motion ? 40.0f : 16.0f);
+    };
+    if (space_.active())
+    {
+        // Free up space over the screen; once there's room the download resumes.
+        settle_menus();
+        ctx_.store.set_fast(true);
+        if (focused && space_.update(input, dt, feedback) == FreeSpaceForm::Result::freed)
+            for (const Job &job : ctx_.store.state().jobs)
+                if (job.id == space_job_)
+                    ctx_.store.job_action(job.id, "resume", false);
+        return {};
+    }
+    if (links_.active())
+    {
+        // Download from links over the screen; what it added shows in the list behind.
+        Intent intent;
+        settle_menus();
+        ctx_.store.set_fast(true);
+        if (focused && links_.update(input, dt, feedback) == LinksForm::Result::added)
+        {
+            intent.toast = links_.note();
+            view_ = JobView::active;
+            xb_folder_ = -1;
+        }
+        return intent;
+    }
     sync_queue_position(true);
     Intent result;
     if (power_open_ || install_open_ || clear_open_)
     {
+        settle_menus();
         ctx_.store.set_fast(true);
         if (focused)
             result = power_open_ ? update_power(input, feedback) : install_open_ ? update_installation(input, feedback) : update_clear(input, feedback);
@@ -390,12 +460,28 @@ Intent DownloadsScreen::update_store(const InputFrame &input, float dt, Feedback
             if (input.nav == Direction::left || input.nav == Direction::right)
             {
                 const int next = static_cast<int>(view_) + (input.nav == Direction::right ? 1 : -1);
-                if (next >= 0 && next < static_cast<int>(JobView::count))
+                if (links_pill_)
+                {
+                    // Download from links sits after the views, as in the browser's toolbar.
+                    if (input.nav == Direction::left)
+                    {
+                        links_pill_ = false;
+                        feedback.play(hui::audio::Cue::focus);
+                    }
+                    else
+                        refuse(feedback, input);
+                }
+                else if (next >= 0 && next < static_cast<int>(JobView::count))
                 {
                     view_ = static_cast<JobView>(next);
                     row_ = 0;
                     button_ = 0;
                     feedback.play(hui::audio::Cue::tab);
+                }
+                else if (next == static_cast<int>(JobView::count))
+                {
+                    links_pill_ = true;
+                    feedback.play(hui::audio::Cue::focus);
                 }
                 else
                 {
@@ -407,6 +493,7 @@ Intent DownloadsScreen::update_store(const InputFrame &input, float dt, Feedback
                 if (!visible().empty())
                 {
                     on_views_ = false;
+                    links_pill_ = false;
                     row_ = 0;
                     button_ = 0;
                     feedback.play(hui::audio::Cue::focus);
@@ -415,6 +502,11 @@ Intent DownloadsScreen::update_store(const InputFrame &input, float dt, Feedback
                 {
                     refuse(feedback, input);
                 }
+            }
+            if (input.is_pressed(Action::confirm) && links_pill_)
+            {
+                open_links(feedback);
+                return intent;
             }
             if (input.is_pressed(Action::confirm) && visible().empty())
             {
@@ -488,6 +580,14 @@ Intent DownloadsScreen::update_store(const InputFrame &input, float dt, Feedback
                 {
                     open_power(job, feedback);
                 }
+                else if (std::string_view(action.action) == "replace-link")
+                {
+                    open_links(feedback, &job);
+                }
+                else if (std::string_view(action.action) == "free-space")
+                {
+                    open_free_space(job, feedback);
+                }
                 else if (std::string_view(action.action) == "view-zero")
                 {
                     intent.toast="This cancelled transfer is saved in Orbit Zero on your computer.";
@@ -536,6 +636,8 @@ Intent DownloadsScreen::update_store(const InputFrame &input, float dt, Feedback
 
 void DownloadsScreen::draw(Frame &frame, bool focused) const
 {
+    links_.draw(frame); // on the overlay, above the look drawn below
+    space_.draw(frame);
     if (power_open_) draw_power(frame);
     if (install_open_) { draw_installation(frame); return; }
     if (clear_open_)
@@ -584,7 +686,7 @@ void DownloadsScreen::draw(Frame &frame, bool focused) const
         const ui::Rect pill{x, kChipsY, width, kChipHeight};
         const bool current = view == view_;
         ui::focus_ring(list, pill, pill.h * 0.5f,
-                       focused && on_views_ && current && !dialog_open_ ? 1.0f : 0.0f);
+                       focused && on_views_ && current && !dialog_open_ && !links_pill_ ? 1.0f : 0.0f);
         if (current)
             list.rounded_rect(pill, pill.h * 0.5f, ui::Color::rgb(0xf4f4f4));
         else
@@ -595,6 +697,16 @@ void DownloadsScreen::draw(Frame &frame, bool focused) const
         ui::text(list, type.medium, number, pill.x + 18.0f + label_width + 7.0f, pill.cy() + 6.5f,
                  18.0f, ink.with_alpha(0.65f));
         x += width + 8.0f;
+    }
+    {
+        // .add-links-button: Download from links at the toolbar's end.
+        const std::string label = tr("Download from links");
+        const float width = 18.0f + 22.0f + 8.0f + type.medium.measure(label, 18.0f) + 18.0f;
+        const ui::Rect pill{1920.0f - ui::kGutter - width, kChipsY, width, kChipHeight};
+        ui::focus_ring(list, pill, pill.h * 0.5f, focused && on_views_ && links_pill_ && !dialog_open_ ? 1.0f : 0.0f);
+        list.bordered_rect(pill, pill.h * 0.5f, ui::Color::rgb(0xffffff, 0.05f), 1.0f, ui::Color::rgb(0xffffff, 0.14f));
+        icons::draw(list, icons::Icon::link, pill.x + 29.0f, pill.cy(), 22.0f, ui::color::text);
+        ui::text(list, type.medium, label, pill.x + 48.0f, pill.cy() + 6.5f, 18.0f, ui::color::text);
     }
 
     // ---- rows ----
@@ -684,6 +796,8 @@ void DownloadsScreen::draw(Frame &frame, bool focused) const
         std::string meta;
         if (release != nullptr)
             meta = release->provider + " \xC2\xB7 " + format_label(*release) + " \xC2\xB7 ";
+        if (job.from_link)
+            meta += (job.link_host.empty() ? std::string(tr("Your link")) : job.link_host) + " \xC2\xB7 ";
         meta += drive != nullptr ? i18n::place(drive->label) : job.storage_id;
         if (job.delivery == "torbox")
             meta += std::string(" \xC2\xB7 ") + tr("via TorBox");
@@ -827,6 +941,8 @@ void DownloadsScreen::draw(Frame &frame, bool focused) const
 
 std::vector<hui::ui::Hint> DownloadsScreen::hints() const
 {
+    if (links_.active()) return links_.hints();
+    if (space_.active()) return space_.hints();
     if (install_open_) return {{hui::ui::Button::dpad, tr("Choose package")}, {hui::ui::Button::cross, tr("Select")}, {hui::ui::Button::circle, tr("Close")}};
     if (power_open_ || clear_open_) return {{hui::ui::Button::cross, tr("Select")}, {hui::ui::Button::circle, tr("Go back")}};
     if (look::is(look::Interface::crossbar))
@@ -943,6 +1059,8 @@ void job_row(const Snapshot &state, const Job &job, xb::Row &row)
     std::string where;
     if (release != nullptr)
         where = release->provider + " \xC2\xB7 " + format_label(*release);
+    if (job.from_link)
+        where = job.link_host.empty() ? std::string(tr("Your link")) : job.link_host;
     if (job.delivery == "torbox")
         where += (where.empty() ? "" : " \xC2\xB7 ") + std::string(tr("via TorBox"));
     where += (where.empty() ? "" : " \xC2\xB7 ") + (drive != nullptr ? i18n::place(drive->label) : job.storage_id);
@@ -1002,7 +1120,7 @@ xb::List DownloadsScreen::crossbar_list() const
     // An empty view says so; the section's empty row leads to Browse.
     const int lead = jobs.empty() ? 1 : static_cast<int>(jobs.size());
     const bool clear = !root && clearable(view); // the browser's row after the downloads
-    list.size = lead + (root ? 3 : 0) + (clear ? 1 : 0);
+    list.size = lead + (root ? 4 : 0) + (clear ? 1 : 0);
     list.fill = [this, jobs, root, view, lead, clear](int i, xb::Row &row)
     {
         const Snapshot &now = ctx_.store.state();
@@ -1041,6 +1159,16 @@ xb::List DownloadsScreen::crossbar_list() const
             }
             return;
         }
+        if (root && i == lead + 3)
+        {
+            // The browser's row after the folders: Download from links.
+            row.key = "links";
+            row.has_icon = true;
+            row.icon = icons::Icon::link;
+            row.title = tr("Download from links");
+            row.sub = tr("Paste links to files that aren't in the catalogue.");
+            return;
+        }
         static const JobView kFolders[] = {JobView::failed, JobView::finished, JobView::cancelled};
         const JobView folder = kFolders[i - lead];
         const int n = count(folder);
@@ -1075,10 +1203,12 @@ std::vector<DownloadsScreen::XbAction> DownloadsScreen::crossbar_actions(const J
             icon = icons::Icon::pause;
         else if (action == "resume")
             icon = icons::Icon::play;
-        else if (action == "retry" || action == "refresh-link")
+        else if (action == "retry" || action == "refresh-link" || action == "replace-link")
             icon = action == "retry" ? icons::Icon::refresh : icons::Icon::link;
         else if (action == "archive-password")
             icon = icons::Icon::key;
+        else if (action == "free-space")
+            icon = icons::Icon::drive;
         else if (action == "power")
             icon = icons::Icon::power;
         else if (action == "remove")
@@ -1265,6 +1395,8 @@ Intent DownloadsScreen::run_action(const Job &job, const std::string &action, Fe
     const Snapshot &state = ctx_.store.state();
     if (job.removing_files) return intent;
     if (action == "remove" || action == "forget") { open_history({job.id}, feedback); return intent; }
+    if (action == "replace-link") { xb_menu_.open = false; pn_bar_open_ = false; open_links(feedback, &job); return intent; }
+    if (action == "free-space") { open_free_space(job, feedback); return intent; }
     if (action == "packages") {
         install_open_ = true; install_job_ = job.id; install_package_ = 0; install_confirm_.clear(); install_reading_ = 0;
         xb_menu_.open = false; pn_bar_open_ = false;
@@ -1390,6 +1522,8 @@ Intent DownloadsScreen::update_crossbar(const InputFrame &input, float dt, Feedb
             }
             else if (row.key == "clear" && xb_folder_ >= 0)
                 open_clear(static_cast<JobView>(xb_folder_), feedback);
+            else if (row.key == "links")
+                open_links(feedback);
             else if (row.key == "empty" && xb_folder_ < 0)
             {
                 feedback.play(hui::audio::Cue::select);
@@ -1593,6 +1727,8 @@ pano::Page DownloadsScreen::panorama_page() const
         {
             entries.push_back({'b', 0});
             g.places = {{0, 0, 2, 1}};
+            entries.push_back({'k', 0}); // Download from links, beside Browse as the empty state's buttons
+            g.places.push_back({2, 0, 2, 1});
         }
         else
         {
@@ -1661,6 +1797,30 @@ pano::Page DownloadsScreen::panorama_page() const
                     place_figures(right, 0);
                 }
             }
+            if (view == JobView::active)
+            {
+                // The browser's dark Download from links tile, in the first free cell.
+                int right = 0;
+                for (const pano::Place &p : g.places)
+                    right = std::max(right, p.col + p.w);
+                const auto taken = [&](int col, int row)
+                {
+                    for (const pano::Place &p : g.places)
+                        if (col >= p.col && col < p.col + p.w && row >= p.row && row < p.row + p.h)
+                            return true;
+                    return false;
+                };
+                pano::Place at{right, 0, 1, 1};
+                for (int col = 0; col < right && at.col == right; ++col)
+                    for (int row = 0; row < pano::kRows; ++row)
+                        if (!taken(col, row))
+                        {
+                            at = {col, row, 1, 1};
+                            break;
+                        }
+                entries.push_back({'k', 0});
+                g.places.push_back(at);
+            }
             if (clearable(view))
             {
                 // The browser's dark tile that clears this view's history, in the first free cell.
@@ -1699,6 +1859,15 @@ pano::Page DownloadsScreen::panorama_page() const
                 tile.icon = icons::Icon::down;
                 tile.label = tr("Nothing in progress");
                 tile.sub = tr("Choose a game to add it to your queue.");
+                return;
+            }
+            if (e.kind == 'k')
+            {
+                tile.key = "links";
+                tile.has_icon = true;
+                tile.icon = icons::Icon::link;
+                tile.label = tr("Download from links");
+                tile.sub = pano::lower(tr("Files that aren't in the catalogue"));
                 return;
             }
             if (e.kind == 'l')
@@ -1893,6 +2062,8 @@ Intent DownloadsScreen::update_panorama(const InputFrame &input, float dt, Feedb
                 intent.kind = Intent::Kind::show_tab;
                 intent.tab = tab::browse;
             }
+            else if (key == "links")
+                open_links(feedback);
             else if (key.rfind("clear:", 0) == 0)
                 open_clear(key == "clear:cancelled" ? JobView::cancelled : JobView::finished, feedback);
             else if (job != nullptr)
@@ -1950,8 +2121,12 @@ void DownloadsScreen::draw_panorama(Frame &frame) const
     pano::draw_header(ctx_, list, pano::lower(tr("Downloads")), pano_.scroll() * 0.35f);
     if (state.jobs.empty())
     {
+    {
+        const std::string key = pano_.focused_key(page);
         pano::draw_empty(ctx_, list, tr("Active"), tr("Nothing in progress"), tr("Choose a game to add it to your queue."),
-                         {pano::button(tr("Browse games"), icons::Icon::grid, true)});
+                         {pano::button(tr("Browse games"), icons::Icon::grid, key != "links"),
+                          pano::button(tr("Download from links"), icons::Icon::link, key == "links")});
+    }
     }
     else
         pano_.draw(ctx_, list, page, !pn_bar_open_ && !dialog_open_);

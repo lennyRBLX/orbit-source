@@ -4,6 +4,8 @@
 #include "packages.h"
 #include "files.h"
 #include "zero_link.h"
+#include "links.h"
+#include "space.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,7 +154,7 @@ int power_client_work(const cJSON *input, const char *owner, char *error, size_t
     return 200;
 }
 static bool background_busy(void) {
-    bool busy = zero_link_busy();
+    bool busy = zero_link_busy() || links_busy() || space_busy();
     cJSON *status = packages_status(), *r, *p;
     cJSON_ArrayForEach(r, cJSON_GetObjectItemCaseSensitive(status, "downloads")) {
         const char *s = json_text(r, "state");

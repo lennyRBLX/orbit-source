@@ -54,6 +54,7 @@ struct System
     bool has_extract_archives = false;
     // 1: Get everything (/api/v1/bundles); 0 on an older service.
     int bundle_protocol = 0;
+    int space_protocol = 0; // Free up space (/api/v1/space)
     // Notifications on this PS5 (1.5.0's download notifications); unset on an older service.
     bool download_notifications = true;
     bool has_download_notifications = false;
@@ -260,6 +261,30 @@ struct Drive
     bool external = false;
 };
 
+// Free up space (POST /api/v1/space): what Orbit can delete on one drive, biggest
+// first, and the deletion the console is running (one at a time).
+struct SpaceItem
+{
+    std::string id, kind, title, name, format; // kind: package archive partial game
+    double size_bytes = 0.0;
+    bool mounted = false;
+};
+struct SpaceDeletion
+{
+    std::string state = "idle"; // idle deleting done failed
+    std::string storage_id, message, current;
+    int total = 0, done = 0, failed = 0;
+    double freed_bytes = 0.0;
+};
+struct SpaceListing
+{
+    std::string storage_id, label;
+    double free_bytes = 0.0, total_bytes = 0.0;
+    double projected_free_bytes = 0.0; // free space minus what unfinished downloads still need
+    std::vector<SpaceItem> leftovers, games;
+    SpaceDeletion deletion;
+};
+
 struct PackageInstallation
 {
     std::string id, filename, platform, state, message;
@@ -290,6 +315,11 @@ struct Job : AddonInfo
     std::vector<PackageInstallation> packages;
     bool can_refresh_link = false;
     bool can_enter_archive_password = false;
+    // A download from a link the user pasted: its host (never the link), and whether
+    // a fresh link can continue it.
+    bool from_link = false;
+    std::string link_host;
+    bool can_replace_link = false;
     std::string id;
     std::string release_id;
     std::string game_id;
@@ -608,6 +638,8 @@ LibraryStorage parse_library_storage(const json::Value &value);
 FileListing parse_file_listing(const json::Value &value);
 // {operation: ...}: false when there is none.
 bool parse_file_operation(const json::Value &value, FileOperation *operation);
+SpaceListing parse_space_listing(const json::Value &value);
+SpaceDeletion parse_space_deletion(const json::Value &value);
 Session parse_session(const json::Value &value);
 CatalogueStatus parse_catalogue_status(const json::Value &value);
 ServiceUpdate parse_service_update(const json::Value &value);
@@ -633,6 +665,7 @@ bool matches_query(const Game &game, std::string_view query);
 enum class Sort : std::uint8_t
 {
     release,    // release date, newest first; undated games last
+    added,      // date added to Orbit, newest first; undated games last (Games only)
     title,      // A to Z
     title_desc, // Z to A
     size,       // smallest matching download first

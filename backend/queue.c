@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "links.h"
 #include "debrid.h"
 #include "extract.h"
 #include <errno.h>
@@ -368,6 +369,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
             copy_text(err, cap,
                       !strcmp(j->status, "cancelled")
                           ? "Open Downloads to resume this cancelled download, or reconnect its original drive and delete the partial file before downloading again."
+                          : !strcmp(r->source, "link") ? "This link is already in Downloads for that drive."
                           : "This release already has a job on that drive. Open Downloads to resume or retry it.");
             return 409;
         }
@@ -487,6 +489,46 @@ int job_create_captured_locked(const Release *r, const Storage *s, const char *e
         return 409;
     }
     return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+}
+int job_create_link_locked(const Release *r, const Storage *s, const char *etag,
+                           const char *modified, char *err, size_t cap, Job **result) {
+    if (!link_release_valid(r)) {
+        copy_text(err, cap, "This link didn't give Orbit a file it can save."); return 400;
+    }
+    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+}
+bool job_can_replace_link(const Job *j) {
+    return j && !strcmp(j->release.source, "link") && !job_active(j) &&
+        (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&
+        !j->archive_ready && !(j->release.compression[0] && j->received >= j->total);
+}
+/* The fresh link must be the same file: the same size, and the same identity when both
+ * links give one and part of the file is already here. The download keeps its name. */
+int job_replace_link_locked(Job *j, const Release *r, const char *etag, const char *modified,
+                            char *err, size_t cap) {
+    if (orbit.stop || orbit.state_failed) {
+        copy_text(err, cap, "Queue state cannot be saved. Try again after restarting Orbit."); return 503;
+    }
+    if (!job_can_replace_link(j)) {
+        copy_text(err, cap, "Pause the download first, or wait until it stops."); return 409;
+    }
+    if (!link_url_allowed(r->url) || r->size != j->total) {
+        copy_text(err, cap, "This link is for a different file (its size differs). Your partial file was kept."); return 409;
+    }
+    if (j->received > 0 && ((j->etag[0] && etag[0] && strcmp(j->etag, etag)) ||
+                            (!j->etag[0] && !etag[0] && j->modified[0] && modified[0] && strcmp(j->modified, modified)))) {
+        copy_text(err, cap, "This link is for a different copy of the file. Your partial file was kept."); return 409;
+    }
+    Job previous = *j;
+    copy_text(j->release.url, sizeof j->release.url, r->url);
+    copy_text(j->etag, sizeof j->etag, etag);
+    copy_text(j->modified, sizeof j->modified, modified);
+    copy_text(j->status, sizeof j->status, "queued");
+    j->error[0] = 0; j->retry_at = 0; j->attempts = 0;
+    atomic_store(&j->pause, false); atomic_store(&j->cancel, false);
+    if (state_save_locked()) { *j = previous; copy_text(err, cap, "Could not persist the queue."); return 503; }
+    pthread_cond_broadcast(&orbit.changed);
+    return 200;
 }
 bool job_can_refresh_link(const Job *j) {
     return j && (!strcmp(j->status, "paused") || !strcmp(j->status, "error")) &&

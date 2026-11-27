@@ -351,12 +351,99 @@ Fixture::Fixture(FixtureMode mode) : mode_(mode)
         "The provider stopped responding. Retry later.");
     add("quiet-harbour", 0, "usb0", "complete", 1.0, 0.0, "");
     add("paper-lanterns", 0, "usb0", "cancelled", 0.4, 0.0, "");
+    if (mode_ == FixtureMode::full)
+        for (Job &job : jobs_)
+            if (job.game == "frostline")
+            {
+                // Downloaded, then paused: its archive needs more room to unpack.
+                job.status = "paused";
+                job.received = job.total;
+                job.extract_total = 33.5e9;
+                job.error = "Not enough free space to unpack this download. Free up space on its drive, then select "
+                            "Resume. The downloaded archive was kept.";
+            }
+    if (mode_ == FixtureMode::full)
+    {
+        // A download from a pasted link whose link expired: Replace link.
+        Job job;
+        job.id = "job" + std::to_string(next_job_++);
+        job.release = "link-8f3a1c2e9b7d4a60";
+        job.title = "Moonfall.zip";
+        job.storage = "usb0";
+        job.filename = "Moonfall.zip";
+        job.format = "Unknown";
+        job.status = "error";
+        job.error = "The link stopped working. It may have expired: choose Replace link and paste a fresh one. "
+                    "Your partial file is kept.";
+        job.total = 7.9e9;
+        job.received = 3.4e9;
+        job.link_host = "files.example.net";
+        jobs_.push_back(job);
+    }
     if (mode_ != FixtureMode::setup)
     {
         enabled_ = {"archive"};
         acknowledged_ = true;
     }
     catalogue_checked_ = unix_now() - 25.0 * 60.0;
+}
+
+std::string Fixture::space_status_json() const
+{
+    char numbers[160];
+    std::snprintf(numbers, sizeof(numbers), ",\"total\":%d,\"done\":%d,\"failed\":0,\"freedBytes\":%.0f}", space_total_,
+                  space_done_, space_freed_);
+    return "{\"state\":" + json::quote(space_state_) + ",\"storageId\":" + json::quote(space_storage_) +
+           ",\"message\":\"\",\"current\":" + json::quote(space_current_) + numbers;
+}
+
+std::string Fixture::space_json(const std::string &storage) const
+{
+    struct Item
+    {
+        const char *id, *kind, *title, *name, *format;
+        double size;
+        bool mounted;
+    };
+    // Biggest first in each group, as Orbit lists them.
+    static const Item kUsb[] = {
+        {"package:c0ffee0000000001:5a17e0000001", "package", "Copper Circuit", "Copper Circuit.pkg", "", 10.8e9, false},
+        {"partial:job105", "partial", "Paper Lanterns", "PPSA90008 Paper Lanterns.ffpfsc", "", 2.1e9, false},
+        {"game:PPSA90031:usb0-lantern", "game", "Lantern Keep", "", "Folder", 22.5e9, false},
+        {"game:PPSA90006:usb0-harbour", "game", "Quiet Harbour", "", "FFPFSC", 9.8e9, true},
+    };
+    static const Item kInternal[] = {
+        {"game:PPSA99050:internal-lab", "game", "Homebrew UI Lab", "", "FFPKG", 4.2e9, false},
+    };
+    const bool usb = storage == "usb0";
+    std::string leftovers, games;
+    const auto add = [&](const Item &item)
+    {
+        if (std::find(space_deleted_.begin(), space_deleted_.end(), item.id) != space_deleted_.end())
+            return;
+        const bool game = std::strcmp(item.kind, "game") == 0;
+        std::string &out = game ? games : leftovers;
+        char size[48];
+        std::snprintf(size, sizeof(size), "%.0f", item.size);
+        out += std::string(out.empty() ? "" : ",") + "{\"id\":" + json::quote(item.id) + ",\"kind\":" + json::quote(item.kind) +
+               ",\"title\":" + json::quote(item.title) + ",\"name\":" + json::quote(item.name) +
+               ",\"format\":" + json::quote(item.format) + ",\"sizeBytes\":" + size +
+               ",\"mounted\":" + (item.mounted ? "true" : "false") + "}";
+    };
+    if (usb)
+        for (const Item &item : kUsb)
+            add(item);
+    else
+        for (const Item &item : kInternal)
+            add(item);
+    const bool full = mode_ == FixtureMode::full;
+    char numbers[200];
+    std::snprintf(numbers, sizeof(numbers), ",\"freeBytes\":%.0f,\"totalBytes\":%.0f,\"projectedFreeBytes\":%.0f",
+                  usb ? (full ? 30.0e9 : 1420.0e9) + space_freed_ : full ? 21.2e9 : 41.2e9, usb ? 2000.0e9 : 825.0e9,
+                  usb ? (full ? 11.3e9 : 1323.3e9) + space_freed_ : full ? 19.0e9 : 39.0e9);
+    return "{\"storageId\":" + json::quote(storage) + ",\"label\":" +
+           json::quote(usb ? "USB Extended Storage" : "Internal storage") + numbers + ",\"leftovers\":[" + leftovers +
+           "],\"games\":[" + games + "],\"deletion\":" + space_status_json() + "}";
 }
 
 std::string Fixture::jobs_json() const
@@ -368,8 +455,8 @@ std::string Fixture::jobs_json() const
         char numbers[256];
         std::snprintf(
             numbers, sizeof(numbers),
-            ",\"received\":%.0f,\"total\":%.0f,\"speed\":%.0f,\"retryAt\":%.0f,\"order\":%zu",
-            job.received, job.total, job.speed, job.retry_at, i);
+            ",\"received\":%.0f,\"total\":%.0f,\"speed\":%.0f,\"retryAt\":%.0f,\"order\":%zu,\"extractTotal\":%.0f",
+            job.received, job.total, job.speed, job.retry_at, i, job.extract_total);
         if (i > 0)
             out += ",";
         out +=
@@ -383,6 +470,9 @@ std::string Fixture::jobs_json() const
                 "/mnt/usb0/homebrew/" + job.filename : "") + ",\"status\":" + json::quote(job.status) +
             ",\"error\":" + json::quote(job.error) +
             ",\"verification\":" + json::quote(job.status == "complete" ? "sha256" : "") + numbers +
+            (job.link_host.empty() ? std::string()
+                                   : ",\"sourceId\":\"link\",\"linkHost\":" + json::quote(job.link_host) +
+                                         ",\"canReplaceLink\":true") +
             (std::getenv("ORBIT_PREVIEW_FIRMWARE") != nullptr && job.status == "complete"
                 ? ",\"maxFirmware\":\"11.60\",\"consoleFirmware\":\"13.60\",\"firmwareIssue\":\"ps5-package\","
                   "\"installation\":{\"available\":true,\"state\":\"ready\",\"message\":\"\",\"packages\":[{"
@@ -486,6 +576,8 @@ std::string Fixture::library_json() const
                 format = game.options.back().format;
             }
         }
+        if (std::find(library_removed_.begin(), library_removed_.end(), title_id) != library_removed_.end())
+            continue;
         const std::string root = std::strcmp(entry.location, "Internal storage") == 0
                                      ? "/data/homebrew"
                                      : "/mnt/usb0/homebrew";
@@ -658,7 +750,8 @@ http::Response Fixture::send(const http::Request &request)
             ",\"power\":{\"available\":true,\"enabled\":" +
             ((power_enabled_ || mode_ == FixtureMode::power_countdown) ? "true" : "false") +
             ",\"state\":" + json::quote(mode_ == FixtureMode::power_countdown ? "countdown" : power_enabled_ ? "waiting" : "off") +
-            ",\"seconds\":45,\"jobId\":" + json::quote(power_job_) + ",\"error\":\"\"},\"downloadConnections\":" + std::to_string(connections_) + "}";
+            ",\"seconds\":45,\"jobId\":" + json::quote(power_job_) + ",\"error\":\"\"},\"downloadConnections\":" + std::to_string(connections_) +
+            ",\"spaceProtocol\":1}";
         return response;
     }
     if (get && path == "/api/v1/sources")
@@ -739,6 +832,21 @@ http::Response Fixture::send(const http::Request &request)
         response.body = error_body("Pair this device with your PS5 to continue.");
         return response;
     }
+    if (get && path == "/api/v1/storage" && mode_ == FixtureMode::full)
+    {
+        // Nearly full: what Free up space deletes comes back as free space.
+        char body[640];
+        std::snprintf(body, sizeof(body),
+                      "[{\"id\":\"usb0\",\"label\":\"USB Extended Storage\",\"path\":\"/mnt/usb0/homebrew\","
+                      "\"freeBytes\":%.0f,\"totalBytes\":2000000000000,\"pendingBytes\":18700000000,"
+                      "\"projectedFreeBytes\":%.0f,\"external\":true},"
+                      "{\"id\":\"internal\",\"label\":\"Internal storage\",\"path\":\"/data/homebrew\","
+                      "\"freeBytes\":21200000000,\"totalBytes\":825000000000,\"pendingBytes\":2200000000,"
+                      "\"projectedFreeBytes\":19000000000,\"external\":false}]",
+                      30.0e9 + space_freed_, 11.3e9 + space_freed_);
+        response.body = body;
+        return response;
+    }
     if (get && path == "/api/v1/storage")
     {
         response.body =
@@ -748,6 +856,78 @@ http::Response Fixture::send(const http::Request &request)
             "{\"id\":\"internal\",\"label\":\"Internal storage\",\"path\":\"/data/homebrew\","
             "\"freeBytes\":41200000000,\"totalBytes\":825000000000,\"pendingBytes\":2200000000,"
             "\"projectedFreeBytes\":39000000000,\"external\":false}]";
+        return response;
+    }
+    if (path == "/api/v1/space")
+    {
+        if (get)
+        {
+            // Each read moves the deletion one item on.
+            if (space_state_ == "deleting")
+            {
+                if (!space_queue_.empty())
+                {
+                    space_freed_ += space_queue_.front().second;
+                    space_queue_.erase(space_queue_.begin());
+                    ++space_done_;
+                }
+                space_current_ = space_queue_.empty() ? std::string() : space_queue_.front().first;
+                if (space_queue_.empty())
+                {
+                    space_state_ = "done";
+                    // As on a console: a deleted game leaves the Library once ShadowMount scans.
+                    for (const std::string &id : space_deleted_)
+                        if (id.rfind("game:", 0) == 0)
+                            library_removed_.push_back(id.substr(5, id.find(':', 5) - 5));
+                }
+            }
+            response.body = space_status_json();
+            return response;
+        }
+        json::Value body;
+        const bool parsed = json::parse(request.body, &body);
+        const std::string storage = parsed ? body.text("storageId") : std::string();
+        if (storage != "usb0" && storage != "internal")
+        {
+            response.status = 404;
+            response.body = error_body("Reconnect the selected drive first.");
+            return response;
+        }
+        if (body.text("action") == "list")
+        {
+            response.body = space_json(storage);
+            return response;
+        }
+        if (body.text("action") != "delete" || !body["ids"].is_array() || body["ids"].items().empty())
+        {
+            response.status = 400;
+            response.body = error_body("Choose what to delete.");
+            return response;
+        }
+        if (space_state_ == "deleting")
+        {
+            response.status = 409;
+            response.body = error_body("Orbit is still deleting. Wait for it to finish.");
+            return response;
+        }
+        json::Value listing;
+        json::parse(space_json(storage), &listing);
+        space_queue_.clear();
+        for (const json::Value &id : body["ids"].items())
+            for (const char *group : {"leftovers", "games"})
+                for (const json::Value &item : listing[group].items())
+                    if (item.text("id") == id.as_string())
+                    {
+                        space_queue_.push_back({item.text("title"), item.number("sizeBytes")});
+                        space_deleted_.push_back(item.text("id"));
+                    }
+        space_state_ = "deleting";
+        space_storage_ = storage;
+        space_total_ = static_cast<int>(space_queue_.size());
+        space_done_ = 0;
+        space_current_ = space_queue_.empty() ? std::string() : space_queue_.front().first;
+        response.status = 202;
+        response.body = space_status_json();
         return response;
     }
     if (get && path == "/api/v1/downloads")

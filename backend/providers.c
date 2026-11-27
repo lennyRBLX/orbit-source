@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "links.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -276,6 +277,12 @@ static bool disposition_filename(const char *value, char *out, size_t cap) {
     }
     return false;
 }
+bool provider_content_filename(const char *disposition, char *out, size_t cap) {
+    return disposition_filename(disposition, out, cap);
+}
+bool provider_percent_decode(const char *src, size_t n, char *out, size_t cap) {
+    return percent_decode(src, n, out, cap);
+}
 /* The file name a storage link's response-content-disposition asks for. The
  * value may be encoded once or twice. Also used for the kernel log. */
 bool provider_disposition_name(const char *url, char *out, size_t cap) {
@@ -342,6 +349,8 @@ static bool viking_storage_link(const Release *r) {
 
 /* Provider boundary: never turn metadata/page URLs into unverified downloads. */
 bool provider_url_supported(const Release *release) {
+    /* A link the user pasted: any https host, guarded like provider downloads. */
+    if (!strcmp(release->source, "link")) return link_url_allowed(release->url);
     if (!strcmp(release->id, "orbit-network-check"))
         return !strcmp(release->url,
                        "https://raw.githubusercontent.com/DaveGamble/cJSON/v1.7.19/LICENSE");
@@ -402,7 +411,8 @@ bool provider_supported(const Release *release) {
 #ifdef ORBIT_TEST
     /* Test binaries may parse the catalogue, but may only transfer fixtures. */
     return !strncmp(release->url, "http://127.0.0.1:", 17) &&
-           (!strcmp(release->source, "archive") || provider_browser_source(release->source));
+           (!strcmp(release->source, "archive") || !strcmp(release->source, "link") ||
+            provider_browser_source(release->source));
 #else
     return provider_url_supported(release);
 #endif

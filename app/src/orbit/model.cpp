@@ -215,6 +215,7 @@ System parse_system(const json::Value &value)
     system.has_extract_archives = value["extractArchives"].is_bool();
     system.extract_archives = value.flag("extractArchives", true);
     system.bundle_protocol = static_cast<int>(value.number("bundleProtocol", 0));
+    system.space_protocol = static_cast<int>(value.number("spaceProtocol", 0));
     system.has_download_notifications = value["downloadNotifications"].is_bool();
     system.download_notifications = value.flag("downloadNotifications", true);
     {
@@ -569,6 +570,9 @@ std::vector<Job> parse_jobs(const json::Value &value)
             job.packages.push_back(std::move(pkg));
         }
         job.can_refresh_link = item.flag("canRefreshLink");
+        job.from_link = item.text("sourceId") == "link";
+        job.link_host = item.text("linkHost");
+        job.can_replace_link = item.flag("canReplaceLink");
         job.can_enter_archive_password = item.flag("canEnterArchivePassword");
         job.delivery_phase = item.text("deliveryPhase");
         job.received = item.number("received");
@@ -591,7 +595,7 @@ std::vector<Job> parse_jobs(const json::Value &value)
 
 namespace
 {
-constexpr const char *kSortIds[] = {"release", "title", "title-desc", "size", "size-desc", "score", "score-desc", "time", "time-desc"};
+constexpr const char *kSortIds[] = {"release", "added", "title", "title-desc", "size", "size-desc", "score", "score-desc", "time", "time-desc"};
 constexpr const char *kSizeIds[] = {"", "small", "medium", "large", "huge"};
 
 std::vector<std::string> strings(const json::Value &value)
@@ -639,10 +643,12 @@ std::vector<SavedFilter> parse_saved_filters(const json::Value &value)
         for (int i = 0; i < static_cast<int>(SizeFilter::count); ++i)
             if (f.text("size") == kSizeIds[i])
                 b.size = static_cast<SizeFilter>(i);
-        // "added" is the Add-ons page's newest first, Sort::release here.
         for (int i = 0; i < static_cast<int>(Sort::count); ++i)
             if (f.text("sort") == kSortIds[i])
                 b.sort = static_cast<Sort>(i);
+        // "added" is the Add-ons page's newest first, Sort::release there.
+        if (saved.addons && b.sort == Sort::added)
+            b.sort = Sort::release;
         out.push_back(std::move(saved));
     }
     return out;
@@ -805,6 +811,54 @@ FileListing parse_file_listing(const json::Value &value)
         entry.locked = item.text("locked");
         listing.entries.push_back(std::move(entry));
     }
+    return listing;
+}
+
+SpaceDeletion parse_space_deletion(const json::Value &value)
+{
+    SpaceDeletion deletion;
+    if (!value.is_object())
+        return deletion;
+    deletion.state = value.text("state");
+    if (deletion.state.empty())
+        deletion.state = "idle";
+    deletion.storage_id = value.text("storageId");
+    deletion.message = value.text("message");
+    deletion.current = value.text("current");
+    deletion.total = static_cast<int>(value.number("total"));
+    deletion.done = static_cast<int>(value.number("done"));
+    deletion.failed = static_cast<int>(value.number("failed"));
+    deletion.freed_bytes = value.number("freedBytes");
+    return deletion;
+}
+
+SpaceListing parse_space_listing(const json::Value &value)
+{
+    SpaceListing listing;
+    listing.storage_id = value.text("storageId");
+    listing.label = value.text("label");
+    listing.free_bytes = value.number("freeBytes");
+    listing.total_bytes = value.number("totalBytes");
+    listing.projected_free_bytes = value.number("projectedFreeBytes");
+    const auto items = [](const json::Value &list, std::vector<SpaceItem> *out)
+    {
+        for (const json::Value &item : list.items())
+        {
+            SpaceItem row;
+            row.id = item.text("id");
+            row.kind = item.text("kind");
+            row.title = item.text("title");
+            row.name = item.text("name");
+            row.format = item.text("format");
+            row.size_bytes = item.number("sizeBytes");
+            row.mounted = item.flag("mounted");
+            if (!row.id.empty())
+                out->push_back(std::move(row));
+        }
+    };
+    items(value["leftovers"], &listing.leftovers);
+    items(value["games"], &listing.games);
+    listing.deletion = parse_space_deletion(value["deletion"]);
     return listing;
 }
 
@@ -1132,6 +1186,8 @@ const char *sort_label(Sort sort)
 {
     switch (sort)
     {
+    case Sort::added:
+        return tr("Recently added");
     case Sort::title:
         return tr("Title A\xE2\x80\x93Z");
     case Sort::title_desc:
@@ -1401,6 +1457,16 @@ std::vector<int> browse(const std::vector<Game> &games, const BrowseFilters &fil
                              if (x.release_date != y.release_date)
                                  return x.release_date > y.release_date;
                              return title < 0;
+                         case Sort::added:
+                         {
+                             // Newest on Orbit first, as the browser's "added" sort.
+                             static const std::string undated;
+                             const std::string &xa = x.releases.empty() ? undated : x.releases.front().added_at;
+                             const std::string &ya = y.releases.empty() ? undated : y.releases.front().added_at;
+                             if (xa != ya)
+                                 return xa > ya;
+                             return title < 0;
+                         }
                          case Sort::size:
                              if (a.size != b.size)
                                  return a.size < b.size;

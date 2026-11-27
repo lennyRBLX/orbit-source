@@ -1,8 +1,8 @@
-# Building Orbit Store 1.9.6
+# Building Orbit Store 1.9.7
 
-Orbit 1.9.6 follows Vikingfile’s move of its file pages to a new address, so Vikingfile downloads open and start again. This source bundle builds the PS5 service and native TV app. Orbit Zero is maintained and packaged separately. See [release notes](https://github.com/saawant12/orbit-store-ps5/releases/tag/v1.9.6) for the user-facing changes.
+Orbit 1.9.7 can free up space for a download and download files from your own links. This source bundle builds the PS5 service and native TV app. Orbit Zero is maintained and packaged separately. See [release notes](https://github.com/saawant12/orbit-store-ps5/releases/tag/v1.9.7) for the user-facing changes.
 
-This source builds the Orbit **1.9.6** service/browser payload and the native TV app **1.13.6** (`PPSA99177`, content version `01.013.006`). The TV app includes the payload built from this tree. Game metadata and external artwork URLs come from the included catalogue snapshot; builds do not fetch game artwork.
+This source builds the Orbit **1.9.7** service/browser payload and the native TV app **1.13.7** (`PPSA99177`, content version `01.013.007`). The TV app includes the payload built from this tree. Game metadata and external artwork URLs come from the included catalogue snapshot; builds do not fetch game artwork.
 
 Requirements: Node.js 22+, Python 3, a host C compiler, OpenSSL development files and Docker. On macOS use the Command Line Tools and `brew install openssl@3`; the build container already supplies Clang and OpenSSL. Run host Python tools through a project virtual environment. Catalogue tools compile a small host helper against OpenSSL; no extra Python packages are required.
 
@@ -82,6 +82,6 @@ docker run --rm --cpus 2 --memory 6g --network none -v "$PWD:/work" -w /work/app
 
 Run tests in a checkout; root development tests are omitted from the release source archive. Native app tests remain with its vendored source. None of these commands contact a console.
 
-From a clean release commit, rebuild both binaries, run the package verification, then `npm run release:package`. The command checks release evidence, version agreement, artifact freshness, package identities and dependency source hashes. It stages both binaries, their checksums, exact source and licence bundle, release notes and both official feeds under `build/release-1.9.6/`. It never uploads or installs anything. Publish feed changes only after their binary URLs are live and their hashes verified.
+From a clean release commit, rebuild both binaries, run the package verification, then `npm run release:package`. The command checks release evidence, version agreement, artifact freshness, package identities and dependency source hashes. It stages both binaries, their checksums, exact source and licence bundle, release notes and both official feeds under `build/release-1.9.7/`. It never uploads or installs anything. Publish feed changes only after their binary URLs are live and their hashes verified.
 
-For local preparation before the console smoke check, use `npm run release:package -- --review`. This creates `build/review-1.9.6/` with the remaining release gates recorded; it does not publish or waive them.
+For local preparation before the console smoke check, use `npm run release:package -- --review`. This creates `build/review-1.9.7/` with the remaining release gates recorded; it does not publish or waive them.

@@ -905,6 +905,40 @@ int files_delete_download(const Job *job, char *error, size_t cap) {
     cJSON_Delete(items); storage_release();
     return rc;
 }
+/* Free up space: a completed download's archive kept beside the files it unpacked.
+ * The name must be the job's own archive, a plain file on its drive that nothing is
+ * using; -1 when there is none to delete. */
+static int kept_archive(const Job *job, int dir, struct stat *st) {
+    if (!job->archive_kept || !job->output[0] || !strcmp(job->output, job->filename) ||
+        !extract_name_ok(job->filename) || strchr(job->filename, '/') || job->filename[0] == '.') return -1;
+    char path[1100]; snprintf(path, sizeof path, "%s/homebrew/%s", job->root, job->filename);
+    Guards guards = guards_collect();
+    bool busy = *locked(&guards, path);
+    guards_free(&guards);
+    if (busy || fstatat(dir, job->filename, st, AT_SYMLINK_NOFOLLOW) || !S_ISREG(st->st_mode) ||
+        st->st_dev != job->device || st->st_nlink != 1) return -1;
+    return 0;
+}
+int64_t files_kept_archive_size(const Job *job) {
+    int dir = storage_open(job);
+    if (dir < 0) return -1;
+    struct stat st;
+    int rc = kept_archive(job, dir, &st);
+    close(dir);
+    return rc ? -1 : (int64_t)st.st_size;
+}
+int files_delete_kept_archive(const Job *job, int64_t *freed, char *error, size_t cap) {
+    if (!storage_claim()) { copy_text(error, cap, "Another file operation is running. Wait for it to finish, or cancel it."); return -1; }
+    int dir = storage_open(job), rc = -1;
+    struct stat st;
+    if (dir < 0) copy_text(error, cap, "Reconnect the original drive before deleting downloaded files.");
+    else if (kept_archive(job, dir, &st)) copy_text(error, cap, "The kept archive changed or is in use. It was kept.");
+    else if (unlinkat(dir, job->filename, 0)) copy_text(error, cap, "The kept archive could not be deleted.");
+    else { rc = 0; *freed += (int64_t)st.st_size; fsync(dir); }
+    if (dir >= 0) close(dir);
+    storage_release();
+    return rc;
+}
 static int run_delete(char *error, size_t cap) {
     char parent[PATH_LIMIT];
     const char *leaf;

@@ -1,6 +1,6 @@
 # Orbit Store for TV (native app)
 
-The native TV app **1.13.6** is included with **Orbit Store 1.9.6**. Its FFPKG bundles the matching **1.9.6 service**.
+The native TV app **1.13.7** is included with **Orbit Store 1.9.7**. Its FFPKG and its folder ZIP (for Kraken Mount) bundle the matching **1.9.7 service**.
 
 A full-screen PS5 app for Orbit's storefront, drawn by the GPU instead of
 the console browser. It is a client of the Orbit backend payload. Downloads,
@@ -333,7 +333,7 @@ versions, the linked WebP and C++ runtime sources, and their notices. See
 
 ### Orbit Zero
 
-Use native app **1.13.6**, running service **1.9.6** and the shared Orbit Zero **1.9.6** for the current controls and 26 interface languages. The FFPKG and Zero’s installers include service 1.9.6, and Zero fetches newer compatible services from the official feed; an explicit ELF can also be selected for an offline update. Zero integration originally required service 1.0.0, and PS4 browsing required service 1.1.0/native app 1.4.0; those are historical minimums, not the current versions.
+Use native app **1.13.7**, running service **1.9.7** and the shared Orbit Zero **1.9.7** for the current controls and 26 interface languages. The FFPKG and Zero’s installers include service 1.9.7, and Zero fetches newer compatible services from the official feed; an explicit ELF can also be selected for an offline update. Zero integration originally required service 1.0.0, and PS4 browsing required service 1.1.0/native app 1.4.0; those are historical minimums, not the current versions.
 
 Pair Orbit Zero on the computer with the running, matching Orbit ELF. In the TV app, open **App settings → Devices → Orbit Zero → Enable Orbit Zero**. The native storefront then uses the computer's catalogue and artwork; Download follows the computer's saved preference. Downloads shows the internet rate and the transfer rate to the PS5 separately. Keep the computer and Orbit Zero running while it transfers. Vikingfile verification opens on the computer, with a prompt to continue there. Turning this mode off affects new downloads; existing computer transfers retain their original route.
 

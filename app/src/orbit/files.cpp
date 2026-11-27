@@ -2015,18 +2015,28 @@ void LibraryScreen::files_drive_groups(pano::Page &page, bool tools) const
     pano::Group storage;
     storage.title = pano::lower(tr("Storage"));
     storage.pattern = pano::Pattern::small;
-    // The scan, for games Orbit didn't add itself; sizes are measured on their own.
-    if (!library.can("rescan"))
+    // The scan, for games Orbit didn't add itself (sizes are measured on their own),
+    // and Free up space.
+    const bool scan = library.can("rescan");
+    const bool space = fullest_drive() != nullptr;
+    if (!scan && !space)
         return;
-    storage.size = 1;
-    storage.fill = [this](int, pano::Tile &tile)
+    storage.size = (scan ? 1 : 0) + (space ? 1 : 0);
+    storage.fill = [this, scan](int i, pano::Tile &tile)
     {
         const LibrarySnapshot &lib = ctx_.store.state().library;
         tile.has_icon = true;
-        tile.key = "scan";
-        tile.icon = icons::Icon::scan;
-        tile.label = tr("Scan for games");
-        tile.off = lib.working();
+        if (scan && i == 0)
+        {
+            tile.key = "scan";
+            tile.icon = icons::Icon::scan;
+            tile.label = tr("Scan for games");
+            tile.off = lib.working();
+            return;
+        }
+        tile.key = "space";
+        tile.icon = icons::Icon::drive;
+        tile.label = tr("Free up space");
     };
     page.groups.push_back(std::move(storage));
 

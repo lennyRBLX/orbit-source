@@ -573,6 +573,8 @@ std::vector<Scenario> scenarios()
          tap(Action::confirm), move(Direction::down), pause(0.6f, "pn-browse-source"), tap(Action::confirm),
          tap(Action::back), tap(Action::back), pause(0.8f, "pn-browse-results"), tap(Action::west), move(Direction::down), move(Direction::down),
          move(Direction::down), move(Direction::down), move(Direction::down), move(Direction::down), move(Direction::down),
+         // Metacritic, Playtime and Play style came before Region, Size and Sort.
+         move(Direction::down), move(Direction::down), move(Direction::down), move(Direction::down),
          tap(Action::confirm), pause(0.6f, "pn-browse-sort"),
          tap(Action::back), tap(Action::back), move(Direction::right), move(Direction::right), move(Direction::right),
          move(Direction::right), move(Direction::right), move(Direction::right), pause(0.8f, "pn-browse-favourites")}});
@@ -969,6 +971,129 @@ std::vector<Scenario> scenarios()
           tap(Action::confirm), pause(1.2f, "settings-service-saved"), tap(Action::confirm),
           pause(0.8f, "settings-restart-confirm"), move(Direction::left), tap(Action::confirm),
           pause(0.6f, "settings-restarting"), pause(40.0f, "settings-restarted")}});
+    // Free up space and Download from links in each look (ORBIT_INTERFACE picks it;
+    // Cinema draws Store's Library and Downloads). Mode::full: no drive has room for
+    // Echo Valley, Frostline is paused without room to unpack and Moonfall.zip's link expired.
+    {
+        const char *env = std::getenv("ORBIT_INTERFACE");
+        const std::string look = env != nullptr ? env : "store";
+        const auto times = [](std::vector<Step> &steps, Direction direction, int count)
+        {
+            for (int i = 0; i < count; ++i)
+                steps.push_back(move(direction, 0.15f));
+        };
+        // The game page: Download opens Not enough space, then the list; tick the last
+        // game, Delete and download, confirm, and watch it delete and start.
+        std::vector<Step> game{run(1.5f, [](orbit::App &app) { app.open_game("echo-valley"); }),
+                               pause(1.2f, "space-game")};
+        if (look == "cinema")
+        {
+            game.push_back(tap(Action::confirm));
+            game.push_back(pause(0.8f, "space-game-sheet"));
+        }
+        else if (look == "store")
+        {
+            game.push_back(move(Direction::down, 0.6f));
+            game.push_back(move(Direction::down));
+            game.push_back(tap(Action::confirm));
+            game.push_back(pause(0.8f, "space-game-options"));
+        }
+        game.push_back(tap(Action::confirm));
+        game.push_back(pause(1.2f, "space-shortfall"));
+        game.push_back(tap(Action::confirm));
+        game.push_back(pause(1.2f, "space-list"));
+        game.push_back(move(Direction::up));
+        game.push_back(tap(Action::confirm));
+        game.push_back(pause(0.6f, "space-ticked"));
+        game.push_back(move(Direction::down));
+        game.push_back(tap(Action::confirm));
+        game.push_back(pause(0.6f, "space-confirm"));
+        game.push_back(tap(Action::confirm));
+        game.push_back(pause(0.9f, "space-deleting"));
+        game.push_back(pause(4.0f, "space-after"));
+        list.push_back({"space-game", Mode::full, false, game});
+
+        // Library: Free up space starts on the fullest drive.
+        std::vector<Step> library{run(1.5f, [](orbit::App &app) { app.show_tab(orbit::tab::library); }),
+                                  pause(1.5f, "space-library")};
+        if (look == "crossbar")
+            times(library, Direction::down, 30);
+        else if (look == "panorama")
+        {
+            times(library, Direction::right, 4); // to Storage's Scan for games, Free up space under it
+            library.push_back(move(Direction::down));
+        }
+        else
+            times(library, Direction::right, 3); // from Games, past Scan for games
+        library.push_back(pause(1.2f, "space-library-control"));
+        library.push_back(tap(Action::confirm));
+        library.push_back(pause(1.5f, "space-library-list"));
+        list.push_back({"space-library", Mode::full, false, library});
+
+        // Downloads: Frostline (job103) is paused without room to unpack.
+        std::vector<Step> downloads{run(1.5f, [](orbit::App &app) {
+                                        app.show_tab(orbit::tab::downloads);
+                                        app.downloads().show_job("job103");
+                                    }),
+                                    pause(1.2f, "space-downloads")};
+        // The menus list Resume, Cancel download, Free up space; Store's buttons too.
+        const bool menu_look = look == "crossbar" || look == "panorama";
+        if (look == "crossbar")
+            downloads.push_back(tap(Action::confirm));
+        else if (look == "panorama")
+            downloads.push_back(tap(Action::menu));
+        if (menu_look)
+            times(downloads, Direction::down, 2);
+        else
+            times(downloads, Direction::right, 2);
+        downloads.push_back(pause(0.8f, "space-downloads-actions"));
+        downloads.push_back(tap(Action::confirm));
+        downloads.push_back(pause(1.5f, "space-downloads-form"));
+        list.push_back({"space-downloads", Mode::full, false, downloads});
+
+        // Download from links, and Replace link on Moonfall.zip (job106).
+        std::vector<Step> links{run(1.5f, [](orbit::App &app) {
+                                    app.show_tab(orbit::tab::downloads);
+                                    app.downloads().show_job("job106");
+                                }),
+                                pause(1.2f, "links-failed")};
+        if (look == "crossbar")
+            links.push_back(tap(Action::confirm));
+        else if (look == "panorama")
+            links.push_back(tap(Action::menu));
+        if (menu_look)
+            links.push_back(move(Direction::down));
+        else
+            times(links, Direction::right, 1);
+        links.push_back(pause(0.8f, "links-failed-actions"));
+        links.push_back(tap(Action::confirm));
+        links.push_back(pause(1.0f, "links-replace-form"));
+        list.push_back({"links", Mode::full, false, links});
+
+        // Download from links with nothing picked: Store's pill after the views, the
+        // row after Crossbar's folders, Panorama's tile in the active group.
+        std::vector<Step> fresh{run(1.5f, [](orbit::App &app) {
+                                    app.show_tab(orbit::tab::downloads);
+                                    app.downloads().show_job("job103");
+                                }),
+                                pause(1.2f, "links-new-page")};
+        if (look == "crossbar")
+            times(fresh, Direction::down, 4);
+        else if (look == "panorama")
+        {
+            fresh.push_back(move(Direction::up)); // Frostline to Tidewater, then past Starfall Rally
+            times(fresh, Direction::right, 2);
+        }
+        else
+        {
+            times(fresh, Direction::up, 4); // Frostline is the fourth row; then past the views
+            times(fresh, Direction::right, 4);
+        }
+        fresh.push_back(pause(0.8f, "links-new-control"));
+        fresh.push_back(tap(Action::confirm));
+        fresh.push_back(pause(1.0f, "links-new-form"));
+        list.push_back({"links-new", Mode::full, false, fresh});
+    }
     return list;
 }
 

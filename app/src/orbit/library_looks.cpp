@@ -107,6 +107,8 @@ std::vector<LibraryScreen::XbEntry> LibraryScreen::crossbar_entries() const
         out.push_back({'S', 0});
         if (library.can("rescan"))
             out.push_back({'c', 0});
+        if (fullest_drive() != nullptr)
+            out.push_back({'f', 0});
     }
     return out;
 }
@@ -151,7 +153,7 @@ xb::List LibraryScreen::crossbar_list() const
         }
         case 'j':
         {
-            // The copy or move under way, pinned at the top.
+            // The copy, move or deletion (Free up space) under way, pinned at the top.
             const StorageJob &job = library.storage_job;
             std::string title = job.title_id;
             for (const LibraryGame &g : library.games)
@@ -159,8 +161,10 @@ xb::List LibraryScreen::crossbar_list() const
                     title = g.title;
             row.key = "job";
             row.primary = true;
-            row.icon = job.operation == "move" ? icons::Icon::move : icons::Icon::copy;
-            row.title = job.operation == "move" ? tr("Move {title}", {{"title", title}}) : tr("Copy {title}", {{"title", title}});
+            row.icon = job.operation == "move" ? icons::Icon::move : job.operation == "delete" ? icons::Icon::trash : icons::Icon::copy;
+            row.title = job.operation == "move"     ? tr("Move {title}", {{"title", title}})
+                        : job.operation == "delete" ? tr("Deleting {title}\xE2\x80\xA6", {{"title", title}})
+                                                    : tr("Copy {title}", {{"title", title}});
             if (!job.destination.empty())
                 row.sub = tr("To {path}", {{"path", job.destination}});
             const float progress = job.state == "completed" ? 1.0f
@@ -256,6 +260,16 @@ xb::List LibraryScreen::crossbar_list() const
                       tr("{size} free", {{"size", format_bytes(free)}});
             break;
         }
+        case 'f':
+            if (const Drive *fullest = fullest_drive())
+            {
+                row.key = "space";
+                row.icon = icons::Icon::drive;
+                row.title = tr("Free up space");
+                row.sub = i18n::place(fullest->label) + " \xC2\xB7 " +
+                          tr("{size} free", {{"size", format_bytes(fullest->free_bytes)}});
+            }
+            break;
         case 'c':
             row.key = "scan";
             row.icon = icons::Icon::scan;
@@ -665,6 +679,8 @@ Intent LibraryScreen::update_crossbar(const InputFrame &input, float dt, Feedbac
                 error_.clear();
                 feedback.play(hui::audio::Cue::modal_open);
             }
+            else if (key == "space")
+                open_free_space(feedback);
             else if (key == "mount" && game != nullptr)
             {
                 if (!game->mounted)
@@ -1013,7 +1029,7 @@ pano::Page LibraryScreen::panorama_page() const
             tile.dim = 0.3f;
             tile.label_size = 26.0f;
             // Keep the header clear of the large percentage. Full paths remain in Details.
-            tile.kicker = jj.operation == "move" ? tr("Move") : tr("Copy");
+            tile.kicker = jj.operation == "move" ? tr("Move") : jj.operation == "delete" ? tr("Delete") : tr("Copy");
             for (const LibraryGame &g : now.library.games)
                 if (g.title_id == jj.title_id)
                     tile.label = g.title;
@@ -1462,6 +1478,8 @@ Intent LibraryScreen::update_panorama(const InputFrame &input, float dt, Feedbac
                 panorama_run('S', game, feedback, input);
             else if (key == "scan")
                 panorama_run('c', game, feedback, input);
+            else if (key == "space")
+                open_free_space(feedback);
             else if (key == "job:cancel")
                 panorama_run('x', game, feedback, input);
             else if (key == "job:details" || key == "job")

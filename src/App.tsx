@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useOrbit } from "./useOrbit";
 import { useController } from "./controller";
 import { Backdrop, GameTile, Icon, Modal, StorageRows } from "./components";
+import { FreeSpaceHost } from "./FreeSpace";
 import { GameRail, type RailMemory } from "./GameRail";
 import { placeOf, restorePlace, type Place } from "./returnPlace";
 import { Details } from "./Details";
@@ -687,6 +688,7 @@ export default function App() {
           onChange={(value) => filter("sort", value)}
           options={[
             { value: defaultSort, label: t(addonsPage ? "Recently added" : "Newest first") },
+            ...(!addonsPage ? [{ value: "added", label: t("Recently added") }] : []),
             { value: "title", label: t("Title A–Z") },
             { value: "title-desc", label: t("Title Z–A") },
             { value: "size", label: t("Smallest download") },
@@ -788,6 +790,7 @@ export default function App() {
       openLibrary={(job) => openLibrary({ titleId: job.titleId, path: job.path, title: job.title })}
       concurrent={orbit.system?.paired ? orbit.system.concurrentDownloads : undefined}
       deletePackages={orbit.system?.deletePackages === true}
+      preferredDrive={orbit.system?.preferredStorage}
     />
   );
   // Before games arrive (opening, unreachable, no sources), in every interface.
@@ -1241,6 +1244,7 @@ export default function App() {
           {storagePanel}
         </Modal>
       )}
+      {orbit.system?.paired && <FreeSpaceHost drives={orbit.storage} refresh={() => orbit.refresh()} />}
       {zeroOpen && (
         <Modal title="Orbit Zero" close={() => setZeroOpen(false)} className="storage-modal orbit-zero-modal">
           {zeroPanel}

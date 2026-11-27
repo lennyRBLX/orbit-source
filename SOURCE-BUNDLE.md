@@ -1,8 +1,8 @@
 # Orbit Store source and licence bundle
 
-The **1.9.6** release supplies `orbit-store-1.9.6-source-bundle.zip`. Its `orbit-store-1.9.6-source.tar.gz` builds both service **1.9.6** and native app **1.13.6**. Build the service first, then include that ELF in the FFPKG. `SOURCES.json` identifies the exact release source snapshot; later documentation edits on main do not change the published binaries or their corresponding source archive.
+The **1.9.7** release supplies `orbit-store-1.9.7-source-bundle.zip`. Its `orbit-store-1.9.7-source.tar.gz` builds both service **1.9.7** and native app **1.13.7**. Build the service first, then include that ELF in the FFPKG. `SOURCES.json` identifies the exact release source snapshot; later documentation edits on main do not change the published binaries or their corresponding source archive.
 
-This bundle supplies the application source for both `orbit_store.elf` and `PPSA99177.ffpkg`, plus the corresponding sources and notices for their copyleft components and other linked libraries. `SOURCES.json` records the exact application source tree and its parent or release commit and every upstream archive's URL and SHA-256. `SOURCE-SHA256SUMS` covers every source-bundle input.
+This bundle supplies the application source for `orbit_store.elf`, `PPSA99177.ffpkg` and the same app folder in `PPSA99177.zip`, plus the corresponding sources and notices for their copyleft components and other linked libraries. `SOURCES.json` records the exact application source tree and its parent or release commit and every upstream archive's URL and SHA-256. `SOURCE-SHA256SUMS` covers every source-bundle input.
 
 Catalogue snapshots are included as `catalog/games.enc`, `catalog/releases.enc`, `catalog/addons.enc` and `catalog/catalog.enc`. All readers, required decoding material and build tools are included, so the source can build and modify the application and catalogue. See [BUILDING.md](BUILDING.md) for compiler and OpenSSL prerequisites.
 

@@ -161,6 +161,10 @@ export interface Job extends AddonIdentity {
   error: string;
   verification: string;
   canRefreshLink?: boolean;
+  // Downloads from a link the user pasted (sourceId "link"): its host, never the link.
+  sourceId?: "link";
+  linkHost?: string;
+  canReplaceLink?: boolean;
   compression?: string;
   canEnterArchivePassword?: boolean;
   extracted?: number;

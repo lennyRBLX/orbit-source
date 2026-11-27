@@ -27,6 +27,8 @@ const commandGlyph: Record<JobCommand, GlyphName> = {
   "cancel-dialog": "close",
   password: "key",
   "refresh-link": "link",
+  "replace-link": "link",
+  "free-space": "drive",
   "move-up": "up",
   "move-down": "arrowDown",
   remove: "trash",
@@ -49,6 +51,7 @@ export function CrossbarDownloads({
   password,
   clear,
   browse,
+  addLinks,
   openLibrary,
   dialogs,
 }: {
@@ -68,6 +71,8 @@ export function CrossbarDownloads({
   password: (job: Job) => void;
   clear: () => void;
   browse: () => void;
+  // Opens Download from links.
+  addLinks: () => void;
   openLibrary?: (job: Job) => void;
   dialogs: ReactNode;
 }) {
@@ -117,6 +122,7 @@ export function CrossbarDownloads({
           ? [status, job.error && t(job.error)].filter(Boolean).join(" · ")
           : [
               release ? `${release.provider} · ${formatLabel(release)}` : "",
+              job.sourceId === "link" ? job.linkHost || t("Your link") : "",
               job.delivery === "torbox" ? t("via TorBox") : "",
               drive ? placeName(drive.label) : job.storageId,
               lost ? t("Reconnect this drive") : "",
@@ -264,9 +270,25 @@ export function CrossbarDownloads({
           ),
         }
       : null;
+  // Active ends with Download from links, as a row like the folders.
+  const linksRow: XbRow = {
+    key: "add-links",
+    activate: addLinks,
+    render: () => (
+      <>
+        <span className="xb-row-icon">
+          <Glyph name="link" size={22} />
+        </span>
+        <span className="xb-row-text">
+          <span className="xb-row-title">{t("Download from links")}</span>
+          <span className="xb-row-sub">{t("Paste links to files that aren't in the catalogue.")}</span>
+        </span>
+      </>
+    ),
+  };
   const rows: XbRow[] =
     view === "Active"
-      ? [...list.map(jobRow), ...folders.map(folderRow)]
+      ? [...list.map(jobRow), ...folders.map(folderRow), linksRow]
       : list.length
         ? [...list.map(jobRow), ...(clearRow ? [clearRow] : [])]
         : [

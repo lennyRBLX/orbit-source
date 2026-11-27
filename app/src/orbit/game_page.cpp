@@ -88,7 +88,7 @@ int GamePage::addon_count() const {
 }
 std::string GamePage::addon_label() const {return tr("Add-ons ({count})", {{"count", i18n::count(addon_count())}});}
 
-GamePage::GamePage(Context &context) : Screen(context) {}
+GamePage::GamePage(Context &context) : Screen(context), space_(context) {}
 
 namespace
 {
@@ -208,7 +208,9 @@ bool GamePage::primary_enabled(const Release &release, const Offer &now) const
     // Viewing/cancelling an existing session must remain possible after its
     // selected drive disconnects. This action never creates another session.
     if (!torbox_ && release.browser_available && state.browser.active) return true;
-    if (now.drive == nullptr || !now.plan.enough || state.system.platform == "desktop") return false;
+    if (now.drive == nullptr || state.system.platform == "desktop") return false;
+    // Too little room: Free up space opens first (an older service can't free any).
+    if (!now.plan.enough && state.system.space_protocol < 1) return false;
     if (torbox_) return state.debrid.supports(release);
     return !release.browser_available || (state.have_browser && state.browser.available &&
            state.link == Link::online && !ctx_.store.browser_action().busy);
@@ -462,7 +464,7 @@ GamePage::Layout GamePage::compose(hui::gfx::DrawList *list, Sheet sheet, bool f
         { control(Slot::again,0,{116,y,450,58},tr("Download another copy"));y+=80; }
         if (now.collection.job && now.collection.job->status == "complete")
         { paragraph(tr("Download history records a completed transfer. Find it in Library to check its current location."),116,y,width_notes,20);y+=16; }
-        if (now.show_download && (!now.drive || !now.plan.enough))
+        if (now.show_download && (!now.drive || (!now.plan.enough && state.system.space_protocol < 1)))
         {
             paragraph(!now.drive ? tr("Connect a writable drive to your PS5.") :
                 tr("Not enough space after unfinished downloads. Free space or cancel an item in Downloads."),116,y,width_notes);
@@ -649,26 +651,74 @@ Intent GamePage::activate(const Control &control,const Game &game,const Release 
         {intent.kind=Intent::Kind::show_job;intent.id=now.collection.job->id;}
         else if(!download_again_ && now.collection.kind==CollectionState::Kind::library && now.collection.library)
         {intent.kind=Intent::Kind::show_library;intent.id=now.collection.library->title_id;intent.detail=now.collection.library->source_key;}
-        else if(release.browser_available && !torbox_)
-        {
-            error_.clear();
-            remember_choice(release);
-            if (!state.browser.active) ctx_.store.start_browser(release.id,now.drive->id);
-            intent.kind=Intent::Kind::provider_browser;
-        }
+        else if(!now.plan.enough && !(release.browser_available && !torbox_ && state.browser.active))
+            open_free_space(release,now);
         else
-        {
-            error_.clear();waiting_=true;action_serial_=ctx_.store.action().serial;
-            remember_choice(release);
-            ctx_.store.download(release.id,now.drive->id,torbox_);
-        }
+            intent=start_download(release,now.drive?now.drive->id:std::string());
         break;
     }
     return intent;
 }
 
+Intent GamePage::start_download(const Release &release, const std::string &drive_id)
+{
+    Intent intent;
+    error_.clear();
+    remember_choice(release);
+    if (release.browser_available && !torbox_)
+    {
+        if (!ctx_.store.state().browser.active)
+            ctx_.store.start_browser(release.id, drive_id);
+        intent.kind = Intent::Kind::provider_browser;
+        return intent;
+    }
+    waiting_ = true;
+    action_serial_ = ctx_.store.action().serial;
+    ctx_.store.download(release.id, drive_id, torbox_);
+    return intent;
+}
+
+void GamePage::open_free_space(const Release &release, const Offer &now)
+{
+    const auto &state = ctx_.store.state();
+    FreeSpaceForm::Request request;
+    request.storage_id = now.drive->id;
+    request.size_bytes = release.size_bytes;
+    // The projected free space the download needs, as plan_space() counts it.
+    request.need_bytes = (now.plan.planned ? 0.0 : release.size_bytes) + kSpaceMargin;
+    request.then = FreeSpaceForm::Then::download;
+    for (const Drive &d : state.drives)
+        if (d.id != now.drive->id && plan_space(release, d, state.jobs).enough)
+            request.others.push_back(d.id);
+    space_release_ = release.id;
+    space_drive_ = now.drive->id;
+    error_.clear();
+    space_.open(std::move(request));
+}
+
 Intent GamePage::update(const InputFrame &input,float dt,Feedback &feedback,bool focused)
 {
+    if (space_.active())
+    {
+        // Free up space, over every look: once there's room, the download starts.
+        const FreeSpaceForm::Result result = focused ? space_.update(input, dt, feedback) : FreeSpaceForm::Result::none;
+        if (result != FreeSpaceForm::Result::freed && result != FreeSpaceForm::Result::use_drive)
+            return {};
+        const Game *game = ctx_.store.state().game(game_id_);
+        if (game == nullptr || game->releases.empty())
+            return {};
+        const Release &release =
+            game->releases[static_cast<std::size_t>(std::clamp(option_, 0, static_cast<int>(game->releases.size()) - 1))];
+        if (release.id != space_release_)
+            return {};
+        const std::string target = result == FreeSpaceForm::Result::use_drive ? space_.drive() : space_drive_;
+        if (result == FreeSpaceForm::Result::use_drive)
+            drive_id_ = target;
+        for (const Drive &d : ctx_.store.state().drives)
+            if (d.id == target)
+                return start_download(release, target);
+        return {};
+    }
     ev_follow();
     if (ev_open_ && !ev_sent_ && ev_plan().rows.empty())
     {
@@ -797,6 +847,12 @@ Intent GamePage::update(const InputFrame &input,float dt,Feedback &feedback,bool
 
 void GamePage::draw(Frame &frame,bool focused) const
 {
+    draw_look(frame, focused);
+    space_.draw(frame);
+}
+
+void GamePage::draw_look(Frame &frame,bool focused) const
+{
     if (look::is(look::Interface::crossbar))
     {
         draw_crossbar(frame);
@@ -875,6 +931,8 @@ void GamePage::draw(Frame &frame,bool focused) const
 }
 std::vector<hui::ui::Hint> GamePage::hints() const
 {
+    if (space_.active())
+        return space_.hints();
     if (look::is(look::Interface::cinema))
         return cinema_hints();
     if (look::is(look::Interface::panorama))
@@ -924,7 +982,7 @@ std::vector<std::string> GamePage::situation(const Release &release, const Offer
         notes.push_back(tr("In your Library on {location}.", {{"location", i18n::place(now.collection.library->location)}}));
     if (now.collection.job != nullptr && now.collection.job->status == "complete")
         notes.push_back(tr("Download history records a completed transfer. Find it in Library to check its current location."));
-    if (now.show_download && (now.drive == nullptr || !now.plan.enough))
+    if (now.show_download && (now.drive == nullptr || (!now.plan.enough && state.system.space_protocol < 1)))
         notes.push_back(now.drive == nullptr ? tr("Connect a writable drive to your PS5.")
                                              : tr("Not enough space after unfinished downloads. Free space or cancel an item in Downloads."));
     if (!error_.empty())
@@ -1646,7 +1704,7 @@ void GamePage::draw_cinema(Frame &frame) const
         const ui::Rect card{x, y + 22.0f, width, 36.0f + 28.5f * static_cast<float>(n)};
         out.rounded_rect(card, 20.0f, ui::Color::rgb(0xffffff, 0.06f));
         out.bordered_rect(card, 20.0f, ui::Color{0, 0, 0, 0}, 1.0f, ui::Color::rgb(0xffffff, 0.1f));
-        const bool warn = now.show_download && (now.drive == nullptr || !now.plan.enough);
+        const bool warn = now.show_download && (now.drive == nullptr || (!now.plan.enough && ctx_.store.state().system.space_protocol < 1));
         ui::paragraph(out, type.regular, notes, card.x + 22.0f, card.y + 18.0f + 14.25f + 6.65f, 19.0f, width - 44.0f, 28.5f,
                       warn ? cn::kWarn : cn::kInk, 3);
         return card.y + card.h;
@@ -2043,7 +2101,7 @@ pano::Page GamePage::panorama_page() const
     std::string note;
     for (const std::string &n : situation(release, now))
         note += (note.empty() ? "" : " ") + n;
-    const bool warn = !error_.empty() || (now.show_download && (now.drive == nullptr || !now.plan.enough));
+    const bool warn = !error_.empty() || (now.show_download && (now.drive == nullptr || (!now.plan.enough && ctx_.store.state().system.space_protocol < 1)));
     std::string meta = game->genre.empty() ? std::string() : i18n::genre(game->genre);
     if (game->release_date.size() >= 4)
         meta += (meta.empty() ? "" : " \xC2\xB7 ") + game->release_date.substr(0, 4);

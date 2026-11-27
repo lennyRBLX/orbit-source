@@ -54,6 +54,8 @@ export type JobCommand =
   | "cancel-dialog"
   | "password"
   | "refresh-link"
+  | "replace-link"
+  | "free-space"
   | "move-up"
   | "move-down"
   | "remove"
@@ -64,6 +66,11 @@ export interface JobAction {
   label: string; // untranslated, for t()
   disabled: boolean;
   primary?: boolean;
+}
+
+// Paused without room to unpack: Free up space on its drive, then it resumes.
+export function unpackShort(job: Job) {
+  return job.status === "paused" && job.error.startsWith("Not enough free space to unpack");
 }
 
 // The same buttons, in the same order and with the same conditions, as a row
@@ -95,7 +102,9 @@ export function jobActions(job: Job, { busy, drives, queued, power }: { busy: bo
       disabled: busy,
     });
   }
+  if (unpackShort(job) && drive) actions.push({ command: "free-space", label: /* i18n */ "Free up space", disabled: busy });
   if (job.canRefreshLink) actions.push({ command: "refresh-link", label: /* i18n */ "Refresh download link", disabled: busy });
+  if (job.canReplaceLink) actions.push({ command: "replace-link", label: /* i18n */ "Replace link", disabled: busy });
   if (waiting(job)) {
     const position = queued.findIndex((q) => q.id === job.id);
     actions.push({ command: "move-up", label: /* i18n */ "↑ Move up", disabled: busy || position <= 0 });

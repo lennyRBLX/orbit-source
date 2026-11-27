@@ -3266,6 +3266,40 @@ html.pointer .debrid-settings input:focus {
 .archive-password-form label { display: grid; gap: .6rem; }
 .archive-password-form input { width: 100%; min-width: 0; }
 .archive-password-form .actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+/* Download from links */
+.add-links-form textarea { width: 100%; min-width: 0; resize: vertical; font-size: .95rem; line-height: 1.5; word-break: break-all; }
+/* The form's own gap spaces its lines; a paragraph's margins would add to it. */
+.modal .add-links-form > p { margin-bottom: 0; }
+.add-links-form .fine { margin-top: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.link-results { display: grid; gap: .6rem; max-height: 46vh; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.link-result { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem 1rem; padding: .8rem 1rem; border-radius: 12px; background: #ffffff0d; }
+.link-result strong { font-weight: 500; overflow-wrap: anywhere; }
+.link-result small { grid-column: 1 / -1; color: var(--text-2); overflow-wrap: anywhere; }
+.link-result small.job-error { color: inherit; }
+/* Free up space */
+.free-space-form .space-summary { margin: 0; overflow-wrap: anywhere; }
+.free-space-form .fine { margin: 0; color: var(--text-2); }
+.space-meter { display: grid; gap: .5rem; }
+.space-meter-bar { position: relative; height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.space-meter-bar > span { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--action); transition: width .2s; }
+.space-meter.met .space-meter-bar > span { background: var(--ok); }
+.space-group h3 { margin: 0 0 .5rem; font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-2); }
+.space-items { display: grid; gap: .45rem; max-height: 34vh; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.space-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .9rem; width: 100%; min-height: 0; padding: .7rem 1rem; border-radius: 12px; background: #ffffff0d; color: var(--text); text-align: start; font: inherit; }
+.space-item[aria-pressed="true"] { background: #ffffff1f; }
+.space-check { display: grid; place-items: center; width: 1.3rem; height: 1.3rem; border: 1px solid var(--text-2); border-radius: 50%; }
+.space-item[aria-pressed="true"] .space-check { background: var(--text); border-color: var(--text); color: var(--night-0); }
+.space-check svg { width: .9rem; height: .9rem; }
+.space-item-text { display: grid; gap: .15rem; min-width: 0; }
+.space-item-text strong { font-weight: 500; overflow-wrap: anywhere; }
+.space-item-text small { color: var(--text-2); overflow-wrap: anywhere; }
+.space-item-size { color: var(--text-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.space-confirm .space-item { grid-template-columns: minmax(0, 1fr) auto; }
+.space-notice { margin: 0; color: var(--ok); }
+.add-links-button svg,
+.empty-actions svg { width: 18px; height: 18px; margin-inline-end: 6px; vertical-align: -4px; }
+.empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: .8rem; margin-top: .8rem; }
+.empty-actions .primary { margin-top: 0; }
 
 .download-retry-settings { margin-block: 24px; }
 .download-retry-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; align-items: center; margin-block: 16px; }

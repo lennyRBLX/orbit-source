@@ -436,6 +436,24 @@ TEST(Model, BrowseSortsByTitleDateOrSmallestOption)
     EXPECT_EQ(titles(Sort::size_desc), (std::vector<std::string>{"c", "b", "a"}));
 }
 
+TEST(Model, BrowseSortsGamesByDateAddedToOrbit)
+{
+    // Issue 195: newest on Orbit first, whatever the release date; undated last.
+    std::vector<Release> releases = {make_release("old", "old", "Old", "2026-01-01", 10),
+                                     make_release("new", "new", "New", "2020-01-01", 10),
+                                     make_release("none", "none", "Undated", "2025-01-01", 10)};
+    releases[0].added_at = "2026-10-01T00:00:00Z";
+    releases[1].added_at = "2026-11-20T00:00:00Z";
+    const std::vector<Game> games = group_games(releases);
+    BrowseFilters filters;
+    filters.sort = Sort::added;
+    std::vector<std::string> ids;
+    for (int index : browse(games, filters, {}))
+        ids.push_back(games[static_cast<std::size_t>(index)].id);
+    EXPECT_EQ(ids, (std::vector<std::string>{"new", "old", "none"}));
+    EXPECT_STREQ(sort_label(Sort::added), "Recently added");
+}
+
 TEST(Model, GamePageStartsOnTheFilteredThenLastThenDirectOption)
 {
     const auto option = [](const char *id, const char *source, const char *format, bool page)
@@ -1124,11 +1142,17 @@ TEST(Model, SavedFiltersReadAndSaveEveryFilterAndTheSearch)
          "format":["exFAT"],"tags":["open-world"],"region":"EUR","platform":"ps5","size":"small","collection":"favorites",
          "hideInstalled":true,"sort":"title-desc","addonType":""}},
         {"id":"f0000000000000002","name":"New add-ons","page":"addons","filters":{"sort":"added","addonType":"expansion"}},
+        {"id":"f0000000000000004","name":"New games","page":"games","filters":{"sort":"added"}},
         {"id":"","name":"No ID","page":"games","filters":{}},
         {"id":"f0000000000000003","name":"No filters","page":"games"}])",
                             &value));
     const std::vector<SavedFilter> saved = parse_saved_filters(value);
-    ASSERT_EQ(saved.size(), 2u);
+    ASSERT_EQ(saved.size(), 3u);
+    // On Games, "added" is its own sort (issue 195) and saves back as "added".
+    EXPECT_FALSE(saved[2].addons);
+    EXPECT_EQ(saved[2].filters.sort, Sort::added);
+    ASSERT_TRUE(json::parse(saved_filter_body("New games", false, saved[2].filters), &value));
+    EXPECT_EQ(value["filters"].text("sort"), "added");
     const BrowseFilters &f = saved[0].filters;
     EXPECT_EQ(saved[0].name, "Small PS5");
     EXPECT_FALSE(saved[0].addons);

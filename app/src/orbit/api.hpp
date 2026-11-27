@@ -18,6 +18,17 @@
 namespace orbit::api
 {
 
+// Download from links (GET/POST /api/v1/links): the PS5's check of the last links sent.
+struct LinkCheck
+{
+    std::string host, filename, state, message, job_id; // state: waiting checking queued failed
+};
+struct LinksStatus
+{
+    std::string id, state; // state: idle checking done
+    std::vector<LinkCheck> items;
+};
+
 template <typename T> struct Result
 {
     T value{};
@@ -147,6 +158,11 @@ class Client
     };
     // The operation after the request, or none.
     Result<FileOperation> files_status();
+    // Free up space: what Orbit can delete on a drive, deleting the chosen items
+    // (one deletion at a time on the console), and how that deletion is going.
+    Result<SpaceListing> space_list(const std::string &storage_id);
+    Result<SpaceDeletion> space_delete(const std::string &storage_id, const std::vector<std::string> &ids);
+    Result<SpaceDeletion> space_status();
     Result<FileOperation> files_action(const FileRequest &request);
 
     // ---- settings ----
@@ -168,6 +184,11 @@ class Client
     Result<ArchiveAccount> archive_sign_out();
     // POST /api/v1/viking-pass {action:"forget"}: the new pass state ("none").
     Result<std::string> forget_viking_pass();
+    // Download from links: starts the PS5's check of these links, or of a fresh link for
+    // a paused or failed link download; links_status() follows it.
+    Result<LinksStatus> add_links(const std::vector<std::string> &urls, const std::string &storage_id);
+    Result<LinksStatus> replace_link(const std::string &job_id, const std::string &url);
+    Result<LinksStatus> links_status();
     Result<int> set_download_limit(int limit);
     Result<int> set_download_connections(int connections);
     Result<int> set_download_recovery(int field, int value);

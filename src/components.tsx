@@ -26,7 +26,8 @@ export function Icon({
     | "more"
     | "chevron"
     | "info"
-    | "layers";
+    | "layers"
+    | "link";
 }) {
   return (
     <svg
@@ -85,6 +86,9 @@ export function Icon({
         </>
       ) : name === "layers" ? (
         <path d="M12 4 3.5 8.5 12 13l8.5-4.5zM3.5 12.5 12 17l8.5-4.5M3.5 16.5 12 21l8.5-4.5" />
+      ) : name === "link" ? (
+        // The interface designs' link (Glyph.tsx).
+        <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" />
       ) : name === "close" ? (
         <path d="m6 6 12 12M6 18 18 6" />
       ) : name === "check" ? (

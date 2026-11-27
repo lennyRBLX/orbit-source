@@ -463,6 +463,49 @@ Result<FileOperation> Client::files_status()
     return result;
 }
 
+Result<SpaceListing> Client::space_list(const std::string &storage_id)
+{
+    Result<SpaceListing> result;
+    const http::Response response =
+        send("POST", "/api/v1/space", "{\"action\":\"list\",\"storageId\":" + json::quote(storage_id) + "}");
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (!json::parse(response.body, &value) || !value.is_object() || !value["games"].is_array())
+        result.error = tr("Orbit sent an unreadable status.");
+    else
+        result.value = parse_space_listing(value);
+    return result;
+}
+
+Result<SpaceDeletion> Client::space_delete(const std::string &storage_id, const std::vector<std::string> &ids)
+{
+    std::string body = "{\"action\":\"delete\",\"storageId\":" + json::quote(storage_id) + ",\"ids\":[";
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        body += (i ? "," : "") + json::quote(ids[i]);
+    body += "]}";
+    Result<SpaceDeletion> result;
+    const http::Response response = send("POST", "/api/v1/space", body);
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (json::parse(response.body, &value))
+        result.value = parse_space_deletion(value);
+    return result;
+}
+
+Result<SpaceDeletion> Client::space_status()
+{
+    Result<SpaceDeletion> result;
+    const http::Response response = send("GET", "/api/v1/space");
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (json::parse(response.body, &value))
+        result.value = parse_space_deletion(value);
+    return result;
+}
+
 Result<FileOperation> Client::files_action(const FileRequest &request)
 {
     Result<FileOperation> result;
@@ -1055,6 +1098,63 @@ Result<ArchiveAccount> Client::archive_sign_in(const std::string &email, const s
 Result<ArchiveAccount> Client::archive_sign_out()
 {
     return archive_reply([this]() { return send("POST", "/api/v1/archive-account", "{\"action\":\"sign-out\"}"); });
+}
+
+namespace
+{
+LinksStatus links_from(const json::Value &value)
+{
+    LinksStatus status;
+    status.id = value.text("id");
+    status.state = value.text("state");
+    for (const json::Value &item : value["items"].items())
+        status.items.push_back({item.text("host"), item.text("filename"), item.text("state"), item.text("message"),
+                                item.text("jobId")});
+    return status;
+}
+} // namespace
+
+Result<LinksStatus> Client::add_links(const std::vector<std::string> &urls, const std::string &storage_id)
+{
+    std::string body = "{\"urls\":[";
+    for (std::size_t i = 0; i < urls.size(); ++i)
+        body += (i ? "," : "") + json::quote(urls[i]);
+    body += "],\"storageId\":" + json::quote(storage_id) + "}";
+    Result<LinksStatus> result;
+    const http::Response response = send("POST", "/api/v1/links", body);
+    std::fill(body.begin(), body.end(), '\0');
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (json::parse(response.body, &value))
+        result.value = links_from(value);
+    return result;
+}
+
+Result<LinksStatus> Client::replace_link(const std::string &job_id, const std::string &url)
+{
+    std::string body = "{\"url\":" + json::quote(url) + "}";
+    Result<LinksStatus> result;
+    const http::Response response = send("POST", "/api/v1/downloads/" + job_id + "/replace-link", body);
+    std::fill(body.begin(), body.end(), '\0');
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (json::parse(response.body, &value))
+        result.value = links_from(value);
+    return result;
+}
+
+Result<LinksStatus> Client::links_status()
+{
+    Result<LinksStatus> result;
+    const http::Response response = send("GET", "/api/v1/links");
+    if (fail(response, &result))
+        return result;
+    json::Value value;
+    if (json::parse(response.body, &value))
+        result.value = links_from(value);
+    return result;
 }
 
 Result<std::string> Client::forget_viking_pass()

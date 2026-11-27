@@ -22,6 +22,8 @@ const commandGlyph: Record<JobCommand, GlyphName> = {
   "cancel-dialog": "close",
   password: "key",
   "refresh-link": "link",
+  "replace-link": "link",
+  "free-space": "drive",
   "move-up": "up",
   "move-down": "arrowDown",
   remove: "history",
@@ -48,6 +50,7 @@ export function PanoramaDownloads({
   password,
   clear,
   browse,
+  addLinks,
   openLibrary,
   dialogs,
 }: {
@@ -66,6 +69,8 @@ export function PanoramaDownloads({
   password: (job: Job) => void;
   clear: (view: "Finished" | "Cancelled") => void;
   browse: () => void;
+  // Opens Download from links.
+  addLinks: () => void;
   openLibrary?: (job: Job) => void;
   dialogs: ReactNode;
 }) {
@@ -198,7 +203,8 @@ export function PanoramaDownloads({
         glyph={job.status === "error" ? "warn" : undefined}
         kicker={
           focused && size === "large"
-            ? [extracting ? t("Extracting") : status, release?.provider, release && formatLabel(release)].filter(Boolean).join(" · ")
+            ? [extracting ? t("Extracting") : status, release?.provider, release && formatLabel(release),
+                job.sourceId === "link" && (job.linkHost || t("Your link"))].filter(Boolean).join(" · ")
             : undefined
         }
         title={title}
@@ -258,9 +264,15 @@ export function PanoramaDownloads({
           <span className="pn-kicker">{t("Active")}</span>
           <h2>{t("Nothing in progress")}</h2>
           <p>{t("Choose a game to add it to your queue.")}</p>
-          <button className="primary" onClick={browse}>
-            {t("Browse games")}
-          </button>
+          <div className="pn-hero-actions">
+            <button className="primary" onClick={browse}>
+              {t("Browse games")}
+            </button>
+            <button onClick={addLinks}>
+              <Glyph name="link" size={15} stroke={2} />
+              {t("Download from links")}
+            </button>
+          </div>
         </div>
       )}
       {(active.length > 0 || others.length > 0) && (
@@ -277,6 +289,13 @@ export function PanoramaDownloads({
                   label={tn(concurrent, "{count} download at a time", "{count} downloads at a time")}
                 />
               ) : null}
+              <PnTile
+                tone="dark"
+                glyph="link"
+                title={t("Download from links")}
+                sub={t("Files that aren't in the catalogue")}
+                onClick={addLinks}
+              />
               {projected && (
                 <PnTile
                   tone="dark"
