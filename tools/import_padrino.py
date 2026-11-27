@@ -2,11 +2,13 @@
 """Convert a local Padrino Store checkout to Orbit's bundled community feed."""
 
 import argparse
+from collections import Counter
 import gzip
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from urllib.parse import unquote, urlsplit, urlunsplit
 import zlib
 
@@ -27,7 +29,7 @@ def https(value, limit=2048):
         return None
     try:
         parts = urlsplit(value)
-        if parts.hostname and not parts.username and parts.password is None:
+        if parts.hostname and parts.username is None and (parts.port is None or parts.port > 0):
             return parts
     except ValueError:
         pass
@@ -43,42 +45,60 @@ def provider_page(parts):
             or (host == 'datanodes.to' and re.fullmatch(r'/[A-Za-z0-9]{12}/?', path))
         ))
         or (host == 'archive.org' and path.startswith('/details/'))
+        or (parts.netloc == '1fichier.com' and path == '/' and re.fullmatch(r'[A-Za-z0-9]{20}', parts.query))
     )
 
 
+def supported_filename(name):
+    return (isinstance(name, str) and FILE.search(name) and len(name.encode()) < 160
+            and not re.search(r'[/\\:\x00-\x1f\x7f]|\.\.', name))
+
+
 def option(row):
-    if (row.get('category') not in ('game', None) or row.get('volume') or row.get('unavailableReason')
-            or row.get('health') in ('dead', 'broken', 'unavailable')
-            or any(ZSTD.search(str(row.get(key, ''))) for key in
-                   ('assetCompression', 'compression', 'format', 'source', 'label', 'filename', 'url', 'browserUrl'))):
-        return None
-    filename = row.get('filename') or ''
-    if VOLUME.search(filename):
-        return None
+    if row.get('category') not in ('game', None):
+        return None, 'unsupported_category'
+    filename = row.get('filename')
+    if row.get('volume') or (isinstance(filename, str) and VOLUME.search(filename)):
+        return None, 'multipart'
+    if row.get('unavailableReason') or row.get('health') in ('dead', 'broken', 'unavailable'):
+        return None, 'unavailable'
+    if any(ZSTD.search(str(row.get(key, ''))) for key in
+           ('assetCompression', 'compression', 'format', 'source', 'label', 'filename', 'url', 'browserUrl')):
+        return None, 'unsupported_compression'
+
+    requires_browser = row.get('requiresBrowser')
+    rejection = None
     page = False
     for url in (row.get('browserUrl'), row.get('url')):
         parts = https(url)
-        if not parts or ZSTD.search(unquote(url)):
+        if not parts:
             continue
-        if provider_page(parts) and len(url.split('#', 1)[0].encode()) < 128:
-            if parts.fragment and parts.hostname not in VIKING:
-                continue
+        if ZSTD.search(unquote(url)):
+            rejection = rejection or 'unsupported_compression'
+            continue
+        recognized_page = provider_page(parts)
+        base_url, fragment, _ = url.partition('#')
+        if fragment and (not recognized_page or parts.hostname not in VIKING):
+            continue
+        if recognized_page and len(base_url.encode()) < 128:
             url = urlunsplit(parts._replace(fragment='', path=parts.path.rstrip('/') or '/'))
             page = True
             break
         name = unquote(parts.path.rsplit('/', 1)[-1])
-        if (not row.get('requiresBrowser') and not parts.fragment and FILE.search(name)
-                and not VOLUME.search(name) and not re.search(r'[/\\:\x00-\x1f\x7f]|\.\.', name)
-                and len(name.encode()) < 160):
+        if VOLUME.search(name):
+            rejection = rejection or 'multipart'
+        elif not requires_browser and not fragment and supported_filename(name):
             filename = name
             break
+        elif not recognized_page and requires_browser:
+            rejection = rejection or 'unsupported_provider_page'
+        elif not recognized_page and not FILE.search(name):
+            rejection = rejection or 'opaque_nonfile_url'
     else:
-        return None
+        return None, rejection or 'invalid_url_or_filename'
 
-    if not FILE.search(filename) or len(filename.encode()) >= 160 or re.search(r'[/\\:\x00-\x1f\x7f]|\.\.', filename):
-        filename = ''
     result = {'url': url, 'name': row.get('provider') or 'Padrino Store'}
-    if filename:
+    if supported_filename(filename):
         result['filename'] = filename
     # Padrino's package labels distinguish PS4 fake packages from official PKGs.
     if re.search(r'\bfpkg\b', row.get('label') or '', re.I):
@@ -96,10 +116,10 @@ def option(row):
     checksum = row.get('sha256')
     if not page and isinstance(checksum, str) and re.fullmatch(r'[0-9a-fA-F]{64}', checksum):
         result['sha256'] = checksum.lower()
-    return result
+    return result, None
 
 
-def convert(checkout):
+def convert(checkout, show_skips=False):
     data = checkout / 'app/data'
     if subprocess.check_output(['git', 'status', '--porcelain', '--', 'app/data'], cwd=checkout):
         raise ValueError('Commit or clean up Padrino catalog edits before importing')
@@ -113,6 +133,7 @@ def convert(checkout):
             raise ValueError(f'Padrino catalog is missing the {name} array')
         games.extend(json.JSONDecoder().raw_decode(module, match.end())[0])
     packages = {}
+    skipped = Counter()
     for game in games:
         tid = game['id']
         if not TITLE_ID.fullmatch(tid) or tid in packages:
@@ -121,9 +142,14 @@ def convert(checkout):
         links = {}
         if path.is_file():
             for row in json.loads(path.read_text()):
-                link = option(row)
+                link, reason = option(row)
                 if link:
                     links.setdefault(link['url'], link)
+                else:
+                    skipped[reason] += 1
+                    if show_skips:
+                        details = {key: row.get(key) for key in ('id', 'provider', 'url', 'browserUrl')}
+                        print(json.dumps({'titleId': tid, 'reason': reason, **details}), file=sys.stderr)
         if not links:
             continue
         title = game['title'].encode()[:127].decode(errors='ignore').strip()
@@ -140,6 +166,9 @@ def convert(checkout):
             if https(value) and '#' not in value:
                 fields[key] = value
         packages[tid] = fields
+    if skipped:
+        counts = ', '.join(f'{reason}={count}' for reason, count in sorted(skipped.items()))
+        print(f'Skipped {sum(skipped.values())} candidates ({counts})')
     if not packages:
         raise ValueError('No Padrino games had supported download options')
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=checkout, text=True).strip()
@@ -168,8 +197,11 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--checkout', type=Path, help='local checkout at the Padrino revision to import')
     mode.add_argument('--embed', type=Path, help='write the C header from the committed snapshot')
+    parser.add_argument('--show-skips', action='store_true', help='write one JSON diagnostic per skipped row to stderr')
     args = parser.parse_args()
     if args.checkout:
-        convert(args.checkout.resolve())
+        convert(args.checkout.resolve(), show_skips=args.show_skips)
+    elif args.show_skips:
+        parser.error('--show-skips requires --checkout')
     else:
         embed(args.embed)
