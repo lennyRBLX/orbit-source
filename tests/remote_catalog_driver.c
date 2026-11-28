@@ -1,4 +1,5 @@
 #include "catalog_view.h"
+#include "debrid.h"
 #include "firmware.h"
 #include "links.h"
 #include "orbit.h"
@@ -30,6 +31,9 @@ bool link_release_valid(const Release *r) { (void)r; return false; }
 bool link_url_allowed(const char *url) { (void)url; return false; }
 void link_host(const char *url, char *out, size_t cap) { (void)url; if (cap) out[0] = 0; }
 bool job_can_replace_link(const Job *j) { (void)j; return false; }
+bool debrid_link_covered_locked(const Release *r) { (void)r; return false; }
+unsigned debrid_cache_revision_locked(const Release *r) { (void)r; return 0; }
+bool debrid_check_cached(const Release *r, unsigned revision) { (void)r; (void)revision; return false; }
 
 static atomic_llong scheduler_clock;
 int64_t orbit_remote_test_clock(void) { return atomic_load(&scheduler_clock); }

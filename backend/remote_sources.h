@@ -42,7 +42,10 @@ void remote_mark_missing_locked(const Release *release);
 /* The release must be a live catalogue entry. */
 const char *remote_mirror_group_locked(const Release *release);
 bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror);
-bool remote_mirror_locked(const Release *release, const char *id, Release *mirror);
+bool remote_mirror_locked(const Release *release, const char *id, Release *mirror, bool torbox);
+bool remote_torbox_route_locked(const Release *release, Release *route);
+bool remote_link_listed_locked(const Release *release);
+void remote_torbox_changed_locked(void);
 /* Acquires orbit.mutex to check provider metadata. */
 bool remote_mirror_file(const Release *selected, const Release *file);
 bool remote_metadata_option(const Release *release);

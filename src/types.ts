@@ -32,6 +32,8 @@ export interface Release extends AddonIdentity {
   sourceId: SourceId;
   torboxHost?: string;
   torboxHosts?: string[];
+  torboxCached?: boolean;
+  torboxPending?: boolean;
   mirrorCount?: number;
   providerMetadata?: boolean;
   providerMissing?: boolean;
@@ -410,6 +412,7 @@ export interface PspkgChoice {
   reason: string;
   providerHost?: string;
   torboxAvailable?: boolean;
+  torboxCached?: boolean;
 }
 
 export interface BrowserSession {

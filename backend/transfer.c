@@ -1306,7 +1306,7 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed,
     pthread_mutex_lock(&orbit.mutex);
     bool found = true;
     if (j->mirror_id[0]) {
-        found = remote_mirror_locked(&j->release, j->mirror_id, candidate);
+        found = remote_mirror_locked(&j->release, j->mirror_id, candidate, torbox(t));
     } else {
         const Release *original = release_find(j->release.id);
         *candidate = original ? *original : j->release;

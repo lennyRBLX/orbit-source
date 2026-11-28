@@ -117,7 +117,7 @@ static size_t first_mirror(const Release *const *rows, size_t count, const char 
 
 static bool describe_mirrors(cJSON *entry, const Release *r, const Release *const *group, size_t count) {
     char host[254];
-    if (!remote_link_missing_locked(r) && remote_link_host(r, host, sizeof host) && !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
+    if (remote_link_listed_locked(r) && remote_link_host(r, host, sizeof host) && !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
     bool metadata = remote_metadata_option(r);
     size_t available = remote_link_missing_locked(r) ? 0 : 1;
     if (count > 1) {
@@ -127,8 +127,8 @@ static bool describe_mirrors(cJSON *entry, const Release *r, const Release *cons
         for (size_t i = 0; i < count; i++) {
             const Release *mirror = group[i];
             metadata |= remote_metadata_option(mirror);
-            if (remote_link_missing_locked(mirror)) continue;
-            available++;
+            if (!remote_link_listed_locked(mirror)) continue;
+            if (!remote_link_missing_locked(mirror)) available++;
             if (!remote_link_host(mirror, host, sizeof host)) continue;
             bool duplicate = false;
             const cJSON *item;
@@ -194,7 +194,6 @@ static bool append_remote_locked(cJSON *out) {
         const Release *r = &orbit.remote_releases[i];
         if (r->remote_alias || !source_enabled_locked(r)) continue;
         bool pspkg = !strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) || !strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE);
-        if (!pspkg && remote_link_missing_locked(r)) continue;
         size_t begin = 0, end = 0;
         const char *group = remote_mirror_group_locked(r);
         if (*group) {
@@ -202,6 +201,11 @@ static bool append_remote_locked(cJSON *out) {
             if (begin == mirror_count || mirrors[begin] != r) continue;
             end = begin + 1;
             while (end < mirror_count && !strcmp(remote_mirror_group_locked(mirrors[end]), group)) end++;
+        }
+        if (!pspkg && !remote_link_listed_locked(r)) {
+            bool listed = false;
+            for (size_t j = begin; j < end; j++) listed |= remote_link_listed_locked(mirrors[j]);
+            if (!listed) continue;
         }
         cJSON *entry = catalog_remote_choice_locked(r, mirrors + begin, end - begin);
         if (!entry) { ok = false; break; }
@@ -258,7 +262,7 @@ static cJSON *snapshot_locked(bool addons) {
                          ? &orbit.releases[slot]
                          : release_find(id);
         slot++;
-        if (!source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
+        if (!source_enabled_locked(r) || !remote_link_listed_locked(r)) continue;
         cJSON *entry = cJSON_Duplicate(x, true);
         if (!entry) {
             cJSON_Delete(a);
@@ -270,7 +274,8 @@ static cJSON *snapshot_locked(bool addons) {
         cJSON_AddBoolToObject(entry, "directAvailable", provider_url_supported(r));
         if (remote_metadata_option(r)) cJSON_AddTrueToObject(entry, "providerMetadata");
         char host[254];
-        if (!remote_link_missing_locked(r) && remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
+        if (remote_link_missing_locked(r)) cJSON_AddTrueToObject(entry, "providerMissing");
+        if (remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
         firmware_describe(entry, orbit.firmware);
         cJSON_AddItemToArray(a, entry);
     }

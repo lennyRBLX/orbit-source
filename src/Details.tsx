@@ -205,8 +205,9 @@ export function Details({
     mirrorCount?: number;
   } &
     Partial<Pick<Release, "filename" | "filenameHint" | "format" | "compression" | "provider" |
-      "torboxHosts" | "browserAvailable" | "directAvailable" | "sizeEstimateBytes">>;
+      "torboxHosts" | "torboxCached" | "torboxPending" | "browserAvailable" | "directAvailable" | "sizeEstimateBytes">>;
   const [providerFiles, setProviderFiles] = useState<Record<string, ProviderFile>>({});
+  const torboxRevision = debrid.status?.connected && !debrid.status.busy ? debrid.status.revision : undefined;
   const metadataIds = communityOptions
     .filter((r) => r.providerMetadata)
     .map((r) => r.id)
@@ -236,7 +237,7 @@ export function Details({
     }
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [metadataIds, system?.paired]);
+  }, [metadataIds, system?.paired, torboxRevision]);
   const options = communityOptions.map((r) => {
     const file = providerFiles[r.id];
     if (!file) return r;
@@ -248,6 +249,8 @@ export function Details({
       directAvailable: file.directAvailable ?? r.directAvailable,
       torboxHost: file.torboxHosts ? undefined : r.torboxHost,
       torboxHosts: file.torboxHosts ?? r.torboxHosts,
+      torboxCached: file.torboxCached,
+      torboxPending: file.torboxPending,
       mirrorCount: file.mirrorCount ?? r.mirrorCount,
       filename: file.provider ? file.filename || "" : file.filename || r.filename,
       filenameHint: file.provider ? file.filenameHint : r.filenameHint,
@@ -259,7 +262,10 @@ export function Details({
       metadataSizeOnly: file.sizeOnly,
     };
   });
-  const releases = options.filter((r) => !r.providerMissing || torboxAvailable(debrid.status, r));
+  const releases = options.filter((r) => !r.providerMissing || r.torboxPending ||
+    ((r.torboxCached || !providerFiles[r.id]) && torboxAvailable(debrid.status, r)));
+  const cacheLabel = (option: Release, prefix = "") =>
+    option.torboxCached && torboxAvailable(debrid.status, option) ? prefix + t("Cached") : "";
   // Preserve the game and its library actions when every download option is missing.
   const release =
       releases.find((r) => r.id === releaseId) || releases[0] ||
@@ -281,7 +287,7 @@ export function Details({
   const listingId = pspkgListing || pspkgHere?.pspkgReleaseId ||
     listings.find((listing) => listing.titleIdMatch)?.id || listings[0]?.id;
   const pspkgLinks = pspkgHere?.pspkgReleaseId === listingId ? pspkgHere?.pspkgLinks || [] : [];
-  const canTorbox = torboxAvailable(debrid.status, release);
+  const canTorbox = torboxAvailable(debrid.status, release) && (!release.providerMissing || !!release.torboxCached);
   const delivery = release.providerMissing && canTorbox ? "torbox" : deliveryChoice ?? undefined;
   const torbox = !isPspkg && canTorbox && delivery !== "direct";
   const useBrowser = isPspkg || (!!release.browserAvailable && !release.providerMissing && !torbox);
@@ -460,7 +466,7 @@ export function Details({
       : !downloadAgain && collection?.kind === "library" && libraryGame
         ? t("View in Library")
         : release.providerMissing && !canTorbox
-          ? t("Unavailable")
+          ? release.torboxPending ? t("Please wait…") : t("Unavailable")
           : pending
           ? t("Please wait…")
           : isPspkg
@@ -477,7 +483,7 @@ export function Details({
   const methodLabel = isPspkg
     ? t("Automatic: TorBox or direct")
     : torbox
-    ? "TorBox"
+    ? `TorBox${cacheLabel(release, " · ")}`
     : t("{provider} directly", { provider: releaseProvider(release) });
   const methodNote = isPspkg
     ? t("Orbit checks the selected provider and uses TorBox when supported, otherwise a verified direct file.")
@@ -543,7 +549,7 @@ export function Details({
                   onClick={() => void selectPspkgLink(link.id)}>
                   <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
                   <small>{[link.providerHost, link.edition || [link.titleId, link.version, link.region, link.format, link.compression].filter(Boolean).join(" · "),
-                    reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
+                    link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
                 </button>
               ))}
             </div>
@@ -802,7 +808,7 @@ export function Details({
     ...(showDownload && release.compression
       ? [{ key: "compressed", text: t("Compressed download. Orbit checks the files and available space before extraction. A password may be required.") }]
       : []),
-    ...(showDownload && release.providerMissing && !canTorbox
+    ...(showDownload && release.providerMissing && !canTorbox && !release.torboxPending
       ? [{ key: "missing", warn: true, text: t("The source no longer has this file. Choose another download option if there is one.") }]
       : []),
     ...(showDownload && release.notes ? [{ key: "release", text: release.notes }] : []),
@@ -958,6 +964,7 @@ export function Details({
             title: `${releaseProvider(option)} · ${formatLabel(option)}`,
             sub: [
               releaseSize(option),
+              cacheLabel(option),
               option.version && t("version {version}", { version: option.version }),
               option.region,
               releaseState(option, jobs, library)?.label && t(releaseState(option, jobs, library)!.label),
@@ -1254,7 +1261,7 @@ export function Details({
                   tone="dark"
                   kicker={releaseProvider(option)}
                   title={`${formatLabel(option)} · ${releaseSize(option)}`}
-                  sub={[option.version && t("version {version}", { version: option.version }), option.region, presence && t(presence.label), firmwareLabel(option)]
+                  sub={[cacheLabel(option), option.version && t("version {version}", { version: option.version }), option.region, presence && t(presence.label), firmwareLabel(option)]
                     .filter(Boolean)
                     .join(" · ")}
                   check={release.id === option.id}
@@ -1465,6 +1472,7 @@ export function Details({
                           <strong>{formatLabel(option)}</strong>
                           <small>
                             {releaseSize(option)}
+                            {cacheLabel(option, " · ")}
                             {option.version && ` · ${t("version {version}", { version: option.version })}`}
                             {option.region && ` · ${option.region}`}
                           </small>
@@ -1766,6 +1774,7 @@ export function Details({
                         </small>
                         <small>
                           {releaseSize(option)}
+                          {cacheLabel(option, " · ")}
                           {presence && ` · ${t(presence.label)}`}
                         </small>
                         {firmwareLabel(option) && (

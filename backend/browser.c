@@ -344,7 +344,7 @@ static CommunityResult resolve_community(Release *selected, char *etag, char *mo
     pthread_mutex_lock(&orbit.mutex);
     const Job *j = session.queued_job_id[0] ? job_find(session.queued_job_id) : NULL;
     bool queued = j != NULL;
-    bool found = !j || !j->mirror_id[0] || remote_mirror_locked(selected, j->mirror_id, &candidate);
+    bool found = !j || !j->mirror_id[0] || remote_mirror_locked(selected, j->mirror_id, &candidate, false);
     if (j && !j->mirror_id[0]) {
         const Release *original = release_find(selected->id);
         if (original) candidate = *original;
@@ -700,22 +700,26 @@ static void download_pspkg(void) {
     }
     remote_pspkg_identify_choice(&route, choice.url, selected_index);
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
-    bool missing = ok && *provider && remote_download_confirm_missing(locator.url, &session.cancel);
+    bool cached = false;
+    if (*provider) {
+        copy_text(route.remote_provider_page, sizeof route.remote_provider_page, locator.url);
+        route.url[0] = 0;
+        pthread_mutex_lock(&orbit.mutex);
+        cached = session.pspkg_torbox && choice.torbox_cached_revision &&
+                 choice.torbox_cached_revision == debrid_cache_revision_locked(&route);
+        pthread_mutex_unlock(&orbit.mutex);
+    }
+    bool missing = *provider && !cached && remote_download_confirm_missing(locator.url, &session.cancel);
     if (missing) {
         copy_text(error, sizeof error, REMOTE_DOWNLOAD_REMOVED);
         ok = false;
     }
-    if (ok) {
-        if (*provider) {
-            copy_text(route.remote_provider_page, sizeof route.remote_provider_page, locator.url);
-            route.url[0] = 0;
-        } else {
-            pthread_mutex_lock(&orbit.mutex);
-            state_locked("validating", "Checking the PSPKG file before adding it to Downloads…");
-            pthread_mutex_unlock(&orbit.mutex);
-            ok = !remote_download_verify(&route, locator.url, &session.cancel, error, sizeof error);
-            validated = ok;
-        }
+    if (ok && !*provider) {
+        pthread_mutex_lock(&orbit.mutex);
+        state_locked("validating", "Checking the PSPKG file before adding it to Downloads…");
+        pthread_mutex_unlock(&orbit.mutex);
+        ok = !remote_download_verify(&route, locator.url, &session.cancel, error, sizeof error);
+        validated = ok;
     }
     pthread_mutex_lock(&orbit.mutex);
     if (missing && selected_index < session.pspkg_count)
@@ -867,9 +871,16 @@ static void *worker(void *unused) {
                 if (*reason) copy_text(link->reason, sizeof link->reason, reason);
                 else {
                     const char *provider = remote_browser_provider(resolved);
-                    if (*provider && strlen(resolved) < sizeof link->provider)
+                    if (*provider && strlen(resolved) < sizeof link->provider) {
                         copy_text(link->provider, sizeof link->provider, resolved);
-                    else copy_text(link->url, sizeof link->url, resolved);
+                        Release route = {.remote_page = true};
+                        copy_text(route.remote_provider_page, sizeof route.remote_provider_page, resolved);
+                        pthread_mutex_lock(&orbit.mutex);
+                        unsigned revision = debrid_cache_revision_locked(&route);
+                        pthread_mutex_unlock(&orbit.mutex);
+                        if (revision && debrid_check_cached(&route, revision))
+                            link->torbox_cached_revision = revision;
+                    } else copy_text(link->url, sizeof link->url, resolved);
                 }
                 pthread_mutex_lock(&orbit.mutex);
                 if (!atomic_load(&session.cancel)) session.pspkg_links[i] = *link;
@@ -1171,6 +1182,9 @@ cJSON *browser_status(void) {
                 char host[254];
                 if (remote_link_host(&route, host, sizeof host)) cJSON_AddStringToObject(choice, "providerHost", host);
                 cJSON_AddBoolToObject(choice, "torboxAvailable", debrid_link_covered_locked(&route));
+                if (link->torbox_cached_revision &&
+                    link->torbox_cached_revision == debrid_cache_revision_locked(&route))
+                    cJSON_AddTrueToObject(choice, "torboxCached");
             }
             cJSON_AddItemToArray(choices, choice);
         }

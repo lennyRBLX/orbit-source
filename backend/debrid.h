@@ -11,6 +11,8 @@ int debrid_prepare_locked(const Release *release, Job *job, char *error, size_t 
 /* Suggested route only. Reported host limits never prevent an explicit TorBox request. */
 bool debrid_default_locked(const Release *release);
 bool debrid_link_covered_locked(const Release *release);
+unsigned debrid_cache_revision_locked(const Release *release);
+bool debrid_check_cached(const Release *release, unsigned revision);
 bool debrid_job_account_locked(const Job *job);
 /* Runs on the download worker. */
 DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at,

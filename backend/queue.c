@@ -348,47 +348,32 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
                   "This download option is no longer available.");
         return 409;
     }
-    if ((!pin || dry_run) && remote_link_missing_locked(r)) {
-        Release mirror;
-        if (!remote_next_mirror_locked(r, "", &mirror)) {
-            copy_text(err, cap, REMOTE_DOWNLOAD_REMOVED);
-            return 409;
-        }
-    }
     Job delivery_job = {0};
     if (delivery && *delivery && strcmp(delivery, "direct") && !torbox) {
         copy_text(err, cap, "Choose direct or torbox delivery."); return 400;
     }
     if (torbox) {
-        const Release *route = recovery ? recovery : r;
-        Release mirror;
-        if (!recovery && (remote_link_missing_locked(r) || !debrid_link_covered_locked(r))) {
-            char after[sizeof mirror.id] = "";
-            while (remote_next_mirror_locked(r, after, &mirror)) {
-                if (!remote_link_missing_locked(&mirror) && debrid_link_covered_locked(&mirror)) {
-                    route = &mirror;
-                    copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, mirror.id);
-                    copy_text(delivery_job.mirror_first, sizeof delivery_job.mirror_first, mirror.id);
-                    delivery_job.mirror_torbox = true;
-                    break;
-                }
-                copy_text(after, sizeof after, mirror.id);
-            }
-        }
-        if ((!recovery && remote_link_missing_locked(route)) ||
-            debrid_prepare_locked(route, &delivery_job, err, cap) != 200) {
+        Release preferred;
+        const Release *route = recovery ? recovery : remote_torbox_route_locked(r, &preferred) ? &preferred : NULL;
+        if (!route || debrid_prepare_locked(route, &delivery_job, err, cap) != 200) {
             if (recovery) return 409;
             torbox = false;
-            delivery_job.mirror_id[0] = delivery_job.mirror_first[0] = 0;
-            delivery_job.mirror_torbox = false;
             err[0] = 0;
+        } else {
+            delivery_job.direct_missing = remote_link_missing_locked(route);
+            if (strcmp(r->id, route->id)) {
+                copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, route->id);
+                if (!recovery) copy_text(delivery_job.mirror_first, sizeof delivery_job.mirror_first, route->id);
+                delivery_job.mirror_torbox = true;
+            }
         }
     }
-    if (recovery) {
-        delivery_job.direct_missing = true;
-        if (strcmp(r->id, recovery->id)) {
-            copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, recovery->id);
-            delivery_job.mirror_torbox = true;
+    if (recovery) delivery_job.direct_missing = true;
+    if (!torbox && (!pin || dry_run) && remote_link_missing_locked(r)) {
+        Release mirror;
+        if (!remote_next_mirror_locked(r, "", &mirror)) {
+            copy_text(err, cap, REMOTE_DOWNLOAD_REMOVED);
+            return 409;
         }
     }
     delivery_job.browser_pending = !torbox && !pin && job_needs_browser(r);

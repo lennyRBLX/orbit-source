@@ -12,7 +12,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -69,6 +69,15 @@ class Fixture(BaseHTTPRequestHandler):
                      401 if self.server.key == "invalid" else 200)
         elif path == "/webdl/hosters":
             self.api(self.server.hosters)
+        elif path == "/webdl/checkcached":
+            params = parse_qs(urlsplit(self.path).query)
+            self.server.cache_queries.append(params)
+            digest = self.server.cache_hash
+            if self.headers.get("Authorization") != "Bearer orbit-test-fixture-key":
+                self.api(None, 401)
+            else:
+                self.api({digest: {"hash": digest, "name": "provider.pkg", "size": len(FILE)}}
+                         if digest in params.get("hash", []) else {})
         elif path == "/webdl/mylist":
             self.server.calls.append("list")
             self.server.polls += 1
@@ -168,10 +177,14 @@ def wait_for(check, timeout=15):
 class TorBoxRouting(unittest.TestCase):
     def run_download(self, hosters, *, cached=False, truncate=False, original_fails=False, explicit=None,
                      browser=False, processing=None, rejection=None, key="valid", interrupt=None,
-                     transient=False, mirrors=False, pspkg=None):
+                     transient=False, mirrors=False, pspkg=None, check_cache=False):
         with tempfile.TemporaryDirectory() as temp, ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as fixture:
             fixture.base = f"http://127.0.0.1:{fixture.server_port}"
             fixture.calls = []
+            fixture.check_cache = check_cache
+            fixture.cache_queries = []
+            cache_url = "/pspkg-provider/buzzheavier.com/file.pkg" if pspkg else "/provider"
+            fixture.cache_hash = hashlib.md5((fixture.base + cache_url).encode()).hexdigest() if cached or pspkg == "supported" else ""
             fixture.hosters = hosters
             fixture.downloads = []
             fixture.original_fails = original_fails
@@ -289,6 +302,7 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual((link["titleId"], link["version"], link["region"], link["format"]),
                          ("PPSA04029", "02.120", "EUR", "PKG"))
         self.assertEqual(link.get("torboxAvailable"), mode == "supported")
+        self.assertEqual(bool(link.get("torboxCached")), mode == "supported")
         call("/browser", {"action": "pspkg-download", "releaseId": release["id"],
                           "linkId": link["id"], "storageId": "desktop", "delivery": "torbox"})
         browser = wait_for(lambda: value if not (value := call("/browser"))["active"] else None)
@@ -323,7 +337,7 @@ class TorBoxRouting(unittest.TestCase):
                 headers["Authorization"] = "Bearer " + token
             data = None if body is None else json.dumps(body).encode()
             with urlopen(Request(f"http://127.0.0.1:{port}/api/v1{path}", data, headers, method=method),
-                         timeout=3) as reply:
+                         timeout=15 if path == "/catalog" else 3) as reply:
                 return json.load(reply)
 
         def connect():
@@ -332,7 +346,7 @@ class TorBoxRouting(unittest.TestCase):
             except URLError:
                 return None
 
-        token = wait_for(connect)
+        token = wait_for(connect, timeout=30)
         if fixture.browser:
             for path, method, body, code in (
                 ("/sources", "POST", {"enabled": [], "noticeVersion": 1, "acknowledged": True}, 405),
@@ -370,6 +384,21 @@ class TorBoxRouting(unittest.TestCase):
                 "files": [{"id": 0, "short_name": "provider.pkg" if fixture.browser else release["filename"],
                            "size": len(FILE)}],
             }]
+        if fixture.check_cache:
+            def metadata_done():
+                result = call("/community-metadata?ids=" + release["id"])
+                return result["files"][0] if not result["pending"] else None
+
+            row = wait_for(metadata_done)
+            self.assertEqual(bool(row.get("torboxCached")), cached)
+            if any(h["status"] for h in fixture.hosters):
+                digest = hashlib.md5(original_url.encode()).hexdigest()
+                self.assertEqual(fixture.cache_queries,
+                                 [{"format": ["object"], "list_files": ["false"], "hash": [digest]}])
+            else:
+                self.assertEqual(fixture.cache_queries, [])
+            if fixture.original_fails:
+                self.assertEqual(row["status"], "missing")
         download = {"releaseId": release["id"], "storageId": "desktop"}
         if explicit == "browser":
             call("/browser", dict(download, action="start", returnTarget="browser"))
@@ -413,6 +442,12 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual(calls[0], "list")
         self.assertIn("/torbox-file", calls)
         self.assertNotIn("/original", calls)
+
+    def test_web_cache_checks_exact_url_and_keeps_cached_missing_source_downloadable(self):
+        for up, cached, missing in ((True, True, True), (True, False, False), (False, False, False)):
+            with self.subTest(up=up, cached=cached, missing=missing):
+                self.run_download([{"domains": ["127.0.0.1"], "status": up}], browser=True,
+                                  cached=cached, original_fails=missing, check_cache=True)
 
     def test_processing_is_polled_before_using_the_cached_file(self):
         calls = self.run_download([{"domains": ["127.0.0.1"], "status": True}],

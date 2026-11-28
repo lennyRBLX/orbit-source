@@ -20,6 +20,7 @@
 #define RESPONSE_MAX (1024 * 1024)
 #define HOST_TTL 600
 #define HOST_COUNT 5
+#define CACHE_PATH "/webdl/checkcached?"
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
@@ -46,7 +47,7 @@ static struct {
     pthread_t thread;
     bool started, stop, busy, connected, check;
     char key[KEY_CAP], pending_key[KEY_CAP], account[65], error[256];
-    time_t checked, retry_at, next_check;
+    time_t checked, retry_at, next_check, cache_retry_at;
     unsigned revision;
     struct { bool available; int64_t limit; } hosts[HOST_COUNT];
     DebridHost *community_hosts;
@@ -226,8 +227,9 @@ static cJSON *call(const char *key, const char *path, const char *link, bool bea
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "OrbitStore/" ORBIT_VERSION);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    bool cache_lookup = !strncmp(path, CACHE_PATH, sizeof CACHE_PATH - 1);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, cache_lookup ? 4L : 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, cache_lookup ? 8L : 30L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collect);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &reply);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headers);
@@ -399,6 +401,7 @@ static void check_account(const char *key) {
     if (ok && !debrid.stop) {
         if (persist(key, account)) { ok = false; copy_text(err, sizeof err, "Could not save the TorBox connection on this console."); }
         else {
+            if (strcmp(debrid.key, key)) debrid.cache_retry_at = 0;
             OPENSSL_cleanse(debrid.key, sizeof debrid.key);
             copy_text(debrid.key, sizeof debrid.key, key); copy_text(debrid.account, sizeof debrid.account, account);
             debrid.connected = true; debrid.checked = time(NULL);
@@ -422,6 +425,7 @@ static void check_account(const char *key) {
     debrid.next_check = time(NULL) + (ok ? HOST_TTL - 60 : 60);
     if (debrid.next_check < debrid.retry_at) debrid.next_check = debrid.retry_at;
     debrid.busy = false;
+    remote_torbox_changed_locked();
     pthread_mutex_unlock(&orbit.mutex);
     free(community_hosts);
 }
@@ -524,6 +528,7 @@ int debrid_action(const cJSON *input, char *err, size_t cap) {
             pause_jobs_locked();
             OPENSSL_cleanse(debrid.key, sizeof debrid.key); debrid.account[0] = debrid.error[0] = 0;
             debrid.connected = false; debrid.checked = 0; debrid.revision++;
+            remote_torbox_changed_locked();
             if (state_save_locked()) { code = 503; copy_text(err, cap, "TorBox was disconnected, but download state could not be saved."); }
         }
     } else if (debrid.retry_at > time(NULL)) { code = 429; copy_text(err, cap, "Wait before checking TorBox again."); }
@@ -561,22 +566,49 @@ static bool current_account(void) {
 bool debrid_link_covered_locked(const Release *r) {
     return current_account() && covered_limit(r) >= 0;
 }
+unsigned debrid_cache_revision_locked(const Release *r) {
+    return !debrid.busy && debrid_link_covered_locked(r) ? debrid.revision : 0;
+}
+
+bool debrid_check_cached(const Release *r, unsigned revision) {
+    const char *url = provider_torbox_url(r);
+    unsigned char digest[16];
+    unsigned length = 0;
+    if (!EVP_Digest(url, strlen(url), digest, &length, EVP_md5(), NULL) || length != sizeof digest)
+        return false;
+    char link_hash[33];
+    for (size_t i = 0; i < sizeof digest; i++) snprintf(link_hash + 2 * i, 3, "%02x", digest[i]);
+    char key[KEY_CAP];
+    pthread_mutex_lock(&orbit.mutex);
+    bool current = revision && revision == debrid_cache_revision_locked(r) &&
+                   time(NULL) >= debrid.cache_retry_at;
+    if (current) copy_text(key, sizeof key, debrid.key);
+    pthread_mutex_unlock(&orbit.mutex);
+    if (!current) return false;
+
+    char err[256] = "";
+    char path[96];
+    snprintf(path, sizeof path, CACHE_PATH "format=object&list_files=false&hash=%s", link_hash);
+    time_t retry = 0;
+    cJSON *reply = call(key, path, NULL, true, NULL, &retry, err, sizeof err, NULL);
+    OPENSSL_cleanse(key, sizeof key);
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(reply, "data");
+    const cJSON *entry = cJSON_GetObjectItemCaseSensitive(data, link_hash);
+    bool cached = cJSON_IsObject(entry) && !strcasecmp(json_text(entry, "hash"), link_hash) &&
+                  !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(entry, "cached"));
+    cJSON_Delete(reply);
+    pthread_mutex_lock(&orbit.mutex);
+    current = revision == debrid_cache_revision_locked(r);
+    if (current && retry > debrid.cache_retry_at) debrid.cache_retry_at = retry;
+    pthread_mutex_unlock(&orbit.mutex);
+    return current && cached;
+}
 bool debrid_job_account_locked(const Job *job) {
     return debrid.connected && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
 }
-static bool covered_option(const Release *r) {
-    if (!r || !current_account()) return false;
-    if (!remote_link_missing_locked(r) && covered_limit(r) >= 0) return true;
-    Release mirror;
-    char after[sizeof mirror.id] = "";
-    while (remote_next_mirror_locked(r, after, &mirror)) {
-        if (!remote_link_missing_locked(&mirror) && covered_limit(&mirror) >= 0) return true;
-        copy_text(after, sizeof after, mirror.id);
-    }
-    return false;
-}
 bool debrid_default_locked(const Release *r) {
-    return !debrid.busy && covered_option(r);
+    Release route;
+    return r && !debrid.busy && current_account() && remote_torbox_route_locked(r, &route);
 }
 int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
     if (!debrid.connected || !debrid.key[0]) { copy_text(err, cap, "Connect TorBox in App settings first."); return 409; }
