@@ -795,12 +795,12 @@ class RemoteCatalogueTests(unittest.TestCase):
                                              feed={"packages": [arabic]})["releases"], [])
 
     def test_pspkg_links_keep_prefilter_edition_and_part_diagnostics(self):
-        html = ('<h3>Game PKG PPSA12345 v2.31 EUR 54.25 GB</h3>'
+        html = ('<section><h3>Game PKG PPSA12345 v2.31 EUR 54.25 GB</h3>'
                 '<a href="https://vikingfile.com/f/game123456">VikingFile</a>'
-                '<a href="https://rootz.so/d/mirror">Rootz</a>'
-                '<h3>Game PKG ZSTD</h3><a href="https://datanodes.to/abcd12345678">Download</a>'
-                '<h3>Game PKG</h3><a href="https://filekeeper.net/abcd12345678">Part 1</a>'
-                '<h3>Update PKG</h3><a href="https://rootz.so/d/update">Update</a>')
+                '<a href="https://rootz.so/d/mirror">Rootz</a></section>'
+                '<section><h3>Game PKG ZSTD</h3><a href="https://datanodes.to/abcd12345678">Download</a></section>'
+                '<section><h3>Game PKG</h3><a href="https://filekeeper.net/abcd12345678">Part 1</a></section>'
+                '<section><h3>Update PKG</h3><a href="https://rootz.so/d/update">Update</a></section>')
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
             links = service.command("pspkg-links", html=html)
             self.assertEqual([row["filterReason"] for row in links],
@@ -808,6 +808,54 @@ class RemoteCatalogueTests(unittest.TestCase):
             self.assertEqual(links[0]["titleId"], "PPSA12345")
             self.assertEqual(links[0]["sizeEstimateBytes"], 54_250_000_000)
             self.assertIn("ZSTD", links[2]["edition"])
+
+    def test_pspkg_filters_ads_in_public_and_verified_html(self):
+        provider = "https://vikingfile.com/f/game123456"
+        direct = "https://files.example.org/Title.PKG?token=fixture"
+        handoff = "https://pspkg.com/ps5/download.php?game_id=123&edition_id=5&link_id=42"
+        ads = ('<a href="https://ads.example/download">Download</a>'
+               '<a href="https://vikingfile.com.ads.example/f/game123456">Download</a>'
+               '<a href="https://ads.example/click?next=Title.pkg">Download</a>'
+               '<a href="https://ads.example/game.pkg.html">Download</a>'
+               '<a href="/ps5/advert?next=/download.php?game_id=123">Download</a>')
+        public_html = (f'<section><h3>اللعبة</h3><p><img alt="">'
+                       f'<a href="{provider}">VikingFile</a></p>{ads}</section>'
+                       f'<section><a href="{direct}">Game PKG</a></section>'
+                       '<aside><a href="https://vikingfile.com/f/other12345">Download</a></aside>'
+                       f'<section><a href="https://rootz.so/d/unrelated">Download</a>{"x" * 351} Game</section>'
+                       f'<p>Game PKG <a href="{handoff}">Verify</a></p>')
+        verified_html = (f'<div>{ads}<a href="{provider}">VikingFile</a>'
+                         f'<a href="{handoff.replace("&", "&amp;")}">Provider</a></div>')
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            links = service.command("pspkg-links", html=public_html)
+            self.assertEqual([row["url"] for row in links], [provider, direct])
+            self.assertTrue(all(row["metadataEligible"] for row in links))
+            self.assertEqual(links[1]["filename"], "Title.PKG")
+            links = service.command("pspkg-links", html=verified_html, heading="PPSA12345 Game PKG")
+            self.assertEqual([row["url"] for row in links], [provider, handoff])
+            self.assertTrue(links[1]["intermediate"])
+
+    def test_pspkg_metadata_probes_public_package_without_fetching_ads(self):
+        server = FixtureServer()
+        page, pkg, ad = "/ps5/download-game-123.html", "/game.pkg", "/advert?name=game.pkg"
+        server.downloads[page] = (200, {"Content-Type": "text/html"},
+                                  f'<section>Game PKG <a href="{ad}">Download</a>'
+                                  f'<a href="{pkg}">Download</a></section>'.encode())
+        server.downloads[pkg] = (206, {"Content-Type": "application/octet-stream",
+                                       "Content-Range": "bytes 0-7/42"}, b"\x7fFIHtest")
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                metadata = service.command("metadata-page", url=server.url.replace("/catalogue.json", page))
+                self.assertEqual(server.paths, [page, pkg])
+                self.assertEqual(server.ranges, [(page, None), (pkg, "bytes=0-7")])
+                link, = metadata["links"]
+                self.assertEqual((link["sizeBytes"], link["exact"]), (42, True))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_pspkg_handoff_accepts_provider_pages_or_verifiable_file_candidates(self):
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:

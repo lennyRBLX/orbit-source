@@ -130,7 +130,11 @@ int main(int argc, char **argv) {
             print_json(remote_pspkg_preview(json_text(request, "source"), json_text(request, "url"),
                                             (size_t)json_int(request, "gameLimit")));
         } else if (!strcmp(op, "pspkg-links")) {
-            print_json(remote_pspkg_links(json_text(request, "html")));
+            const char *page = "https://pspkg.com/ps5/download-game-123.html";
+            const char *html = json_text(request, "html");
+            const cJSON *heading = cJSON_GetObjectItemCaseSensitive(request, "heading");
+            print_json(cJSON_IsString(heading) ? remote_pspkg_session_links(html, page, heading->valuestring)
+                                             : remote_pspkg_links(html, page));
         } else if (!strcmp(op, "pspkg-job-page")) {
             Release release, saved;
             const char *source = json_text(request, "source");

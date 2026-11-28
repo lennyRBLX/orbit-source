@@ -20,7 +20,7 @@ cJSON *remote_pspkg_preview(const char *source_id, const char *url,
 cJSON *remote_sources_test_status_locked(void);
 void remote_sources_test_refresh_locked(void);
 #endif
-cJSON *remote_pspkg_links(const char *html);
+cJSON *remote_pspkg_links(const char *html, const char *page);
 cJSON *remote_pspkg_session_links(const char *html, const char *page, const char *heading);
 void remote_pspkg_identify_choice(Release *release, const char *url, size_t index);
 int remote_sources_start(void);

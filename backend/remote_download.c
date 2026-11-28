@@ -1153,8 +1153,47 @@ static void rootz_metadata(const Response *page, const Release *r, RemoteFileMet
     free(api.body);
 }
 
-/* Keep only stable, independently validated public provider pages. */
-static cJSON *pspkg_page_links(const char *html, const char *page, const char *heading) {
+enum { PSPKG_GAME_LABEL = 1, PSPKG_OTHER_LABEL = 2, PSPKG_CONTEXT_CHARS = 350 };
+
+static unsigned pspkg_link_labels(const char *text) {
+    unsigned labels = 0;
+    if (phrase(text, "game") || phrase(text, "pkg") || phrase(text, "fpkg") ||
+        strstr(text, "اللعبة") || strstr(text, "العبة"))
+        labels |= PSPKG_GAME_LABEL;
+    if (phrase(text, "update") || phrase(text, "updates") || phrase(text, "patch") ||
+        phrase(text, "backport") || phrase(text, "dlc") || phrase(text, "dlcs") ||
+        strstr(text, "تحديث") || strstr(text, "إضافات") || strstr(text, "الاضافات"))
+        labels |= PSPKG_OTHER_LABEL;
+    return labels;
+}
+
+typedef struct { const char *tag, *end; } PspkgParent;
+
+static bool pspkg_void_element(const char *name) {
+    const char *tags[] = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+                          "link", "meta", "param", "source", "track", "wbr"};
+    for (size_t i = 0; i < sizeof tags / sizeof *tags; i++)
+        if (tag_is(name, tags[i])) return true;
+    return false;
+}
+
+static unsigned pspkg_nearby_labels(const PspkgParent *parents, size_t depth) {
+    unsigned labels = 0;
+    /* Match the PSPKG sync script's short, local text windows. */
+    for (unsigned i = 0; depth && i < 3; i++) {
+        const PspkgParent *parent = &parents[--depth];
+        if (tag_is(parent->tag + 1, "body") || tag_is(parent->tag + 1, "html")) break;
+        char text[PSPKG_CONTEXT_CHARS * 4 + 2];
+        if (!element_text(parent->tag, parent->end, text, sizeof text)) continue;
+        unsigned characters = 0;
+        for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+            characters += (*p & 0xc0) != 0x80;
+        if (characters <= PSPKG_CONTEXT_CHARS) labels |= pspkg_link_labels(text);
+    }
+    return labels;
+}
+
+static cJSON *pspkg_page_links(const char *html, const char *page, const char *heading, bool public_page) {
     cJSON *links = cJSON_CreateArray();
     if (!links) return NULL;
     char edition[256] = "";
@@ -1162,8 +1201,11 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
     SizeChoice edition_size = {0};
     RemoteFileMetadata candidates = {0};
     if (heading) copy_text(edition, sizeof edition, heading);
-    bool base = !phrase(edition, "update") && !phrase(edition, "patch") &&
-                !phrase(edition, "backport") && !phrase(edition, "dlc");
+    const Release locator = {.source = "pspkg"};
+    const char *last_slash = strrchr(page, '/');
+    size_t directory = last_slash ? (size_t)(last_slash + 1 - page) : 0;
+    PspkgParent parents[64];
+    size_t depth = 0, edition_depth = 0;
     for (const char *tag = html; (tag = strchr(tag, '<')) && cJSON_GetArraySize(links) < PSPKG_LINK_LIMIT;) {
         const char *next = skip_markup(tag);
         if (next != tag) { tag = next; continue; }
@@ -1171,6 +1213,26 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         if (!end) break;
         const char *current = tag;
         tag = end + 1;
+        const char *name = current + 1;
+        if (*name == '/') {
+            size_t length = tag_name_length(++name);
+            for (size_t i = depth; length && i; i--)
+                if (tag_name_length(parents[i - 1].tag + 1) == length &&
+                    !strncasecmp(name, parents[i - 1].tag + 1, length)) {
+                    depth = i - 1;
+                    break;
+                }
+            if (depth < edition_depth) {
+                copy_text(edition, sizeof edition, heading ? heading : "");
+                edition_depth = 0;
+            }
+            continue;
+        }
+        bool anchor = tag_is(name, "a");
+        if (!anchor && tag_name_length(name) && end[-1] != '/' && !pspkg_void_element(name)) {
+            if (depth == sizeof parents / sizeof *parents) break;
+            parents[depth++] = (PspkgParent){current, end};
+        }
         char classes[128];
         if (heading && tag_value(current, end, "class", classes, sizeof classes)) {
             if (has_label(classes, "dpx-meta-size")) {
@@ -1188,30 +1250,28 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
             }
         }
         if (tag_is(current + 1, "h2") || tag_is(current + 1, "h3") || tag_is(current + 1, "h4")) {
+            edition[0] = 0;
             element_text(current, end, edition, sizeof edition);
-            base = !phrase(edition, "update") && !phrase(edition, "patch") &&
-                   !phrase(edition, "backport") && !phrase(edition, "dlc");
+            edition_depth = depth ? depth - 1 : 0;
             continue;
         }
-        if (!tag_is(current + 1, "a")) continue;
-        char href[2048], label[128] = "";
-        if (!tag_value(current, end, "href", href, sizeof href)) continue;
+        if (!anchor) continue;
+        char raw[2048], href[2048], label[128] = "";
+        if (!tag_value(current, end, "href", raw, sizeof raw) ||
+            !resolve_href(page, raw, href, sizeof href)) continue;
         element_text(current, end, label, sizeof label);
-        char resolved[2048];
-        bool valid = !page || resolve_href(page, href, resolved, sizeof resolved);
-        if (page && valid) copy_text(href, sizeof href, resolved);
-        const char *provider = valid ? remote_browser_provider(href) : "";
-        bool file = valid && (strstr(href, ".pkg") || strstr(href, ".7z") ||
-            strstr(href, ".zip") || strstr(href, ".rar") || strstr(href, ".exfat") || strstr(href, ".ffpfsc"));
-        bool intermediate = page && valid && strstr(href, "/download.php?") &&
-            (!strncmp(href, "https://pspkg.com/", 18)
-#ifdef ORBIT_TEST
-             || (!strncmp(href, "http://127.0.0.1:", 17) && !strncmp(page, href, (size_t)(strchr(page + 17, '/') - page)))
-#endif
-            );
-        if ((!page && !*provider) || !strcmp(provider, "pspkg") ||
-            (page && !*edition && !intermediate)) continue;
-        if (page && !*provider && !file && !intermediate && !phrase(label, "download")) continue;
+        const char *provider = remote_browser_provider(href);
+        bool intermediate = !public_page && directory && !strncmp(href, page, directory) &&
+            !strncmp(href + directory, "download.php?", sizeof "download.php?" - 1);
+        unsigned labels = pspkg_link_labels(edition);
+        if (!intermediate) {
+            if (!provider_capture_url(&locator, href)) continue;
+            unsigned local = pspkg_link_labels(label) | pspkg_nearby_labels(parents, depth);
+            if (heading) local |= pspkg_link_labels(heading);
+            if (!local) continue;
+            labels |= local;
+        }
+        bool base = !(labels & PSPKG_OTHER_LABEL);
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "url", href);
         cJSON_AddStringToObject(item, "name", provider);
@@ -1219,15 +1279,13 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         if (*edition) cJSON_AddStringToObject(item, "edition", edition);
         if (*group) cJSON_AddStringToObject(item, "group", group);
         if (*password) cJSON_AddStringToObject(item, "archivePassword", password);
-        if (valid) {
-            char name[sizeof ((Release *)0)->filename] = "";
-            if (!tag_value(current, end, "download", name, sizeof name) &&
-                !tag_value(current, end, "data-filename", name, sizeof name) && file)
-                remote_url_filename(href, name, sizeof name);
-            Release detected = {0};
-            if (safe_page_name(name) && !remote_provider_file_format(&detected, name, NULL))
-                cJSON_AddStringToObject(item, "filename", name);
-        }
+        char filename[sizeof locator.filename] = "";
+        if (!tag_value(current, end, "download", filename, sizeof filename) &&
+            !tag_value(current, end, "data-filename", filename, sizeof filename) && !*provider && !intermediate)
+            remote_url_filename(href, filename, sizeof filename);
+        Release detected = {0};
+        if (safe_page_name(filename) && !remote_provider_file_format(&detected, filename, NULL))
+            cJSON_AddStringToObject(item, "filename", filename);
         bool unsupported = phrase(edition, "zstd") || phrase(edition, "lz4") ||
                            phrase(label, "zstd") || phrase(label, "lz4") || phrase(edition, "pfs");
         bool multipart = phrase(edition, "part") || phrase(edition, "multipart") ||
@@ -1270,9 +1328,7 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
             if (isdigit((unsigned char)*part)) cJSON_AddNumberToObject(item, "part", strtol(part, NULL, 10));
         }
         if (intermediate) cJSON_AddTrueToObject(item, "intermediate");
-        if (page && (!valid || (!*provider && !file && !intermediate)))
-            cJSON_AddStringToObject(item, "filterReason", "unsafe-url");
-        else if (unsupported) cJSON_AddStringToObject(item, "filterReason", "unsupported-format");
+        if (unsupported) cJSON_AddStringToObject(item, "filterReason", "unsupported-format");
         else if (multipart) cJSON_AddStringToObject(item, "filterReason", "multipart");
         else if (!base) cJSON_AddStringToObject(item, "filterReason", "unsupported-category");
         else cJSON_AddStringToObject(item, "filterReason", "");
@@ -1296,10 +1352,12 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
     return links;
 }
 
-cJSON *remote_pspkg_links(const char *html) { return pspkg_page_links(html, NULL, NULL); }
+cJSON *remote_pspkg_links(const char *html, const char *page) {
+    return pspkg_page_links(html, page, NULL, true);
+}
 
 cJSON *remote_pspkg_session_links(const char *html, const char *page, const char *heading) {
-    return pspkg_page_links(html, page, heading);
+    return pspkg_page_links(html, page, heading, false);
 }
 
 static cJSON *pspkg_field_labels(const char *html) {
@@ -1593,7 +1651,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     }
     if (pspkg && links && page.body && !page.truncated && !response_challenge(&page) &&
         (ok || metadata->status == REMOTE_METADATA_INTERACTIVE)) {
-        *links = remote_pspkg_links(page.body);
+        *links = remote_pspkg_links(page.body, page.url);
         cJSON *row;
         cJSON_ArrayForEach(row, *links) {
             if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "metadataEligible"))) {
@@ -1601,7 +1659,12 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
                 continue;
             }
             Release provider = *r;
-            copy_text(provider.browser_url, sizeof provider.browser_url, json_text(row, "url"));
+            const char *target = json_text(row, "url");
+            provider.remote_page = *remote_browser_provider(target) != 0;
+            provider.remote_provider_page[0] = 0;
+            provider.url[0] = provider.browser_url[0] = 0;
+            if (provider.remote_page) copy_text(provider.browser_url, sizeof provider.browser_url, target);
+            else copy_text(provider.url, sizeof provider.url, target);
             RemoteFileMetadata downstream;
             remote_download_metadata(&provider, &downstream, NULL);
             cJSON_AddBoolToObject(row, "getAttempted", downstream.attempted);
