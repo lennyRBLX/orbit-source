@@ -76,7 +76,9 @@ static bool match_prefix(BrowserMatch *match, const unsigned char *bytes, size_t
                     candidate[j] = 0;
                     char resolved[sizeof candidate];
                     memcpy(resolved, candidate, j + 1);
-                    bool current = strcmp(match->release->source, "akirabox") || current_akira_route(resolved);
+                    bool current = (strcmp(match->release->source, "akirabox") &&
+                                    strcmp(match->release->source, "pspkg")) ||
+                                   current_akira_route(resolved);
                     bool rejected = false;
                     for (size_t k = 0; k < match->rejected_count; k++)
                         if (!strcmp(match->rejected[k], resolved) &&

@@ -500,6 +500,8 @@ export default function App() {
       download={orbit.download}
       browser={orbit.browser}
       openProvider={orbit.openProvider}
+      fetchPspkgLinks={orbit.fetchPspkgLinks}
+      downloadPspkgLink={orbit.downloadPspkgLink}
       openQueue={openDownload}
       library={library.stale ? [] : library.snapshot?.games || []}
       openLibrary={openLibrary}

@@ -502,15 +502,27 @@ class RemoteCatalogueTests(unittest.TestCase):
             links = service.command("pspkg-links", html=html)
             self.assertEqual([link["url"] for link in links], ["https://vikingfile.com/f/game123"])
 
+    def test_pspkg_handoff_accepts_provider_pages_or_verifiable_file_candidates(self):
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            for url, expected in (
+                ("https://vik1ngf1le.online/f/54VHFcPHGM", True),
+                ("https://vikingfile.com/f/not-a-file", False),
+                ("https://files.example.org/game.pkg?token=abc", True),
+                ("https://pspkg.com/ps5/game.pkg", False),
+                ("https://files.example.org/landing", False),
+            ):
+                self.assertEqual(service.command("pspkg-candidate", url=url), expected, url)
+
     def test_pspkg_scan_fetches_general_ps5_and_ps4_pages(self):
         server = FixtureServer()
         for platform in ("ps5", "ps4"):
             server.downloads[f"/{platform}/?page=1"] = (200, {"Content-Type": "text/html"},
                 (f'<a href="/{platform}/sample-game-123.html">Sample</a>'
                  '<a href="/arabic-games/arabic-game-456.html">Arabic</a>').encode())
+            public = (b'<div>Game PKG <a href="https://vikingfile.com/f/game123">Download</a></div>'
+                      if platform == "ps5" else b'<p>Downloads require verification</p>')
             server.downloads[f"/{platform}/sample-game-123.html"] = (200, {"Content-Type": "text/html"},
-                b'<h1>Sample &amp; Game</h1><div>Game PKG '
-                b'<a href="https://vikingfile.com/f/game123">Download</a></div>')
+                b'<h1>Sample &amp; Game</h1>' + public)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -525,8 +537,15 @@ class RemoteCatalogueTests(unittest.TestCase):
                     self.assertEqual(len(packages), 1)
                     self.assertEqual(packages[0]["title"], "Sample & Game")
                     self.assertEqual(packages[0]["category"], platform.upper())
-                    self.assertEqual(packages[0]["downloadLinks"][0]["url"],
-                                     "https://vikingfile.com/f/game123")
+                    links = packages[0]["downloadLinks"]
+                    self.assertEqual(len(links), 2 if platform == "ps5" else 1)
+                    self.assertEqual(links[-1], {
+                        "name": "PSPKG",
+                        "url": f"{server.url.replace('/catalogue.json', f'/{platform}/')}download-sample-game-123.html?id=123",
+                        "page": True,
+                    })
+                    if platform == "ps5":
+                        self.assertEqual(links[0]["url"], "https://vikingfile.com/f/game123")
         finally:
             server.shutdown()
             server.server_close()

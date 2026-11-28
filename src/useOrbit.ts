@@ -182,6 +182,22 @@ export function useOrbit() {
     await polling.current;
     await refresh();
   };
+  const fetchPspkgLinks = async (releaseId: string) => {
+    const status = await api<BrowserSession>("/browser", {
+      action: "pspkg-links", releaseId, returnToOrbit: true,
+    });
+    if (alive.current) setBrowser(status);
+    await polling.current;
+    await refresh();
+  };
+  const downloadPspkgLink = async (releaseId: string, linkId: string, storageId: string) => {
+    const status = await api<BrowserSession>("/browser", {
+      action: "pspkg-download", releaseId, linkId, storageId, returnToOrbit: true,
+    });
+    if (alive.current) setBrowser(status);
+    await polling.current;
+    await refresh();
+  };
   const cancelProvider = async (id: string) => {
     const status = await api<BrowserSession>("/browser", {
       action: "cancel",
@@ -246,6 +262,8 @@ export function useOrbit() {
     browser,
     ready,
     openProvider,
+    fetchPspkgLinks,
+    downloadPspkgLink,
     cancelProvider,
     favorites,
     favorite,

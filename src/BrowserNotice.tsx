@@ -42,6 +42,8 @@ export function BrowserNotice({
   const heading =
     session.state === "queued"
       ? t("Added to Downloads")
+      : session.state === "links-ready"
+        ? t("PSPKG links ready")
       : session.state === "failed"
         ? t("Verification couldn't finish")
         : session.state === "cancelled"

@@ -2,6 +2,8 @@
 #include "remote_sources.h"
 #include "browser_platform.h"
 #include "browser_match.h"
+#include "debrid.h"
+#include "pspkg.h"
 #include "viking_session.h"
 #include "viking_pass.h"
 #include "network.h"
@@ -16,12 +18,16 @@ static struct {
     pthread_t thread;
     pthread_cond_t changed;
     bool ready, stop, pending, busy, thread_started, return_to_browser, native_dialog, dialog_opened, account;
-    bool check_account, resolving;
+    bool check_account, resolving, pspkg_fetch, pspkg_download;
     atomic_bool cancel;
     char id[33], state[16], message[256], job_id[33], title[128], client_id[65];
     char queued_job_id[sizeof ((Job *)0)->id];
     char mirror_page[128];
     char native_failure[256];
+    char pspkg_release_id[sizeof ((Release *)0)->id];
+    PspkgLink pspkg_links[PSPKG_LINK_LIMIT], pspkg_selected;
+    size_t pspkg_count;
+    time_t pspkg_expires;
     Release release;
     Storage storage;
     Job refresh_job;
@@ -177,7 +183,8 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
     session.link_ms = milliseconds() - session.started_ms;
     session.candidates++;
     pthread_mutex_unlock(&orbit.mutex);
-    return !community || !verify_community_capture(community, r, candidate, error, cap);
+    return !strcmp(r->source, "pspkg") || !community ||
+        !verify_community_capture(community, r, candidate, error, cap);
 #else
     if (!active()) return false;
     if (!session.native_dialog && probe_browser_open(r->browser_url)) {
@@ -252,7 +259,7 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
                 if (!session.stop && !atomic_load(&session.cancel))
                     state_locked("validating", "Checking the selected file before adding it to Downloads…");
                 pthread_mutex_unlock(&orbit.mutex);
-                int invalid = community
+                int invalid = !strcmp(r->source, "pspkg") ? 0 : community
                     ? verify_community_capture(community, &candidate, candidate.url, error, cap)
                     : validate_capture(&candidate, etag, modified, error, cap);
                 memset(&candidate, 0, sizeof candidate);
@@ -272,7 +279,7 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
                     if (++failures == 18) return false;
                     continue;
                 }
-                *validated = true;
+                *validated = strcmp(r->source, "pspkg") != 0;
                 copy_text(r->url, sizeof r->url, match.url);
                 memset(&match, 0, sizeof match);
                 memset(rejected, 0, sizeof rejected);
@@ -382,6 +389,185 @@ static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
     pthread_cond_broadcast(&orbit.changed);
 }
 
+typedef struct {
+    char platform[4], game_id[13];
+    PspkgLink links[PSPKG_LINK_LIMIT];
+    size_t count;
+} PspkgCollection;
+
+#ifndef ORBIT_TEST
+static bool pspkg_match(void *context, const unsigned char *bytes, size_t length) {
+    PspkgCollection *found = context;
+    pspkg_scan_links(bytes, length, found->platform, found->game_id,
+                     found->links, &found->count, PSPKG_LINK_LIMIT);
+    return false; /* The whole response may contain many choices. */
+}
+#endif
+
+static bool collect_pspkg(const Release *release, PspkgCollection *found,
+                          char *error, size_t cap) {
+    if (!pspkg_page_identity(release->browser_url, found->platform,
+                             sizeof found->platform, found->game_id,
+                             sizeof found->game_id)) {
+        copy_text(error, cap, "This PSPKG game has no valid download page.");
+        return false;
+    }
+#ifdef ORBIT_TEST
+    const char *html = getenv("ORBIT_TEST_PSPKG_HTML");
+    if (html) pspkg_scan_links((const unsigned char *)html, strlen(html),
+                               found->platform, found->game_id,
+                               found->links, &found->count, PSPKG_LINK_LIMIT);
+#else
+    if (session.native_dialog) {
+        bool opened = false;
+        for (unsigned i = 0; i < 300 && active(); i++) {
+            pthread_mutex_lock(&orbit.mutex);
+            opened = session.dialog_opened;
+            pthread_mutex_unlock(&orbit.mutex);
+            if (opened) break;
+            delay();
+        }
+        if (!opened || !active()) {
+            copy_text(error, cap, "The PSPKG page did not open. Return to Orbit and try again.");
+            return false;
+        }
+    } else if (probe_browser_open(release->browser_url)) {
+        copy_text(error, cap, "The PS5 browser could not open the PSPKG page.");
+        return false;
+    }
+    pthread_mutex_lock(&orbit.mutex);
+    if (!atomic_load(&session.cancel))
+        state_locked("waiting-link", "Complete PSPKG verification if shown, then wait for its download choices.");
+    pthread_mutex_unlock(&orbit.mutex);
+    const time_t deadline = monotonic() + PROBE_SESSION_SECONDS;
+    ProbeTarget targets[PROBE_TARGET_LIMIT] = {{0}};
+    int count = 0;
+    int64_t last_new = 0;
+    PspkgCollection *collection = found;
+    ProbeReader reader = {.read = probe_target_read, .active = native_active,
+        .match = pspkg_match, .match_context = collection,
+        .remaining = PROBE_SESSION_BUDGET};
+    while (active() && monotonic() < deadline && reader.remaining) {
+        ProbeTarget current[PROBE_TARGET_LIMIT] = {{0}};
+        int n = probe_targets_find(current, PROBE_TARGET_LIMIT);
+        if (n < 0) {
+            copy_text(error, cap, "Orbit could not read the PS5 browser status.");
+            return false;
+        }
+        for (int i = 0; i < n; i++) {
+            current[i].cancel = &session.cancel;
+            current[i].deadline = deadline;
+            for (int j = 0; j < count; j++)
+                if (current[i].pid == targets[j].pid &&
+                    current[i].started_seconds == targets[j].started_seconds &&
+                    current[i].started_microseconds == targets[j].started_microseconds &&
+                    !strcmp(current[i].name, targets[j].name))
+                    current[i].cursor = targets[j].cursor;
+        }
+        memcpy(targets, current, sizeof targets);
+        count = n;
+        for (int i = 0; i < count && active() && reader.remaining; i++) {
+            reader.context = &targets[i];
+            size_t before = found->count;
+            (void)probe_target_scan_slice(&targets[i], &reader,
+                                          "download.php?game_id=", PROBE_SCAN_SLICE);
+            if (found->count > before) last_new = milliseconds();
+        }
+        pthread_mutex_lock(&orbit.mutex);
+        session.scanned_bytes = reader.attempted;
+        session.browser_processes = (unsigned)count;
+        session.candidates = (unsigned)found->count;
+        pthread_mutex_unlock(&orbit.mutex);
+        if (found->count && milliseconds() - last_new >= 1500) break;
+        delay();
+    }
+#endif
+    if (found->count) return true;
+    if (!error[0]) copy_text(error, cap,
+        "PSPKG did not reveal download links. Complete the check on that game's page and try again.");
+    return false;
+}
+
+/* A PSPKG choice is a browser-only handoff. Resolve its actual provider page
+ * first, then use TorBox for a covered host or verify the provider's file. */
+static void download_pspkg(void) {
+    Release selected = session.release;
+    PspkgLink choice = session.pspkg_selected;
+    Storage storage = session.storage;
+    pthread_mutex_unlock(&orbit.mutex);
+    char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
+    bool validated = false, ok = active();
+    Release locator = selected;
+    copy_text(locator.source, sizeof locator.source, "pspkg");
+    copy_text(locator.browser_url, sizeof locator.browser_url, choice.url);
+    locator.url[0] = 0;
+    if (ok) ok = capture(&locator, NULL, etag, modified, &validated, error, sizeof error);
+    Release route = selected;
+    const char *provider = ok ? remote_browser_provider(locator.url) : "";
+    if (ok) {
+        if (*provider) {
+            copy_text(route.browser_url, sizeof route.browser_url, locator.url);
+            route.url[0] = 0;
+        } else {
+            pthread_mutex_lock(&orbit.mutex);
+            state_locked("validating", "Checking the PSPKG file before adding it to Downloads…");
+            pthread_mutex_unlock(&orbit.mutex);
+            ok = !remote_download_verify(&route, locator.url, &session.cancel, error, sizeof error);
+            validated = ok;
+        }
+    }
+    pthread_mutex_lock(&orbit.mutex);
+    if (ok && *provider && !session.stop && !atomic_load(&session.cancel) && selected_locked() &&
+        debrid_link_covered_locked(&route)) {
+        Job *job = NULL;
+        int code = job_create_pspkg_torbox_locked(&route, &storage, error, sizeof error, &job);
+        if (code == 201 && job && !strcmp(job->delivery, "torbox")) {
+            copy_text(session.job_id, sizeof session.job_id, job->id);
+            state_locked("queued", "The PSPKG provider has been added to Downloads through TorBox.");
+            session.queued_ms = milliseconds() - session.started_ms;
+            ok = false; /* Completed; do not also start a direct download. */
+        } else error[0] = 0; /* Provider may still offer a direct file. */
+    }
+    bool queued = !strcmp(session.state, "queued");
+    if (ok && *provider && !queued && !session.stop && !atomic_load(&session.cancel) && selected_locked())
+        state_locked("waiting-link", "Open Download on the provider page. Orbit will check the file before adding it to Downloads.");
+    pthread_mutex_unlock(&orbit.mutex);
+    if (ok && *provider && !queued && active()) {
+        Release provider_page = route;
+        copy_text(provider_page.source, sizeof provider_page.source, provider);
+        copy_text(provider_page.url, sizeof provider_page.url, route.browser_url);
+        ok = capture(&provider_page, &route, etag, modified, &validated, error, sizeof error);
+        if (ok && !validated) {
+            copy_text(error, sizeof error, "The provider file could not be verified.");
+            ok = false;
+        }
+        memset(&provider_page, 0, sizeof provider_page);
+    }
+    pthread_mutex_lock(&orbit.mutex);
+    if (!queued) {
+        if (session.stop || atomic_load(&session.cancel))
+            state_locked("cancelled", "PSPKG verification cancelled. No download was added.");
+        else if (!selected_locked())
+            state_locked("failed", "The source or catalogue option changed. Fetch PSPKG links again.");
+        else if (ok) {
+            Job *job = NULL;
+            int code = job_create_captured_locked(&route, &storage, etag, modified,
+                                                  error, sizeof error, &job);
+            if (code == 201 && job) {
+                copy_text(session.job_id, sizeof session.job_id, job->id);
+                state_locked("queued", "The verified PSPKG file has been added to Downloads.");
+                session.queued_ms = milliseconds() - session.started_ms;
+            } else state_locked("failed", error);
+        } else state_locked("failed", error[0] ? error : "PSPKG verification stopped. Try this link again.");
+    }
+    memset(&locator, 0, sizeof locator);
+    memset(&route, 0, sizeof route);
+    memset(&session.release, 0, sizeof session.release);
+    memset(&session.pspkg_selected, 0, sizeof session.pspkg_selected);
+    session.pspkg_download = session.busy = false;
+    session.finished_ms = milliseconds() - session.started_ms;
+}
+
 static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
@@ -432,6 +618,35 @@ static void *worker(void *unused) {
                 ? session.native_failure : "Sign in on Vikingfile, then return to Orbit.");
             session.finished_ms = milliseconds() - session.started_ms;
             session.busy = false;
+            continue;
+        }
+        if (session.pspkg_fetch) {
+            Release selected = session.release;
+            pthread_mutex_unlock(&orbit.mutex);
+            PspkgCollection found = {0};
+            char error[256] = {0};
+            bool ok = active() && collect_pspkg(&selected, &found, error, sizeof error);
+            pthread_mutex_lock(&orbit.mutex);
+            if (ok && selected_locked() && !atomic_load(&session.cancel)) {
+                memcpy(session.pspkg_links, found.links, found.count * sizeof found.links[0]);
+                session.pspkg_count = found.count;
+                session.pspkg_expires = time(NULL) + 300;
+                copy_text(session.pspkg_release_id, sizeof session.pspkg_release_id, selected.id);
+                state_locked("links-ready", "PSPKG download choices are ready. Select one to continue.");
+            } else {
+                state_locked(session.native_failure[0] ? "failed" :
+                             atomic_load(&session.cancel) ? "cancelled" : "failed",
+                             session.native_failure[0] ? session.native_failure :
+                             error[0] ? error : "PSPKG verification stopped.");
+            }
+            memset(&found, 0, sizeof found);
+            memset(&session.release, 0, sizeof session.release);
+            session.finished_ms = milliseconds() - session.started_ms;
+            session.pspkg_fetch = session.busy = false;
+            continue;
+        }
+        if (session.pspkg_download) {
+            download_pspkg();
             continue;
         }
         Release resolved = session.release;
@@ -544,6 +759,7 @@ static int start_worker_locked(void) {
 static void begin_download_locked(const Release *r, const Storage *storage, const Job *refresh,
                                   bool native, const char *client, bool return_to_browser) {
     session.account = session.check_account = false;
+    session.pspkg_fetch = session.pspkg_download = false;
     session.resolving = remote_page_pending(r) || !strcmp(r->source, "vikingfile");
     session.release = *r;
     if (storage) session.storage = *storage;
@@ -593,7 +809,7 @@ void browser_stop(void) {
 cJSON *browser_diagnostics_locked(void) {
     cJSON *o = cJSON_CreateObject();
     const char *state = "idle";
-    const char *states[] = {"opening", "waiting", "waiting-link", "validating", "queued", "cancelled", "failed"};
+    const char *states[] = {"opening", "waiting", "waiting-link", "validating", "links-ready", "queued", "cancelled", "failed"};
     for (size_t i = 0; i < sizeof states / sizeof *states; i++)
         if (!strcmp(session.state, states[i])) state = states[i];
     cJSON_AddStringToObject(o, "state", state);
@@ -642,6 +858,20 @@ cJSON *browser_status(void) {
     cJSON_AddStringToObject(o, "message", session.message);
     cJSON_AddStringToObject(o, "jobId", session.job_id);
     cJSON_AddStringToObject(o, "title", session.title);
+    if (session.pspkg_release_id[0] && time(NULL) < session.pspkg_expires) {
+        cJSON_AddStringToObject(o, "pspkgReleaseId", session.pspkg_release_id);
+        cJSON *choices = cJSON_AddArrayToObject(o, "pspkgLinks");
+        for (size_t i = 0; choices && i < session.pspkg_count; i++) {
+            cJSON *choice = cJSON_CreateObject();
+            char id[26];
+            snprintf(id, sizeof id, "%s:%s", session.pspkg_links[i].edition_id,
+                     session.pspkg_links[i].link_id);
+            if (!choice || !cJSON_AddStringToObject(choice, "id", id) ||
+                !cJSON_AddStringToObject(choice, "label", "PSPKG") ||
+                !cJSON_AddNumberToObject(choice, "number", (double)i + 1) ||
+                !cJSON_AddItemToArray(choices, choice)) cJSON_Delete(choice);
+        }
+    }
     /* Durations/counters only. Never disclose browser bytes, file URLs, process
      * addresses, cookies or verification data through diagnostics. */
     if (session.started_ms) {
@@ -708,7 +938,9 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             if (session.native_failure[0]) state_locked("failed", session.native_failure);
             else state_locked("cancelled", "Verification cancelled. No download was added.");
         }
-    } else if (strcmp(action, "start") && strcmp(action, "refresh") && strcmp(action, "viking-account") && strcmp(action, "viking-check")) {
+    } else if (strcmp(action, "start") && strcmp(action, "refresh") &&
+               strcmp(action, "pspkg-links") && strcmp(action, "pspkg-download") &&
+               strcmp(action, "viking-account") && strcmp(action, "viking-check")) {
         copy_text(error, cap, "Unknown browser action."); code = 400;
     } else if (!session.ready || session.stop || !available()) {
         copy_text(error, cap, "Provider verification is available on the PS5 only."); code = 409;
@@ -758,6 +990,63 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             atomic_store(&session.cancel, false);
             state_locked(session.check_account ? "validating" : "opening", session.check_account ? "Checking sign-in…" : "Opening Vikingfile sign-in…");
             pthread_cond_signal(&session.changed);
+            code = 202;
+            goto done;
+        }
+        if (!strcmp(action, "pspkg-links") || !strcmp(action, "pspkg-download")) {
+            bool download = !strcmp(action, "pspkg-download");
+            Release *r = release_find(json_text(input, "releaseId"));
+            char platform[4], game_id[13];
+            if (!r || strcmp(r->source, "remote") ||
+                (strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) &&
+                 strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE)) ||
+                !pspkg_page_identity(r->browser_url, platform, sizeof platform,
+                                     game_id, sizeof game_id)) {
+                copy_text(error, cap, "Select a general PSPKG PS4 or PS5 game."); code = 400;
+                goto done;
+            }
+            if (!source_enabled_locked(r)) {
+                copy_text(error, cap, "Enable this PSPKG catalogue in Sources first."); code = 409;
+                goto done;
+            }
+            Storage drives[ORBIT_MAX_STORAGE], *storage = NULL;
+            PspkgLink *choice = NULL;
+            if (download) {
+                size_t n = storage_list(drives);
+                for (size_t i = 0; i < n; i++)
+                    if (!strcmp(drives[i].id, json_text(input, "storageId"))) storage = &drives[i];
+                if (strcmp(session.pspkg_release_id, r->id) ||
+                    time(NULL) >= session.pspkg_expires) {
+                    copy_text(error, cap, "Fetch this game's PSPKG links again."); code = 409;
+                    goto done;
+                }
+                for (size_t i = 0; i < session.pspkg_count; i++) {
+                    char id[26];
+                    snprintf(id, sizeof id, "%s:%s", session.pspkg_links[i].edition_id,
+                             session.pspkg_links[i].link_id);
+                    if (!strcmp(id, json_text(input, "linkId")))
+                        choice = &session.pspkg_links[i];
+                }
+                if (!choice || !storage) {
+                    copy_text(error, cap, "Select a PSPKG link and connected drive."); code = 400;
+                    goto done;
+                }
+            }
+            if (start_worker_locked()) {
+                copy_text(error, cap, "PSPKG verification could not start. Try again."); code = 503;
+                goto done;
+            }
+            PspkgLink selected = choice ? *choice : (PspkgLink){0};
+            begin_download_locked(r, storage, NULL, false, "", true);
+            session.pspkg_fetch = !download;
+            session.pspkg_download = download;
+            session.pspkg_selected = selected;
+            if (!download) {
+                session.pspkg_count = 0;
+                session.pspkg_release_id[0] = 0;
+                session.pspkg_expires = 0;
+                state_locked("opening", "Opening this game's PSPKG download page…");
+            } else state_locked("opening", "Opening the selected PSPKG link…");
             code = 202;
             goto done;
         }

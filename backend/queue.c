@@ -575,6 +575,21 @@ int job_create_captured_locked(const Release *r, const Storage *s, const char *e
     }
     return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
 }
+int job_create_pspkg_torbox_locked(const Release *r, const Storage *s,
+                                   char *err, size_t cap, Job **result) {
+    if (!r || !s || strcmp(r->source, "remote") || !remote_page_pending(r) ||
+        (strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) &&
+         strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE)) ||
+        !*remote_browser_provider(r->browser_url) || !debrid_link_covered_locked(r)) {
+        copy_text(err, cap, "TorBox does not support this PSPKG provider.");
+        return 409;
+    }
+    /* create_locked can fall back to direct when preparation fails. A PSPKG
+     * provider page has no direct file yet, so reject that case up front. */
+    Job prepared = {0};
+    if (debrid_prepare_locked(r, &prepared, err, cap) != 200) return 409;
+    return create_locked(r, s->id, s, NULL, NULL, false, "torbox", err, cap, result);
+}
 int job_create_link_locked(const Release *r, const Storage *s, const char *etag,
                            const char *modified, char *err, size_t cap, Job **result) {
     if (!link_release_valid(r)) {
