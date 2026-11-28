@@ -84,7 +84,7 @@ static const char *reason(const char *error) {
     if (strstr(error, "Source check failed")) return "source-check-failed";
     if (strstr(error, "Source size changed")) return "source-size-changed";
     if (strstr(error, "Source identity") || strstr(error, "Source changed")) return "source-identity-changed";
-    if (strstr(error, "Source disabled")) return "source-disabled";
+    if (!strcmp(error, "This download option is no longer available.")) return "source-disabled";
     if (strstr(error, "space")) return "insufficient-space";
     if (strstr(error, "missing") || strstr(error, "Reconnect")) return "destination-unavailable";
     if (strstr(error, "already exists")) return "destination-exists";

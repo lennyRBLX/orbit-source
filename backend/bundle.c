@@ -259,7 +259,7 @@ static int start_locked(const cJSON *input, char *error, size_t cap) {
             return 404;
         }
         if (!source_enabled_locked(r)) {
-            copy_text(error, cap, "Enable this source and acknowledge the download notice in Sources first.");
+            copy_text(error, cap, "This download option is no longer available.");
             return 409;
         }
         Item *it = &list[n++];

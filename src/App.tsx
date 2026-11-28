@@ -27,7 +27,6 @@ import { ArchiveSetting } from "./ArchiveSetting";
 import { PackageSetting } from "./PackageSetting";
 import { PowerSetting } from "./PowerSetting";
 import { HistorySetting } from "./HistoryRemoval";
-import { Sources } from "./Sources";
 import { Pairing } from "./Pairing";
 import type { Game, LibraryTarget } from "./types";
 import { browseGames, catalogueGenres, catalogueTags, choiceCounts, newOnOrbitPicks, newlyAddedGames, defaultFilters, downloadFormats, matchesDownloadFormat, CATALOG_STEP, DOWNLOAD_FORMATS, TAGS, TORBOX_SOURCE, type BrowseFilters, type CountedFilter } from "./browse";
@@ -96,8 +95,7 @@ export default function App() {
       handoffReady !== handoffHash ||
       orbit.error ||
       !orbit.ready ||
-      !orbit.system?.paired ||
-      !orbit.sources?.acknowledged
+      !orbit.system?.paired
     )
       return;
     const selection = parseBrowserHandoff(handoffHash);
@@ -105,9 +103,7 @@ export default function App() {
     setHandoffError(
       selected
         ? ""
-        : t(
-            "This download option is no longer available. Check your enabled sources, then choose a game and source in Browse.",
-          ),
+        : t("This download option is no longer available."),
     );
     setHandoff(selected ? selection : null);
     setGameId(selected?.id || null);
@@ -126,13 +122,12 @@ export default function App() {
     orbit.error,
     orbit.ready,
     orbit.system?.paired,
-    orbit.sources?.acknowledged,
     orbit.games,
+    orbit.addons,
   ]);
   const [storageOpen, setStorageOpen] = useState(false),
     [notificationsOpen, setNotificationsOpen] = useState(false),
     [zeroOpen, setZeroOpen] = useState(false),
-    [sourcesOpen, setSourcesOpen] = useState(false),
     [autoOpen, setAutoOpen] = useState(false),
     [pairOpen, setPairOpen] = useState(false),
     [savedOpen, setSavedOpen] = useState(false);
@@ -228,7 +223,6 @@ export default function App() {
   const back = useCallback(() => {
     if (pairOpen) setPairOpen(false);
     else if (savedOpen) setSavedOpen(false);
-    else if (sourcesOpen) setSourcesOpen(false);
     else if (storageOpen) setStorageOpen(false);
     else if (notificationsOpen) setNotificationsOpen(false);
     else if (zeroOpen) setZeroOpen(false);
@@ -242,7 +236,7 @@ export default function App() {
         first?.focus({ preventScroll: true });
       });
     }
-  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, autoOpen, settingsPage, pairOpen, savedOpen, sourcesOpen, closeSettings]);
+  }, [game, tab, addonBase, storageOpen, notificationsOpen, zeroOpen, autoOpen, settingsPage, pairOpen, savedOpen, closeSettings]);
   const consoleBrowser =
     orbit.system?.platform === "ps5" && !!orbit.system.localSessionAvailable;
   useController(back, consoleBrowser);
@@ -410,13 +404,13 @@ export default function App() {
     <>
       <UpdateNotice
         enabled={!!orbit.system?.paired && orbit.system.platform !== "desktop"}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
+        hidden={autoOpen || pairOpen || storageOpen || notificationsOpen || zeroOpen}
         onViewUpdate={() => { setSettingsPage("updates"); if (iface === "store") setAutoOpen(true); }}
         onAvailable={setUpdateAvailable}
       />
       <AnnouncementNotice
         enabled={!!orbit.system?.paired}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
+        hidden={autoOpen || pairOpen || storageOpen || notificationsOpen || zeroOpen}
       />
       {orbit.error && (
         <div className="connection-error" role="status">
@@ -435,7 +429,7 @@ export default function App() {
         session={orbit.browser}
         cancel={orbit.cancelProvider}
         openQueue={openDownload}
-        hidden={autoOpen || pairOpen || sourcesOpen || storageOpen || notificationsOpen || zeroOpen}
+        hidden={autoOpen || pairOpen || storageOpen || notificationsOpen || zeroOpen}
       />
     </>
   );
@@ -461,20 +455,6 @@ export default function App() {
         )}
     </>
   );
-  const sourceSetupNode =
-    tab !== "Downloads" &&
-    tab !== "Library" &&
-    orbit.sources &&
-    !orbit.sources.acknowledged ? (
-      <section className="page source-setup">
-        <Sources
-          settings={orbit.sources}
-          paired={!!orbit.system?.paired}
-          pair={() => setPairOpen(true)}
-          save={orbit.saveSources}
-        />
-      </section>
-    ) : null;
   // Add-ons and Download all: Get everything.
   const bundleCatalog = {
     addons: orbit.addons,
@@ -731,27 +711,14 @@ export default function App() {
   const browseEmptyNode = (
     <div className="empty compact">
       <h2>{t(addonsPage ? /* i18n */ "No add-ons match these filters." : "No games found")}</h2>
-      <p>
-        {catalogueGames.length
-          ? filters.collection === "favorites"
-            ? t(
-                "Save a game from its details page, or adjust your filters.",
-              )
-            : t("Try another title, title ID or filter.")
-          : t("Your selected sources have no games in this build.")}
-      </p>
-      <button
-        onClick={() => {
-          if (!catalogueGames.length) setSourcesOpen(true);
-          else {
-            resetFilters();
-          }
-        }}
-      >
-        {catalogueGames.length
-          ? t("Reset filters")
-          : t("Choose sources")}
-      </button>
+      {catalogueGames.length > 0 && (
+        <>
+          <p>{filters.collection === "favorites"
+            ? t("Save a game from its details page, or adjust your filters.")
+            : t("Try another title, title ID or filter.")}</p>
+          <button onClick={resetFilters}>{t("Reset filters")}</button>
+        </>
+      )}
     </div>
   );
   const libraryNode = (
@@ -792,48 +759,15 @@ export default function App() {
       preferredDrive={orbit.system?.preferredStorage}
     />
   );
-  // Before games arrive (opening, unreachable, no sources), in every interface.
   const discoverEmptyNode = (
     <div className="empty">
-      {orbit.sources?.acknowledged ? (
-        <Icon name="sources" />
-      ) : (
-        <Loader />
-      )}
-      <h1>
-        {orbit.error
-          ? t("Orbit isn’t reachable")
-          : orbit.sources?.acknowledged
-            ? orbit.sources.enabled.length
-              ? t("No games from your selected sources")
-              : t("No sources enabled")
-            : t("Opening Orbit Store…")}
-      </h1>
-      {orbit.error ? (
-        <p>
-          {t(
-            "Check that Orbit is running on your PS5, then reconnect.",
-          )}
-        </p>
-      ) : (
-        orbit.sources?.acknowledged && (
-          <>
-            <p>
-              {orbit.sources.enabled.length
-                ? t(
-                    "There are no compatible releases from these sources in this build. Choose another source to browse.",
-                  )
-                : t("Choose a download source to see its games.")}
-            </p>
-            <button
-              className="primary"
-              onClick={() => setSourcesOpen(true)}
-            >
-              {t("Choose sources")}
-            </button>
-          </>
-        )
-      )}
+      {(orbit.error || orbit.ready) ? <Icon name="sources" /> : <Loader />}
+      <h1>{orbit.error
+        ? t("Orbit isn’t reachable")
+        : orbit.ready
+          ? t("No games found")
+          : t("Opening Orbit Store…")}</h1>
+      {orbit.error && <p>{t("Check that Orbit is running on your PS5, then reconnect.")}</p>}
     </div>
   );
   const downloadsPanel = <>
@@ -894,19 +828,6 @@ export default function App() {
       choose={(section) => { setSettingsSection(undefined); setSettingsPage(section); }}
       system={orbit.system}
       updateAvailable={updateAvailable}
-      sourceSettings={orbit.sources}
-      sources={
-        orbit.sources ? (
-          <Sources
-            rows
-            settings={orbit.sources}
-            paired={!!orbit.system?.paired}
-            pair={() => setSettingsPage("pair")}
-            save={orbit.saveSources}
-            saved={() => { closeSettings(); go("Browse"); }}
-          />
-        ) : null
-      }
       storage={storagePanel}
       downloads={downloadsPanel}
       notifications={notificationsPanel}
@@ -951,7 +872,6 @@ export default function App() {
           nodes={{
             notices: noticesNode,
             handoffNotices: handoffNoticesNode,
-            sourceSetup: sourceSetupNode,
             discoverEmpty: discoverEmptyNode,
             details: detailsNode,
             browseSearch: browseSearchNode,
@@ -1036,9 +956,7 @@ export default function App() {
       {noticesNode}
       <main>
         {handoffNoticesNode}
-        {sourceSetupNode ? (
-          sourceSetupNode
-        ) : game ? (
+        {game ? (
           detailsNode
         ) : tab === "Discover" ? (
           focused ? (
@@ -1263,27 +1181,6 @@ export default function App() {
         <Modal title={t("App settings")} close={() => closeSettings()} className="settings-modal">
           <h1>{t("App settings")}</h1>
           {settingsNode}
-        </Modal>
-      )}
-      {sourcesOpen && orbit.sources && (
-        <Modal
-          title={t("Download sources")}
-          close={() => setSourcesOpen(false)}
-          className="sources-modal"
-        >
-          <Sources
-            settings={orbit.sources}
-            paired={!!orbit.system?.paired}
-            pair={() => {
-              setSourcesOpen(false);
-              setPairOpen(true);
-            }}
-            save={orbit.saveSources}
-            saved={() => {
-              setSourcesOpen(false);
-              go("Browse");
-            }}
-          />
         </Modal>
       )}
       {savedOpen && (

@@ -30,7 +30,6 @@ Orbit orbit = {.releases = releases,
                .changed = PTHREAD_COND_INITIALIZER,
                .port = ORBIT_HTTP_PORT,
                .state_fd = -1,
-               .sources = {.enabled = ORBIT_SOURCE_REMOTE},
                .delete_archives = true,
                .extract_archives = true,
                .download_notifications = true,
@@ -286,10 +285,6 @@ static cJSON *state_json_locked(void) {
     cJSON_AddNumberToObject(o, "debridNextCreate", (double)orbit.debrid_next_create);
     cJSON_AddItemToObject(o, "favorites", favorites_json_locked());
     cJSON_AddItemToObject(o, "savedFilters", saved_filters_json_locked());
-    cJSON *sources = cJSON_AddObjectToObject(o, "sources");
-    cJSON_AddNumberToObject(sources, "enabled", orbit.sources.enabled);
-    cJSON_AddNumberToObject(sources, "noticeVersion", orbit.sources.notice_version);
-    cJSON_AddNumberToObject(sources, "acknowledgedAt", (double)orbit.sources.acknowledged_at);
     for (size_t i = 0; i < orbit.job_count; i++)
         if (orbit.jobs[i].id[0])
             cJSON_AddItemToArray(a, job_json(&orbit.jobs[i], true));
@@ -449,14 +444,6 @@ int state_load(void) {
     if (cJSON_IsNumber(connections) && connections->valuedouble >= 1 &&
         connections->valuedouble <= ORBIT_MAX_RANGES && connections->valuedouble == connections->valueint)
         orbit.download_connections = (unsigned)connections->valueint;
-    const cJSON *sources = cJSON_GetObjectItemCaseSensitive(o, "sources");
-    if (json_int(sources, "noticeVersion") == ORBIT_SOURCE_NOTICE_VERSION &&
-        json_int(sources, "acknowledgedAt") > 0 && json_int(sources, "enabled") >= 0 &&
-        json_int(sources, "enabled") <= ORBIT_SOURCE_ALL) {
-        orbit.sources.enabled = (unsigned)json_int(sources, "enabled");
-        orbit.sources.notice_version = ORBIT_SOURCE_NOTICE_VERSION;
-        orbit.sources.acknowledged_at = (time_t)json_int(sources, "acknowledgedAt");
-    }
     /* tokenUsed lines up with tokens; releases before 1.8.1 saved no times. */
     const cJSON *used = cJSON_GetObjectItemCaseSensitive(o, "tokenUsed");
     int token_index = 0;
@@ -658,12 +645,15 @@ int state_load(void) {
             j->error[0] = 0;
             j->retry_at = 0;
         }
-        if (!source_enabled_locked(r) &&
+        bool available = source_enabled_locked(r);
+        if (!available &&
             (!strcmp(j->status, "queued") || !strcmp(j->status, "retrying") ||
              !strcmp(j->status, "paused"))) {
             copy_text(j->status, sizeof j->status, "paused");
-            copy_text(j->error, sizeof j->error,
-                      "Source disabled. Enable it in Sources before resuming.");
+            copy_text(j->error, sizeof j->error, "This download option is no longer available.");
+        } else if (available && !strcmp(j->status, "paused") &&
+                   !strcmp(j->error, "Source disabled. Enable it in Sources before resuming.")) {
+            j->error[0] = 0;
         }
     }
     cJSON_Delete(o);

@@ -436,12 +436,7 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
     if (!local_host(host))
         return error(c, 403, "Use the console IP address or a .local or .home.arpa hostname to access Orbit.");
     bool get = !strcmp(method, "GET"), post = !strcmp(method, "POST");
-    const char remote_path[] = "/api/v1/remote-sources";
-    size_t remote_prefix = sizeof remote_path - 1;
-    bool remote_route = !strncmp(url, remote_path, remote_prefix) &&
-                        (!url[remote_prefix] || url[remote_prefix] == '/');
-    bool patch = remote_route && !strcmp(method, "PATCH"), remove = remote_route && !strcmp(method, "DELETE");
-    if (!get && !post && !patch && !remove)
+    if (!get && !post)
         return error(c, 405, "Method not supported.");
     const char *origin = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Origin");
     char expected[270];
@@ -451,7 +446,7 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
     const char *site = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Sec-Fetch-Site");
     if (!strncmp(url, "/api/", 5) && site && strcmp(site, "same-origin") && strcmp(site, "none"))
         return error(c, 403, "Open Orbit directly on this console or your local network.");
-    if (post || patch) {
+    if (post) {
         const char *ct = MHD_lookup_connection_value(c, MHD_HEADER_KIND, "Content-Type");
         if (!ct || (strcmp(url, "/api/v1/receive/chunk") ? strncasecmp(ct, "application/json", 16) : strcmp(ct, "application/octet-stream")))
             return error(c, 415, "Use application/json.");
@@ -585,6 +580,7 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         pthread_mutex_lock(&orbit.mutex);
         cJSON_AddBoolToObject(o, "stateHealthy", !orbit.state_failed);
         cJSON_AddNumberToObject(o, "catalogueRevision", orbit.catalog_revision);
+        cJSON_AddNumberToObject(o, "remoteGeneration", remote_sources_generation_locked());
         cJSON_AddStringToObject(o, "preferredStorage", orbit.preferred_storage);
         cJSON_AddBoolToObject(o, "deleteArchives", orbit.delete_archives);
         cJSON_AddBoolToObject(o, "extractArchives", orbit.extract_archives);
@@ -631,40 +627,12 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         pthread_mutex_unlock(&orbit.mutex);
         return o ? json_response(c, 200, o) : error(c, 503, "Orbit is short of memory. Try again shortly.");
     }
-    if (get && !strcmp(url, "/api/v1/sources")) {
+    if (!strcmp(url, "/api/v1/sources")) {
+        if (!get) return error(c, 405, "Method not supported.");
         pthread_mutex_lock(&orbit.mutex);
         cJSON *o = sources_json_locked();
         pthread_mutex_unlock(&orbit.mutex);
         return json_response(c, 200, o);
-    }
-    if (remote_route) {
-        const char *id = url[remote_prefix] ? url + remote_prefix + 1 : "";
-        bool list = !url[remote_prefix];
-        if ((get && !list) || (post && !list && strcmp(id, "refresh")) ||
-            ((patch || remove) && (list || !*id || strchr(id, '/'))))
-            return error(c, 404, "Community catalogue was not found.");
-        if (!authorized(c)) return error(c, 401, "Pair this device first.");
-        cJSON *input = post || patch ? cJSON_ParseWithLengthOpts((const char *)req->body,
-                                                                  req->length + 1, NULL, true) : NULL;
-        if ((post || patch) && (!cJSON_IsObject(input) || memchr(req->body, 0, req->length))) {
-            cJSON_Delete(input);
-            return error(c, 400, "Invalid catalogue settings.");
-        }
-        char message[256] = {0};
-        pthread_mutex_lock(&orbit.mutex);
-        int status = get ? 200 : remote_sources_change_locked(method, id, input, message, sizeof message);
-        cJSON *o = status < 400 ? remote_sources_json_locked() : NULL;
-        unsigned retry_after = status == 429 ? remote_sources_retry_after_locked() : 0;
-        pthread_mutex_unlock(&orbit.mutex);
-        cJSON_Delete(input);
-        if (status == 429) {
-            o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "error", message);
-            cJSON_AddNumberToObject(o, "retryAfter", retry_after);
-            return json_response(c, 429, o);
-        }
-        if (status >= 400) return error(c, (unsigned)status, message);
-        return o ? json_response(c, (unsigned)status, o) : error(c, 503, "Orbit is short of memory. Try again shortly.");
     }
     if (get && !strcmp(url, "/api/v1/session")) {
         if (!local_peer(c))
@@ -1156,15 +1124,6 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
             pthread_mutex_lock(&orbit.mutex);
             int code = history_clear_locked(input, e, sizeof e);
             cJSON *o = code == 200 ? jobs_json_locked() : NULL;
-            pthread_mutex_unlock(&orbit.mutex);
-            cJSON_Delete(input);
-            return o ? json_response(c, 200, o) : error(c, (unsigned)code, e);
-        }
-        if (post && !strcmp(url, "/api/v1/sources")) {
-            char e[256] = {0};
-            pthread_mutex_lock(&orbit.mutex);
-            int code = sources_set_locked(input, e, sizeof e);
-            cJSON *o = code == 200 ? sources_json_locked() : NULL;
             pthread_mutex_unlock(&orbit.mutex);
             cJSON_Delete(input);
             return o ? json_response(c, 200, o) : error(c, (unsigned)code, e);

@@ -21,19 +21,7 @@
 #define ORBIT_MAX_RANGES 64
 #define ORBIT_DEFAULT_CONNECTIONS 8
 #define ORBIT_VERSION "1.9.7"
-#define ORBIT_SOURCE_NOTICE_VERSION 1
-#define ORBIT_SOURCE_ARCHIVE 1U
-#define ORBIT_SOURCE_VIKINGFILE 2U
-#define ORBIT_SOURCE_AKIRABOX 4U
-#define ORBIT_SOURCE_DATANODES 8U
-#define ORBIT_SOURCE_ONEFICHIER 16U
-#define ORBIT_SOURCE_REMOTE 32U
 #define ORBIT_DIRECT_SOURCE "direct-url"
-#define ORBIT_SOURCE_ALL (ORBIT_SOURCE_ARCHIVE | ORBIT_SOURCE_VIKINGFILE | ORBIT_SOURCE_AKIRABOX | ORBIT_SOURCE_DATANODES | ORBIT_SOURCE_ONEFICHIER | ORBIT_SOURCE_REMOTE)
-typedef struct {
-    unsigned enabled, notice_version;
-    time_t acknowledged_at;
-} SourceSettings;
 typedef struct {
     char id[24], title[128], title_id[16], format[12], filename[160], url[2048], sha256[65];
     char source[16], game_id[64], platform[8];
@@ -139,7 +127,6 @@ typedef struct {
     size_t remote_release_count;
     cJSON *catalog, *addons; /* Base-game and add-on APIs remain separate. */
     unsigned catalog_revision;
-    SourceSettings sources;
     Job jobs[ORBIT_MAX_JOBS];
     size_t job_count;
     char favorites[ORBIT_MAX_RELEASES][64];
@@ -233,7 +220,6 @@ bool provider_percent_decode(const char *src, size_t n, char *out, size_t cap);
 bool provider_viking_file_server(const char *host, size_t n);
 int browser_start(void);
 void browser_stop(void);
-void browser_source_changed_locked(void);
 cJSON *browser_status(void);
 cJSON *browser_diagnostics_locked(void);
 int browser_action(const cJSON *input, char *error, size_t cap);
@@ -250,10 +236,9 @@ typedef struct {
 } LinkProbe;
 /* One bounded request: a file with a size, not a page, and never its contents. */
 int transfer_probe_link(Release *release, atomic_bool *cancel, LinkProbe *out, char *error, size_t cap);
-unsigned source_flag(const char *id);
+bool catalogue_source_known(const char *id);
 bool source_enabled_locked(const Release *release);
 cJSON *sources_json_locked(void);
-int sources_set_locked(const cJSON *input, char *error, size_t cap);
 Job *job_find(const char *id);
 size_t storage_list(Storage *out);
 cJSON *storage_diagnostics(void);

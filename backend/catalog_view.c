@@ -18,12 +18,9 @@ struct CatalogBody {
     size_t size;
     unsigned char *data;
 };
-/* Everything a body depends on. Source settings and firmware are compared
- * directly, so a missed invalidation for them can't serve a stale list. */
+/* Firmware is compared directly so a missed invalidation can't serve a stale list. */
 typedef struct {
     unsigned long generation, catalog;
-    unsigned enabled, notice_version;
-    bool acknowledged;
     uint32_t firmware;
 } ViewKey;
 typedef struct {
@@ -70,15 +67,10 @@ static CatalogBody *body_new(unsigned char *data, size_t size) {
 static void key_locked(ViewKey *key) {
     *key = (ViewKey){.generation = atomic_load(&view_generation),
                      .catalog = replacements,
-                     .enabled = orbit.sources.enabled,
-                     .notice_version = orbit.sources.notice_version,
-                     .acknowledged = orbit.sources.acknowledged_at > 0,
                      .firmware = orbit.firmware};
 }
 static bool same_key(const ViewKey *a, const ViewKey *b) {
-    return a->generation == b->generation && a->catalog == b->catalog && a->enabled == b->enabled &&
-           a->notice_version == b->notice_version && a->acknowledged == b->acknowledged &&
-           a->firmware == b->firmware;
+    return a->generation == b->generation && a->catalog == b->catalog && a->firmware == b->firmware;
 }
 /* Index the curated title identities once per view. Prefer the first curated
  * entry when multiple options share a title ID. */
@@ -145,7 +137,7 @@ static bool describe_mirrors(cJSON *entry, const Release *r, const Release *cons
 }
 
 static bool append_remote_locked(cJSON *out) {
-    if (!(orbit.sources.enabled & ORBIT_SOURCE_REMOTE) || !orbit.remote_release_count) return true;
+    if (!orbit.remote_release_count) return true;
     size_t count = (size_t)cJSON_GetArraySize(orbit.catalog), i = 0;
     TitleEntry *titles = malloc((count ? count : 1) * sizeof *titles);
     const Release **mirrors = malloc(orbit.remote_release_count * sizeof *mirrors);

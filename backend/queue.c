@@ -345,7 +345,7 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
     bool pending_file = remote_page_pending(r);
     if (!source_enabled_locked(r)) {
         copy_text(err, cap,
-                  "Enable this source and acknowledge the download notice in Sources first.");
+                  "This download option is no longer available.");
         return 409;
     }
     Job delivery_job = {0};
@@ -789,8 +789,7 @@ int job_action_locked(Job *j, const char *action, bool remove, char *err, size_t
         Release *r = &j->release;
         bool torbox = !strcmp(j->delivery, "torbox");
         if (!source_enabled_locked(r) || (!torbox && !j->browser_pending && !provider_supported(r))) {
-            copy_text(err, cap,
-                      "Enable a supported source in Sources before resuming this download.");
+            copy_text(err, cap, "This download option is no longer available.");
             return 409;
         }
         if (torbox) {

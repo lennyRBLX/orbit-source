@@ -7,7 +7,7 @@
 typedef struct CatalogBody CatalogBody;
 /* Call with orbit.mutex held right after anything those bodies show changes
  * that the cache key doesn't cover, such as a flag firmware_describe() reads.
- * Covered already: catalogue replacement, source settings and orbit.firmware.
+ * Already covered: catalogue replacement, community catalogue refresh and orbit.firmware.
  * Only bumps a counter: no I/O, no other lock. The next request rebuilds. */
 void catalog_view_invalidate_locked(void);
 /* catalog.c, with orbit.mutex held: orbit.catalog, orbit.addons and

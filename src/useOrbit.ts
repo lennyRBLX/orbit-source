@@ -10,8 +10,6 @@ import type {
   Game,
   Release,
   Job,
-  SourceId,
-  SourceSettings,
   Storage,
   System,
 } from "./types";
@@ -30,7 +28,6 @@ export function useOrbit() {
   const [ready, setReady] = useState(false);
   const [browser, setBrowser] = useSnapshot<BrowserSession | null>(null);
   const [system, setSystem] = useSnapshot<System | null>(null),
-    [sources, setSources] = useSnapshot<SourceSettings | null>(null),
     [error, setError] = useState("");
   const alive = useRef(true),
     polling = useRef<Promise<void> | null>(null),
@@ -43,24 +40,9 @@ export function useOrbit() {
     if (polling.current) return polling.current;
     const request = (async () => {
       try {
-        const [sys, sourceSettings] = await Promise.all([
-          api<System>("/system"),
-          api<SourceSettings>("/sources"),
-        ]);
+        const sys = await api<System>("/system");
         if (!alive.current) return;
-        const key = JSON.stringify([
-          sys.version,
-          sys.instanceId,
-          sys.catalogueRevision,
-          sourceSettings.noticeVersion,
-          sourceSettings.acknowledged,
-          sourceSettings.enabled,
-          sourceSettings.remoteGeneration,
-          sourceSettings.options.map((source) => [
-            source.id,
-            source.releaseCount,
-          ]),
-        ]);
+        const key = JSON.stringify([sys.version, sys.instanceId, sys.catalogueRevision, sys.remoteGeneration]);
         if (catalogKey.current !== key) {
           const [catalogue, extra] = await Promise.all([
             api<Release[]>("/catalog", undefined, { timeoutMs: 60000 }),
@@ -71,7 +53,6 @@ export function useOrbit() {
           setAddons(groupGames(extra));
           catalogKey.current = key;
         }
-        setSources(sourceSettings);
         if (
           sys.localSessionAvailable &&
           (!localSessionLoaded.current || !sys.paired)
@@ -136,7 +117,7 @@ export function useOrbit() {
     })();
     polling.current = request;
     return request;
-  }, [setBrowser, setBundle, setFavorites, setJobs, setSavedFilters, setSources, setStorage, setSystem]);
+  }, [setBrowser, setBundle, setFavorites, setJobs, setSavedFilters, setStorage, setSystem]);
   useEffect(() => {
     alive.current = true;
     void refresh();
@@ -247,12 +228,6 @@ export function useOrbit() {
   const changeSavedFilters = async (body: Record<string, unknown>) => {
     setSavedFilters(await api<SavedFilter[]>("/filters", body));
   };
-  const saveSources = async (enabled: SourceId[], noticeVersion: number) => {
-    await api("/sources", { enabled, acknowledged: true, noticeVersion });
-    await polling.current;
-    catalogKey.current = "";
-    await refresh();
-  };
   return {
     games, addons,
     bundle,
@@ -274,13 +249,11 @@ export function useOrbit() {
     jobs,
     storage,
     system,
-    sources,
     error,
     refresh,
     reconnect,
     pair,
     download,
     action,
-    saveSources,
   };
 }

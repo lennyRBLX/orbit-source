@@ -141,7 +141,7 @@ int zero_probe_request(const char *id, char *error, size_t cap) {
     pthread_mutex_unlock(&orbit.mutex);
     if (!enabled) {
         copy_text(error, cap,
-                  "Enable this source in Orbit before choosing a direct console download.");
+                  "This download option is no longer available.");
         return 409;
     }
     pthread_mutex_lock(&lock);

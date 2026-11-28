@@ -153,7 +153,7 @@ int main(int argc, char **argv) {
     orbit.releases[0].size = strtoll(size, NULL, 10);
     copy_text(orbit.releases[0].sha256, sizeof orbit.releases[0].sha256, sha ? sha : "");
     const char *test_source = getenv("ORBIT_TEST_SOURCE");
-    if (test_source && !source_flag(test_source)) return 1;
+    if (test_source && !catalogue_source_known(test_source)) return 1;
     if (test_source)
         copy_text(orbit.releases[0].source, sizeof orbit.releases[0].source, test_source);
     const char *browser_url = getenv("ORBIT_TEST_BROWSER_URL");

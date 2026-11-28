@@ -68,9 +68,14 @@ class FixtureServer(http.server.ThreadingHTTPServer):
 
 
 class Driver:
-    def __init__(self, directory):
+    def __init__(self, directory, feed=None, second_feed=None):
+        env = dict(os.environ)
+        if feed:
+            env["ORBIT_TEST_CATALOGUE_URL"] = feed
+        if second_feed:
+            env["ORBIT_TEST_SECOND_CATALOGUE_URL"] = second_feed
         self.process = subprocess.Popen(
-            [DRIVER, directory], cwd=ROOT, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+            [DRIVER, directory], cwd=ROOT, env=env, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE
         )
         self.first_game = json.loads(self.process.stdout.readline())
 
@@ -129,13 +134,9 @@ class RemoteCatalogueTests(unittest.TestCase):
     def test_padrino_snapshot_adds_ps4_and_ps5_games_without_replacing_orbit(self):
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
             state = source(service.command("show"), "padrino")
-            self.assertTrue(state["enabled"])
-            self.assertTrue(state["bundled"])
             self.assertGreater(state["entryCount"], 10000)
-            service.command("policy", remote=True, notice=False)
-            self.assertFalse(service.command("view")["remote"])
-            service.command("policy", remote=True, notice=True)
-            view = service.command("view")
+            view = service.command("view", sourcePrefix="rs-padrin-")
+            self.assertGreater(view["curatedCount"], 0)
             rows = view["remote"]
             self.assertEqual(len(rows), state["entryCount"])
             self.assertGreater(len({row["titleId"] for row in rows}), 3500)
@@ -145,8 +146,6 @@ class RemoteCatalogueTests(unittest.TestCase):
             self.assertTrue(any(row["gameId"].startswith("rs-padrino-") and row["cover"] for row in rows))
             self.assertFalse(any(row.get("homebrew") or row.get("archivePassword") or
                                  "zstd" in row["filename"].lower() for row in rows))
-            self.assertEqual(service.command("PATCH", id="padrino", enabled=False)["status"], 200)
-            self.assertTrue(service.command("view")["sameGames"])
 
     def test_padrino_file_formats_and_zstd_filter(self):
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
@@ -223,7 +222,7 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
                 base = {"title": "Game", "titleId": "PPSA12345", "category": "game"}
 
                 def entry(path, label):
@@ -253,20 +252,15 @@ class RemoteCatalogueTests(unittest.TestCase):
                 for path in ("/unknown", "/ambiguous", "/wrong", "/invalid"):
                     self.assertEqual(service.command("resolve", entry=entry(path, "Mirror")), -1)
 
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
                 options = [
                     {"name": "LZ4 · Viki", "url": address + "/game.zip"},
                     {"name": "Folder · Viki", "url": address + "/folder"},
                     {"name": "FPKG · Data", "url": address + "/mirror"},
                 ]
                 server.feed = {"packages": [dict(base, downloadLinks=options)]}
-                source_setup = service.command("POST", url=server.url)
-                self.assertEqual(source_setup["status"], 201)
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
-                rows = service.command("view")["remote"]
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
                 self.assertCountEqual([row["provider"] for row in rows], ["Folder · Viki", "FPKG · Data"])
                 self.assertTrue(all(row["browserAvailable"] and not row["directAvailable"] for row in rows))
                 self.assertTrue(all(row["torboxHost"] == "127.0.0.1" for row in rows))
@@ -301,15 +295,11 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
-                service.command("POST", url=server.url)
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
 
-                rows = service.command("view")["remote"]
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
                 ids = ",".join(row["id"] for row in rows)
                 self.assertTrue(all(row["browserAvailable"] and row["format"] == "Unknown" for row in rows))
                 deadline = time.monotonic() + 5
@@ -368,14 +358,10 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
-                service.command("POST", url=server.url)
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
-                rows = service.command("view")["remote"]
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
                 self.assertEqual(len(rows), 4)
                 for row in rows:
                     self.assertTrue(row["providerMetadata"])
@@ -433,14 +419,10 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
-                service.command("POST", url=server.url)
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
-                rows = service.command("view")["remote"]
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
                 by_title = {}
                 for row in rows:
                     self.assertNotIn("mirrorKey", row)
@@ -455,19 +437,46 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def test_community_catalogues_default_on_and_saved_opt_out_survives_restart(self):
+    def test_legacy_source_preferences_do_not_control_the_built_in_catalogues(self):
         with tempfile.TemporaryDirectory() as directory:
-            with Driver(directory) as service:
-                fresh = service.command("selection")
-                self.assertFalse(fresh["acknowledged"])
-                self.assertEqual(fresh["enabled"], ["remote"])
-                self.assertEqual(service.command("POST", id="refresh")["status"], 409)
-                self.assertEqual(service.command("save-selection", enabled=["archive"],
-                                                 noticeVersion=1, acknowledged=True), 200)
-            with Driver(directory) as service:
-                saved = service.command("selection")
-                self.assertTrue(saved["acknowledged"])
-                self.assertEqual(saved["enabled"], ["archive"])
+            root = Path(directory)
+            (root / "state.json").write_text(json.dumps({
+                "schema": 8,
+                "sources": {"enabled": 0, "noticeVersion": 1, "acknowledgedAt": 1},
+            }))
+            metadata = root / "remote-sources-v1.json"
+            custom_id = "custom-0123456789abcdef"
+            metadata.write_text(json.dumps({
+                "schemaVersion": 1,
+                "revision": 4,
+                "onboardingRevision": 1,
+                "sources": [
+                    {"id": "dlps", "name": "DLPS", "url": "https://pegasus-dl.dev/catalogs/dlps.json",
+                     "enabled": False, "builtIn": True},
+                    {"id": "padrino", "name": "Padrino", "url": "https://github.com/B4ckd0orl/Padrino-Store",
+                     "enabled": False, "builtIn": True},
+                    {"id": custom_id, "name": "Custom", "url": "https://example.org/custom.json",
+                     "enabled": True, "builtIn": False},
+                ],
+            }))
+            cache = root / "remote-cache"
+            cache.mkdir()
+            for source_id in ("dlps", custom_id):
+                (cache / f"{source_id}.json").write_text(json.dumps({"packages": FIXTURE["packages"][:1]}))
+            for corrupt in (False, True):
+                if corrupt:
+                    metadata.write_text("{broken")
+                with Driver(directory) as service:
+                    status = service.command("selection")
+                    self.assertTrue(status["acknowledged"])
+                    self.assertCountEqual(status["enabled"], ["archive", "vikingfile", "akirabox", "datanodes", "remote"])
+                    snapshot = service.command("show")
+                    self.assertEqual({s["id"] for s in snapshot["sources"]}, DEFAULTS)
+                    self.assertGreater(source(snapshot, "padrino")["entryCount"], 10000)
+                    view = service.command("view", sourcePrefix="rs-dlps-")
+                    self.assertGreater(view["curatedCount"], 0)
+                    self.assertEqual(len(view["remote"]), 1)
+                    self.assertFalse(service.command("view", sourcePrefix="rs-custom-")["remote"])
 
     def test_pspkg_general_sources_exclude_arabic_and_keep_platforms_separate(self):
         def package(identity, category, page, title_id=""):
@@ -486,8 +495,6 @@ class RemoteCatalogueTests(unittest.TestCase):
             for source_id, platform, expected in (("pspkg-ps5", "ps5", "P5012345abcdef"),
                                                   ("pspkg-ps4", "ps4", "CUSA12345")):
                 built_in = source(manifest, source_id)
-                self.assertTrue(built_in["builtIn"])
-                self.assertTrue(built_in["enabled"])
                 self.assertEqual(built_in["url"], f"https://pspkg.com/{platform}/")
                 parsed = service.command("parse", source=source_id, feed=feed)
                 self.assertEqual((parsed["code"], parsed["skipped"]), (0, 0))
@@ -555,7 +562,6 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread.start()
         try:
             with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                service.command("policy", remote=True, notice=True)
                 for platform, status in (("ps5", "interactive-verification"), ("ps4", "parse-no-size")):
                     base = server.url.replace("/catalogue.json", f"/{platform}/")
                     result = service.command("pspkg-scan", source=f"pspkg-{platform}", url=base, gameLimit=400)
@@ -675,14 +681,10 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
-                service.command("POST", url=server.url)
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
-                rows = service.command("view")["remote"]
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
                 self.assertEqual(len(rows), 42)
                 self.assertFalse(any(path.startswith("/metadata/") for path in server.paths))
                 for start in range(0, len(rows), 32):
@@ -724,15 +726,11 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    service.command("PATCH", id=name, enabled=False)
-                service.command("POST", url=server.url)
-                service.command("POST", url=base + "/second.json")
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url, base + "/second.json") as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("policy", remote=True, notice=True)
                 service.idle()
-                rows = service.command("view")["remote"]
+                rows = [row for row in service.command("view")["remote"]
+                        if row["id"].startswith(("rs-dlps-", "rs-pfs-"))]
                 self.assertEqual(len(rows), 2)
                 self.assertEqual(max(row.get("mirrorCount", 0) for row in rows), 3)
                 ids = ",".join(row["id"] for row in rows)
@@ -753,29 +751,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def test_manifest_revision_keeps_disabled_defaults(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with Driver(directory) as service:
-                self.assertEqual({s["id"] for s in service.command("show")["sources"]}, DEFAULTS)
-                response = service.command("PATCH", id="evox-coreos", enabled=False)
-                self.assertEqual(response["status"], 200)
-                self.assertFalse(source(response, "evox-coreos")["enabled"])
-                self.assertEqual(service.command("DELETE", id="evox-coreos")["status"], 409)
-            path = Path(directory) / "remote-sources-v1.json"
-            settings = json.loads(path.read_text())
-            settings["revision"] -= 1
-            settings["sources"] = [s for s in settings["sources"]
-                                   if s["id"] not in {"zer0", "pspkg-ps5", "pspkg-ps4"}]
-            path.write_text(json.dumps(settings))
-            with Driver(directory) as service:
-                snapshot = service.command("show")
-                self.assertEqual(snapshot["revision"], settings["revision"] + 1)
-                self.assertFalse(source(snapshot, "evox-coreos")["enabled"])
-                self.assertTrue(source(snapshot, "zer0")["enabled"])
-                self.assertTrue(source(snapshot, "pspkg-ps5")["enabled"])
-                self.assertTrue(source(snapshot, "pspkg-ps4")["enabled"])
-
-    def test_tick_retries_enabled_empty_sources_and_cools_down_manual_refresh(self):
+    def test_tick_retries_only_empty_catalogues_after_cooldown(self):
         server = FixtureServer()
         server.send_etag = False
         server.feed = {"packages": []}
@@ -783,43 +759,22 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
-                for name in DEFAULTS:
-                    self.assertEqual(service.command("PATCH", id=name, enabled=False)["status"], 200)
-                options = service.command("POST", url=server.url)
-                empty = next(row["id"] for row in options["sources"] if not row["builtIn"])
-                self.assertEqual(service.command("POST", url=server.url.replace("catalogue", "populated"))["status"], 201)
+            populated = server.url.replace("catalogue", "populated")
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url, populated) as service:
                 self.assertEqual(service.command("start"), 0)
-                service.command("advance", milliseconds=60000, tick=True)
-                self.assertEqual(server.paths, [])
-                service.command("policy", remote=False, notice=True)
                 snapshot = service.idle()
                 self.assertCountEqual(server.paths, ["/catalogue.json", "/populated.json"])
-                self.assertEqual(source(snapshot, empty)["entryCount"], 0)
-                self.assertFalse(service.command("view")["remote"])
-
+                self.assertEqual(source(snapshot, "dlps")["entryCount"], 0)
+                self.assertEqual(source(snapshot, "pfs")["entryCount"], 1)
                 service.command("advance", milliseconds=59999, tick=True)
                 self.assertEqual(len(server.paths), 2)
                 with server.lock:
                     server.feed = {"packages": FIXTURE["packages"][:1]}
                 service.command("advance", milliseconds=1, tick=True)
-                self.assertEqual(source(service.idle(), empty)["entryCount"], 1)
+                self.assertEqual(source(service.idle(), "dlps")["entryCount"], 1)
                 self.assertEqual(server.paths[2:], ["/catalogue.json"])
                 service.command("advance", milliseconds=60000, tick=True)
                 self.assertEqual(len(server.paths), 3)
-
-                manual = service.command("POST", id="refresh")
-                self.assertEqual((manual["status"], manual["retryAfter"]), (202, 60))
-                self.assertEqual(service.command("POST", id="refresh")["status"], 429)
-                service.idle()
-                service.command("advance", milliseconds=59999)
-                limited = service.command("POST", id="refresh")
-                self.assertEqual((limited["status"], limited["retryAfter"]), (429, 1))
-                service.command("advance", milliseconds=1)
-                self.assertEqual(service.command("POST", id="refresh")["status"], 202)
-                service.idle()
-                self.assertCountEqual(server.paths[3:],
-                                      ["/catalogue.json", "/populated.json"] * 2)
         finally:
             server.shutdown()
             server.server_close()
@@ -831,31 +786,31 @@ class RemoteCatalogueTests(unittest.TestCase):
         thread.start()
         try:
             with tempfile.TemporaryDirectory() as directory:
-                with Driver(directory) as service:
+                with Driver(directory, server.url) as service:
                     self._exercise_refresh(service, server)
-                with Driver(directory) as service:
-                    service.command("policy", remote=True, notice=True)
-                    view = service.command("view")
+                state_path = Path(directory) / "state.json"
+                state = json.loads(state_path.read_text())
+                state["jobs"][0]["error"] = "Source disabled. Enable it in Sources before resuming."
+                state_path.write_text(json.dumps(state))
+                with Driver(directory, server.url) as service:
+                    view = service.command("view", sourcePrefix="rs-dlps-")
                     self.assertEqual(len(view["remote"]), 2)
-                    self.assertEqual(len(server.requests), 6)  # Startup cache never needs a request.
+                    self.assertEqual(len(server.requests), 4)  # Startup cache never needs a request.
                     jobs = service.command("jobs")
+                    self.assertEqual(jobs[0]["status"], "paused")
+                    self.assertFalse(jobs[0].get("error"))
                     self.assertEqual(jobs[0]["detectedFormat"], "Game folder")
                     self.assertEqual(jobs[0]["extractTotal"], 41)
                     snapshot = service.command("show")
-                    custom = next(s for s in snapshot["sources"] if not s["builtIn"])
-                    self.assertEqual(custom["etag"], '"fixture-v1"')
-                    self.assertEqual(custom["entryCount"], 2)
-                    self.assertEqual(service.command("DELETE", id=custom["id"])["status"], 200)
-                    self.assertEqual(service.command("view"), {"sameGames": True, "sameAddons": True, "remote": []})
-                    self.assertFalse((Path(directory) / "remote-cache" / f'{custom["id"]}.json').exists())
+                    cached = source(snapshot, "dlps")
+                    self.assertEqual(cached["etag"], '"fixture-v1"')
+                    self.assertEqual(cached["entryCount"], 2)
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
     def _exercise_refresh(self, service, server):
-        for name in DEFAULTS:
-            self.assertEqual(service.command("PATCH", id=name, enabled=False)["status"], 200)
         good, unsupported = copy.deepcopy(FIXTURE["packages"])
         unsupported["format"] = "ZSTD"
         attached = dict(good, titleId=service.first_game["titleId"], filename="game.zip",
@@ -863,16 +818,8 @@ class RemoteCatalogueTests(unittest.TestCase):
                         downloadLinks=[{"url": "https://example.org/game.zip"}])
         invalid = dict(good, filename="../bad.pkg")
         server.feed = {"packages": [good, unsupported, attached, invalid]}
-        response = service.command("POST", url=server.url, name="Local test catalogue")
-        self.assertEqual(response["status"], 201)
-        custom = next(s for s in response["sources"] if not s["builtIn"])
-        source_id = custom["id"]
-        self.assertEqual(service.command("POST", url=server.url + "?duplicate=1")["status"], 409)
+        source_id = "dlps"
         self.assertEqual(service.command("start"), 0)
-        service.command("policy", remote=True, notice=False)
-        self.assertEqual(service.command("POST", id="refresh")["status"], 409)
-        self.assertEqual(server.requests, [])
-        service.command("policy", remote=True, notice=True)
         refreshed = source(service.idle(), source_id)
         self.assertEqual(server.requests, [None])
         self.assertEqual(refreshed["etag"], '"fixture-v1"')
@@ -880,7 +827,7 @@ class RemoteCatalogueTests(unittest.TestCase):
         self.assertEqual(refreshed["entryCount"], 2)
         self.assertEqual(refreshed["skippedEntries"], 1)
 
-        view = service.command("view")
+        view = service.command("view", sourcePrefix="rs-dlps-")
         self.assertFalse(view["sameGames"])
         self.assertTrue(view["sameAddons"])
         by_title_id = {row["titleId"]: row for row in view["remote"]}
@@ -892,31 +839,19 @@ class RemoteCatalogueTests(unittest.TestCase):
         self.assertNotIn("url", matching)
         service.command("save-job", id=matching["id"])
 
-        self.assertEqual(service.command("POST", id="refresh")["status"], 202)
+        service.command("refresh")
         cached = source(service.idle(), source_id)
         self.assertEqual(server.requests, [None, '"fixture-v1"'])
         self.assertEqual(cached["entryCount"], 2)
-        self.assertEqual(service.command("view"), view)
+        self.assertEqual(service.command("view", sourcePrefix="rs-dlps-"), view)
         for response_code, error in ((503, "http"), (200, "invalid-catalogue")):
-            service.command("advance", milliseconds=60000)
             with server.lock:
                 server.failure = response_code
-            self.assertEqual(service.command("POST", id="refresh")["status"], 202)
+            service.command("refresh")
             failed = source(service.idle(), source_id)
             self.assertEqual(failed["lastError"], error)
             self.assertEqual(failed["entryCount"], 2)
-        self.assertEqual(service.command("view"), view)
+        self.assertEqual(service.command("view", sourcePrefix="rs-dlps-"), view)
         diagnostic = service.command("diagnostics")
         self.assertIn("invalid-catalogue", diagnostic["lastErrorCodes"])
         self.assertNotIn(server.url, json.dumps(diagnostic))
-        self.assertEqual(service.command("PATCH", id=source_id, enabled=False)["status"], 200)
-        self.assertEqual(service.command("view"), {"sameGames": True, "sameAddons": True, "remote": []})
-        service.command("policy", remote=False, notice=True)
-        self.assertEqual(service.command("PATCH", id=source_id, enabled=True)["status"], 200)
-        service.idle()
-        self.assertEqual(len(server.requests), 5)
-        self.assertEqual(service.command("view"), {"sameGames": True, "sameAddons": True, "remote": []})
-        service.command("advance", milliseconds=60000)
-        self.assertEqual(service.command("POST", id="refresh")["status"], 202)
-        service.idle()
-        self.assertEqual(len(server.requests), 6)

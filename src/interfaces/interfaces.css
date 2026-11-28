@@ -2062,7 +2062,7 @@ html:not(.pointer) .cn-shell .settings-section:focus {
   background: rgba(12, 10, 8, 0.72);
   backdrop-filter: blur(12px);
 }
-/* Opening, unreachable, no sources and empty results: a quiet stage. */
+/* Opening, unreachable and empty results. */
 .cn-shell .iface-main > .empty,
 .cn-shell .cn-browse .empty {
   display: flex;
@@ -2145,7 +2145,7 @@ html:not(.pointer) .cn-shell .settings-section:focus {
   background: rgba(0, 0, 0, 0.82);
   backdrop-filter: blur(6px);
 }
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) {
+.iface-cinema .modal:not(.storage-modal):not(.library-details) {
   max-width: 52rem;
   border-radius: 0;
   background: none;
@@ -2153,16 +2153,16 @@ html:not(.pointer) .cn-shell .settings-section:focus {
   backdrop-filter: none;
   text-align: center;
 }
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h2:first-of-type,
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h1:first-of-type,
+.iface-cinema .modal:not(.storage-modal):not(.library-details) > h2:first-of-type,
+.iface-cinema .modal:not(.storage-modal):not(.library-details) > h1:first-of-type,
 .iface-cinema .modal .archive-password-form h2 {
   font-family: "Inter Tight", system-ui, sans-serif;
   font-style: normal;
   font-weight: 600;
   font-size: 2.6rem;
 }
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h2:first-of-type::before,
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h1:first-of-type::before {
+.iface-cinema .modal:not(.storage-modal):not(.library-details) > h2:first-of-type::before,
+.iface-cinema .modal:not(.storage-modal):not(.library-details) > h1:first-of-type::before {
   content: "";
   display: block;
   width: 2.2rem;
@@ -2170,7 +2170,7 @@ html:not(.pointer) .cn-shell .settings-section:focus {
   margin: 0 auto 1.6rem;
   background: var(--cn-gold);
 }
-.iface-cinema .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > .close {
+.iface-cinema .modal:not(.storage-modal):not(.library-details) > .close {
   display: none;
 }
 .iface-cinema .modal .dialog-actions {
@@ -3748,7 +3748,7 @@ html:not(.pointer) .pn-shell .settings-section:focus {
   background: rgba(4, 6, 24, 0.62);
   backdrop-filter: blur(6px);
 }
-.iface-crossbar .modal:not(.storage-modal):not(.library-details):not(.sources-modal) {
+.iface-crossbar .modal:not(.storage-modal):not(.library-details) {
   max-width: none;
   padding: 2.4rem 18% 2.6rem;
   border: 0;
@@ -3761,18 +3761,18 @@ html:not(.pointer) .pn-shell .settings-section:focus {
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
 }
-.iface-crossbar .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > .close {
+.iface-crossbar .modal:not(.storage-modal):not(.library-details) > .close {
   display: none;
 }
-.iface-crossbar .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h2:first-of-type,
-.iface-crossbar .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h1:first-of-type,
+.iface-crossbar .modal:not(.storage-modal):not(.library-details) > h2:first-of-type,
+.iface-crossbar .modal:not(.storage-modal):not(.library-details) > h1:first-of-type,
 .iface-crossbar .modal .archive-password-form h2 {
   padding-inline-end: 0;
   font-size: 2rem;
   font-weight: 600;
   letter-spacing: -0.01em;
 }
-.iface-crossbar .modal:not(.storage-modal):not(.library-details):not(.sources-modal) p {
+.iface-crossbar .modal:not(.storage-modal):not(.library-details) p {
   max-width: 46rem;
   color: rgba(255, 255, 255, 0.82);
 }
@@ -4607,25 +4607,25 @@ html.pointer .pn-back:hover {
   background: rgba(0, 0, 0, 0.66);
   backdrop-filter: none;
 }
-.iface-panorama .modal:not(.storage-modal):not(.library-details):not(.sources-modal) {
+.iface-panorama .modal:not(.storage-modal):not(.library-details) {
   max-width: none;
   padding: 2rem var(--gutter) 2.2rem;
   border: 0;
   background: #222226;
   box-shadow: none;
 }
-.iface-panorama .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > .close {
+.iface-panorama .modal:not(.storage-modal):not(.library-details) > .close {
   display: none;
 }
-.iface-panorama .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h2:first-of-type,
-.iface-panorama .modal:not(.storage-modal):not(.library-details):not(.sources-modal) > h1:first-of-type,
+.iface-panorama .modal:not(.storage-modal):not(.library-details) > h2:first-of-type,
+.iface-panorama .modal:not(.storage-modal):not(.library-details) > h1:first-of-type,
 .iface-panorama .modal .archive-password-form h2 {
   padding-inline-end: 0;
   font-family: "Inter Tight", system-ui, sans-serif;
   font-size: 2.1rem;
   font-weight: 300;
 }
-.iface-panorama .modal:not(.storage-modal):not(.library-details):not(.sources-modal) p {
+.iface-panorama .modal:not(.storage-modal):not(.library-details) p {
   max-width: 52rem;
   color: rgba(255, 255, 255, 0.88);
   font-size: 1rem;
@@ -4650,83 +4650,6 @@ html:not(.pointer) .iface-panorama .modal .actions button:focus {
   box-shadow: 0 0 0 3px #ffffff;
 }
 
-/* Settings → Download sources: each source a row with a switch. */
-.source-rows {
-  display: flex;
-  flex-direction: column;
-  margin: 0.4rem 0 1rem;
-}
-.source-row {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  width: 100%;
-  min-height: 0;
-  padding: 0.85rem 0.3rem;
-  border-radius: 0;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  background: none;
-  text-align: start;
-}
-.source-row:first-child {
-  border-top: 0;
-}
-html.pointer .source-row:hover {
-  background: rgba(255, 255, 255, 0.04);
-}
-.source-row-text {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  min-width: 0;
-}
-.source-row-text strong {
-  font-size: 1rem;
-  font-weight: 500;
-}
-.source-row-text small {
-  color: rgba(255, 255, 255, 0.6);
-  font-size: 0.78rem;
-}
-.source-switch-state {
-  display: none;
-}
-.source-switch {
-  position: relative;
-  flex: none;
-  width: 2.6rem;
-  height: 1.5rem;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.25);
-  transition: background 0.16s;
-}
-.source-switch::after {
-  content: "";
-  position: absolute;
-  top: 3px;
-  inset-inline-start: 3px;
-  width: calc(1.5rem - 6px);
-  height: calc(1.5rem - 6px);
-  border-radius: 50%;
-  background: #ffffff;
-  transition: transform 0.16s var(--ease);
-}
-.source-row[aria-checked="true"] > .source-switch {
-  background: var(--switch-on, #ffffff);
-}
-.source-row[aria-checked="true"] > .source-switch::after {
-  transform: translateX(1.1rem);
-}
-.cn-shell {
-  --switch-on: var(--cn-gold);
-}
-.cn-shell .source-row[aria-checked="true"] > .source-switch::after {
-  background: #0b0907;
-}
-.xb-shell {
-  --switch-on: #6fe3b4;
-}
 /* Cinema and Panorama put the acknowledgement's check at the right. */
 .cn-shell .source-acknowledgement,
 .pn-shell .source-acknowledgement {
@@ -4740,46 +4663,6 @@ html.pointer .source-row:hover {
   padding: 0.9rem 0.3rem;
   text-align: start;
 }
-/* Panorama: a square switch with On / Off beside it; the count in the accent. */
-.pn-shell .source-row {
-  border-top: 0;
-}
-.pn-shell .source-row-text strong {
-  font-size: 1.2rem;
-  font-weight: 300;
-}
-.pn-shell .source-row-text small {
-  color: var(--pn-acc);
-}
-.pn-shell .source-switch-state {
-  display: inline;
-  color: rgba(255, 255, 255, 0.8);
-  font-size: 0.82rem;
-}
-.pn-shell .source-switch {
-  width: 2.8rem;
-  height: 1.25rem;
-  border-radius: 0;
-  background: none;
-  box-shadow: inset 0 0 0 2px #ffffff;
-}
-.pn-shell .source-switch::after {
-  top: 0;
-  inset-inline-start: 0;
-  width: 0.7rem;
-  height: 1.25rem;
-  border-radius: 0;
-  background: #ffffff;
-}
-.pn-shell .source-row[aria-checked="true"] > .source-switch {
-  background: var(--pn-acc);
-  background-clip: content-box;
-  padding: 4px;
-}
-.pn-shell .source-row[aria-checked="true"] > .source-switch::after {
-  transform: translateX(2.1rem);
-}
-
 /* Settings → Updates: the three versions as cards with large numbers. */
 .iface-shell .update-versions {
   display: grid;
@@ -4949,14 +4832,6 @@ html.pointer .source-row:hover {
   position: absolute; top: 10px; inset-inline-end: 10px; width: 30px; height: 30px;
   display: grid; place-items: center; border-radius: 50%;
   color: #fff; background: #101010df; pointer-events: none;
-}
-
-/* Right to left (Arabic): switches turn on towards the start. */
-[dir="rtl"] .source-row[aria-checked="true"] > .source-switch::after {
-  transform: translateX(-1.1rem);
-}
-[dir="rtl"] .pn-shell .source-row[aria-checked="true"] > .source-switch::after {
-  transform: translateX(-2.1rem);
 }
 
 /* Phone settings keep the selected panel full width beneath compact sections. */

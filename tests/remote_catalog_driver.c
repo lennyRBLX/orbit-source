@@ -13,7 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 
-/* The fixture uses the real catalogue, settings, URL policies and queue
+/* The fixture uses the real catalogue, URL policies and queue
  * snapshots. Console firmware, receipts and browser sessions are absent. */
 bool orbit_is_stopping(void) { return orbit.stop; }
 bool firmware_known(uint32_t raw) { return raw != 0; }
@@ -25,7 +25,6 @@ cJSON *packages_for_download(const char *origin) { (void)origin; return NULL; }
 bool job_active(const Job *j) { return !strcmp(j->status, "downloading"); }
 bool job_can_refresh_link(const Job *j) { (void)j; return false; }
 const char *notify_event_name(unsigned index) { (void)index; return NULL; }
-void browser_source_changed_locked(void) {}
 /* User-pasted links are covered by the full service integration test. */
 bool link_release_valid(const Release *r) { (void)r; return false; }
 bool link_url_allowed(const char *url) { (void)url; return false; }
@@ -34,13 +33,6 @@ bool job_can_replace_link(const Job *j) { (void)j; return false; }
 
 static atomic_llong scheduler_clock;
 int64_t orbit_remote_test_clock(void) { return atomic_load(&scheduler_clock); }
-
-static cJSON *find_row(const cJSON *snapshot, const char *id) {
-    cJSON *row;
-    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(snapshot, "sources"))
-        if (!strcmp(json_text(row, "id"), id)) return row;
-    return NULL;
-}
 
 static void print_json(cJSON *value) {
     assert(value);
@@ -72,12 +64,7 @@ int main(int argc, char **argv) {
     assert(!remote_sources_load());
     assert(!state_load());
 
-    SourceSettings loaded = orbit.sources;
-    SourceSettings enabled = {ORBIT_SOURCE_ARCHIVE | ORBIT_SOURCE_VIKINGFILE | ORBIT_SOURCE_AKIRABOX |
-                              ORBIT_SOURCE_DATANODES, ORBIT_SOURCE_NOTICE_VERSION, 1};
-    orbit.sources = enabled;
     CatalogBody *base = view(false), *base_addons = view(true);
-    orbit.sources = loaded;
     const cJSON *first = cJSON_GetArrayItem(orbit.catalog, 0);
     printf("{\"titleId\":\"%s\",\"gameId\":\"%s\"}\n", json_text(first, "titleId"), json_text(first, "gameId"));
     fflush(stdout);
@@ -94,9 +81,14 @@ int main(int argc, char **argv) {
             cJSON_AddBoolToObject(result, "sameAddons", equal_catalogue(base_addons, addons));
             cJSON *catalogue = cJSON_ParseWithLength((const char *)data, catalog_body_size(body)), *row;
             assert(cJSON_IsArray(catalogue));
-            cJSON_ArrayForEach(row, catalogue)
-                if (!strcmp(json_text(row, "sourceId"), "remote"))
+            const char *prefix = json_text(request, "sourcePrefix");
+            size_t curated = 0;
+            cJSON_ArrayForEach(row, catalogue) {
+                if (strcmp(json_text(row, "sourceId"), "remote")) curated++;
+                else if (!strncmp(json_text(row, "id"), prefix, strlen(prefix)))
                     cJSON_AddItemToArray(rows, cJSON_Duplicate(row, true));
+            }
+            cJSON_AddNumberToObject(result, "curatedCount", curated);
             print_json(result);
             cJSON_Delete(catalogue);
             catalog_body_release(addons);
@@ -205,23 +197,13 @@ int main(int argc, char **argv) {
             pthread_mutex_unlock(&orbit.mutex);
         } else {
             pthread_mutex_lock(&orbit.mutex);
-            if (!strcmp(op, "policy")) {
-                orbit.sources = enabled;
-                if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(request, "remote")))
-                    orbit.sources.enabled |= ORBIT_SOURCE_REMOTE;
-                if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(request, "notice"))) {
-                    orbit.sources.notice_version = 0;
-                    orbit.sources.acknowledged_at = 0;
-                }
-                remote_sources_changed_locked();
-                print_json(remote_sources_json_locked());
+            if (!strcmp(op, "refresh")) {
+                remote_sources_test_refresh_locked();
+                puts("true");
             } else if (!strcmp(op, "selection")) {
                 print_json(sources_json_locked());
-            } else if (!strcmp(op, "save-selection")) {
-                char message[128] = "";
-                printf("%d\n", sources_set_locked(request, message, sizeof message));
             } else if (!strcmp(op, "show")) {
-                print_json(remote_sources_json_locked());
+                print_json(remote_sources_test_status_locked());
             } else if (!strcmp(op, "jobs")) {
                 print_json(jobs_json_locked());
             } else if (!strcmp(op, "metadata")) {
@@ -229,14 +211,7 @@ int main(int argc, char **argv) {
             } else if (!strcmp(op, "diagnostics")) {
                 print_json(remote_sources_diagnostics_locked());
             } else {
-                char message[128] = "";
-                const char *id = json_text(request, "id");
-                int code = remote_sources_change_locked(op, id, request, message, sizeof message);
-                cJSON *response = remote_sources_json_locked();
-                cJSON_AddNumberToObject(response, "status", code);
-                const cJSON *row = find_row(response, id);
-                if (row) cJSON_AddBoolToObject(response, "found", true);
-                print_json(response);
+                assert(!"Unknown test command");
             }
             pthread_mutex_unlock(&orbit.mutex);
         }

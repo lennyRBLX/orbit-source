@@ -1846,7 +1846,7 @@ finish:
         copy_text(j->error, sizeof j->error,
                   source_enabled_locked(r)
                       ? ""
-                      : "Source disabled. Enable it in Sources before resuming.");
+                      : "This download option is no longer available.");
     } else if (unpacked == 3) {
         /* No room to unpack: it waits, paused, until the user frees space and resumes. */
         copy_text(j->status, sizeof j->status, "paused");
@@ -1976,7 +1976,7 @@ void *download_worker(void *unused) {
                     if (!source_enabled_locked(&j->release)) {
                         copy_text(j->status, sizeof j->status, "paused");
                         copy_text(j->error, sizeof j->error,
-                                  "Source disabled. Enable it in Sources before resuming.");
+                                  "This download option is no longer available.");
                         state_save_locked();
                         continue;
                     }

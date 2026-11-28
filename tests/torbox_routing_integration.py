@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -127,6 +127,8 @@ class TorBoxRouting(unittest.TestCase):
                 original_url = fixture.base + "/original"
                 env = dict(os.environ, ORBIT_TEST_URL=original_url, ORBIT_TEST_SIZE=str(len(FILE)),
                            ORBIT_TEST_SOURCE="archive", ORBIT_TEST_TORBOX_URL=fixture.base)
+                if fixture.browser:
+                    env["ORBIT_TEST_CATALOGUE_URL"] = fixture.base + "/catalogue.json"
                 with (root / "log").open("w+") as log:
                     service = subprocess.Popen(
                         [BINARY, "--port", str(port), "--storage", str(drive), "--state", str(root / "state")],
@@ -149,12 +151,13 @@ class TorBoxRouting(unittest.TestCase):
     def check_download(self, port, fixture, original_url, cached, explicit, drive):
         token = ""
 
-        def call(path, body=None):
+        def call(path, body=None, method=None):
             headers = {"Content-Type": "application/json"}
             if token:
                 headers["Authorization"] = "Bearer " + token
             data = None if body is None else json.dumps(body).encode()
-            with urlopen(Request(f"http://127.0.0.1:{port}/api/v1{path}", data, headers), timeout=3) as reply:
+            with urlopen(Request(f"http://127.0.0.1:{port}/api/v1{path}", data, headers, method=method),
+                         timeout=3) as reply:
                 return json.load(reply)
 
         def connect():
@@ -164,13 +167,22 @@ class TorBoxRouting(unittest.TestCase):
                 return None
 
         token = wait_for(connect)
-        sources = call("/sources")
-        call("/sources", {"enabled": ["remote"] if fixture.browser else ["archive"], "acknowledged": True,
-                          "noticeVersion": sources["noticeVersion"]})
         if fixture.browser:
-            call("/remote-sources", {"url": fixture.base + "/catalogue.json"})
+            for path, method, body, code in (
+                ("/sources", "POST", {"enabled": [], "noticeVersion": 1, "acknowledged": True}, 405),
+                ("/remote-sources", "POST", {"url": fixture.base + "/catalogue.json"}, 404),
+                ("/remote-sources/dlps", "PATCH", {"enabled": False}, 405),
+                ("/remote-sources/dlps", "DELETE", None, 405),
+            ):
+                with self.subTest(path=path, method=method):
+                    with self.assertRaises(HTTPError) as rejected:
+                        call(path, body, method)
+                    self.assertEqual(rejected.exception.code, code)
+                    rejected.exception.close()
         title = "Provider page fixture" if fixture.browser else "Orbit local test file"
         release = wait_for(lambda: next((r for r in call("/catalog") if r["title"] == title), None))
+        if fixture.browser:
+            self.assertGreater(call("/system")["remoteGeneration"], 1)
         call("/debrid", {"action": "connect", "apiKey": "orbit-test-fixture-key"})
         wait_for(lambda: call("/debrid")["connected"])
         if cached:

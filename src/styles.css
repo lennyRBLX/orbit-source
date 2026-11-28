@@ -1063,29 +1063,6 @@ html:not(.pointer) .select-option[data-active="true"] svg {
   color: var(--text-2);
 }
 
-/* Sources are small toggle labels; the notice and acknowledgement read like settings rows. */
-.sources-form {
-  max-width: 44rem;
-}
-.sources-form .source-intro {
-  margin: 0.9rem 0 1.4rem;
-  color: var(--text-2);
-}
-.source-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem;
-}
-.source-card {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.6rem;
-  padding-block: 0.5rem 0.5rem; padding-inline: 0.6rem 1.1rem;
-  background: rgba(255, 255, 255, 0.08);
-  font-size: 0.95rem;
-  font-weight: 500;
-}
-.source-card .choice-check,
 .default-drive-choice .choice-check,
 .notification-setting .choice-check,
 .notification-events .choice-check {
@@ -1093,7 +1070,6 @@ html:not(.pointer) .select-option[data-active="true"] svg {
   width: 1.3rem;
   height: 1.3rem;
 }
-.source-card .choice-check svg,
 .default-drive-choice .choice-check svg,
 .notification-setting .choice-check svg,
 .notification-events .choice-check svg {
@@ -1110,12 +1086,8 @@ html:not(.pointer) .select-option[data-active="true"] svg {
   text-align: start;
   font-weight: 400;
 }
-html.pointer .source-card:hover,
 html.pointer .source-acknowledgement:hover {
   background: rgba(255, 255, 255, 0.14);
-}
-.source-card.selected {
-  background: rgba(255, 255, 255, 0.26);
 }
 .choice-check {
   display: grid;
@@ -1136,27 +1108,10 @@ html.pointer .source-acknowledgement:hover {
   height: 1rem;
   stroke-width: 2.4;
 }
-.source-notice {
-  margin: 1.8rem 0 1rem;
-  padding-top: 1.4rem;
-  border-top: 1px solid var(--line);
-}
-.source-notice h2 {
-  margin-bottom: 0.6rem;
-  font-size: 1.1rem;
-  font-weight: 500;
-}
-.source-notice p {
-  color: var(--text-2);
-  font-size: 0.9rem;
-}
 .source-acknowledgement {
   align-items: flex-start;
   font-size: 0.9rem;
   line-height: 1.5;
-}
-.sources-modal {
-  max-width: 46rem;
 }
 /* A default-drive choice: the drive's name over its free space. */
 .default-drive > [role="radiogroup"] {
@@ -3437,25 +3392,3 @@ html.pointer .debrid-settings input:focus {
 .game-insights dl { display:flex; flex-wrap:wrap; gap:1rem 2rem; margin:.7rem 0; }
 .game-insights dt,.game-insights small { color:var(--text-3,#aaa); font-size:.8rem; }
 .game-insights dd { margin:.35rem 0; }
-
-.community-catalogues {
-  display: grid;
-  justify-items: start;
-  gap: 0.75rem;
-  margin-block-start: 1.5rem;
-}
-.community-catalogues h2 {
-  margin: 0;
-}
-.community-source,
-.community-add {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  width: 100%;
-}
-.community-source .source-row,
-.community-add input {
-  flex: 1;
-  min-width: 0;
-}

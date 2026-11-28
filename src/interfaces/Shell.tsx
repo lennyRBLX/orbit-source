@@ -55,7 +55,6 @@ export interface ShellProps {
   nodes: {
     notices: ReactNode;
     handoffNotices: ReactNode;
-    sourceSetup: ReactNode;
     // Opening, unreachable or no games: shown instead of Discover and Browse.
     discoverEmpty: ReactNode;
     details: ReactNode;
@@ -349,8 +348,6 @@ function Body({ props, home, browse }: { props: ShellProps; home: ReactNode; bro
       {n.handoffNotices}
       {props.settings
         ? props.settings
-        : n.sourceSetup
-        ? n.sourceSetup
         : !props.orbit.games.length && (props.tab === "Discover" || isBrowse(props)) && !props.game
         ? n.discoverEmpty
         : props.game

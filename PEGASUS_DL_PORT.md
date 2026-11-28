@@ -1,8 +1,8 @@
 # PEGASUS_DL_PORT: prompt
 
-> Status: **implemented.** **Community catalogues** is selected during first-time setup.
-> Orbit starts fetching after you acknowledge and save the download notice. The five default
-> catalogues and any custom sources appear in the Community catalogues section in Sources.
+> Status: **implemented.** The original prompt below documents the first implementation.
+> Orbit includes a fixed set of community catalogues. The PS5 service loads them automatically
+> at startup and refreshes network catalogues in the background.
 > Orbit reads the individual links and labels in `downloadLinks`. Choosing a provider page checks
 > the selected link for a PKG, FPKG, RAR or ZIP. An unlabeled RAR or ZIP goes through game-folder
 > inspection and extraction. LZ4, ZSTD, exFAT, FFPFSC, PFS and 7z options are filtered.

@@ -2,7 +2,7 @@ import { SupportPanel } from "../Support";
 import { VikingAccount } from "../VikingAccount";
 // Shared settings categories in all four layouts; Store hosts this page in its App settings dialog.
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import type { SourceSettings, System } from "../types";
+import type { System } from "../types";
 import { languages, savedLanguage, t, tn } from "../i18n";
 import { interfaces, useInterfacePrefs } from "./choice";
 import { Appearance } from "./Appearance";
@@ -18,7 +18,7 @@ import { Glyph, type GlyphName } from "./Glyph";
 export type SettingsSection =
   | "appearance"
   | "language"
-  | "sources"
+  | "accounts"
   | "downloads"
   | "storage"
   | "notifications"
@@ -38,7 +38,7 @@ export const settingsGroups: { label: string; sections: { id: SettingsSection; l
   { label: /* i18n */ "Settings", sections: [
     { id: "downloads", label: /* i18n */ "Downloads", glyph: "down" },
     { id: "storage", label: /* i18n */ "Storage & cleanup", glyph: "drive" },
-    { id: "sources", label: /* i18n */ "Sources & accounts", glyph: "cloud" },
+    { id: "accounts", label: /* i18n */ "Accounts", glyph: "cloud" },
     { id: "pair", label: /* i18n */ "Devices", glyph: "link" },
     { id: "appearance", label: /* i18n */ "Appearance", glyph: "palette" },
     { id: "notifications", label: /* i18n */ "Notifications", glyph: "bell" },
@@ -50,7 +50,7 @@ export const settingsGroups: { label: string; sections: { id: SettingsSection; l
 ];
 const aliases: Partial<Record<SettingsSection, SettingsSection>> = {
   language: "appearance", payload: "updates", autostart: "updates",
-  torbox: "sources", archive: "sources", viking: "sources", zero: "pair",
+  torbox: "accounts", archive: "accounts", viking: "accounts", zero: "pair",
 };
 export const settingsSections = settingsGroups.flatMap((g) => g.sections);
 
@@ -58,26 +58,22 @@ export function SettingsPage({
   section,
   choose,
   system,
-  sources,
   storage,
   downloads,
   notifications,
   zero,
   pairing,
   updateAvailable,
-  sourceSettings,
 }: {
   section: SettingsSection;
   choose: (section: SettingsSection) => void;
   system: System | null;
-  sources: ReactNode;
   storage: ReactNode;
   downloads: ReactNode;
   notifications: ReactNode;
   zero: ReactNode;
   pairing: ReactNode;
   updateAvailable: boolean;
-  sourceSettings: SourceSettings | null;
 }) {
   const auto = useAutoStart();
   const { prefs } = useInterfacePrefs();
@@ -85,14 +81,6 @@ export function SettingsPage({
   const language = savedLanguage();
   const values: Partial<Record<SettingsSection, string>> = {
     appearance: t(interfaces.find((i) => i.name === prefs.name)?.title || ""),
-    ...(sourceSettings
-      ? {
-          sources: sourceSettings.options
-            .filter((o) => sourceSettings.enabled.includes(o.id))
-            .map((o) => o.label)
-            .join(", "),
-        }
-      : {}),
     language: language ? languages.find((l) => l.code === language)?.name || "" : t("Automatic"),
     ...(system?.paired && system.concurrentDownloads
       ? { downloads: tn(system.concurrentDownloads, "{count} at a time", "{count} at a time") }
@@ -132,11 +120,11 @@ export function SettingsPage({
   }, [current.id, section]);
   const startup = <><div data-setting="payload"><PayloadManagers system={system} auto={auto} /></div><div data-setting="autostart"><StartAutomatically auto={auto} /></div>
     {auto.error && <p className="form-error" role="alert">{auto.error}</p>}</>;
-  const accounts = <>{sources}<div data-setting="torbox"><Debrid /></div><div data-setting="archive"><ArchiveAccount /></div><div data-setting="viking"><VikingAccount /></div></>;
+  const accounts = <><div data-setting="torbox"><Debrid /></div><div data-setting="archive"><ArchiveAccount /></div><div data-setting="viking"><VikingAccount /></div></>;
   const updatePanels = <><Updates onStopped={() => setStopped(true)} />{!stopped && startup}</>;
   const content: Partial<Record<SettingsSection, ReactNode>> = {
     appearance: <><Appearance page /><div data-setting="language"><LanguageSetting /></div></>,
-    sources: accounts,
+    accounts,
     downloads,
     storage,
     notifications,
@@ -175,7 +163,7 @@ export function SettingsPage({
       </nav>
       <div ref={panel} className={`settings-panel settings-panel-${current.id}`} key={current.id}>
         {/* The other panels open with their own heading. */}
-        {["downloads", "storage", "notifications", "sources", "pair", "updates", "diagnostics"].includes(current.id) && <h1 className="settings-title">{t(current.label)}</h1>}
+        {["downloads", "storage", "notifications", "accounts", "pair", "updates", "diagnostics"].includes(current.id) && <h1 className="settings-title">{t(current.label)}</h1>}
         {stopped && current.id !== "updates" ? content.updates : content[current.id]}
       </div>
     </section>

@@ -10,25 +10,23 @@
 
 #include "orbit.h"
 
-/* Startup loads the durable settings and cache before queue state is read. */
+/* Startup loads the built-in catalogues and their cache before reading the queue. */
 int remote_sources_load(void);
 #ifdef ORBIT_TEST
 cJSON *remote_pspkg_preview(const char *source_id, const char *url,
                             size_t game_limit);
 #endif
+#ifdef ORBIT_REMOTE_TEST_CLOCK
+cJSON *remote_sources_test_status_locked(void);
+void remote_sources_test_refresh_locked(void);
+#endif
 cJSON *remote_pspkg_links(const char *html);
 int remote_sources_start(void);
 void remote_sources_stop(void);
-void remote_sources_changed_locked(void);
 void remote_sources_tick(void);
-unsigned remote_sources_retry_after_locked(void);
 bool remote_source_enabled_locked(const Release *release);
-cJSON *remote_sources_json_locked(void);
 cJSON *remote_sources_diagnostics_locked(void);
 unsigned long remote_sources_generation_locked(void);
-size_t remote_sources_entry_count_locked(void);
-int remote_sources_change_locked(const char *method, const char *id, const cJSON *input,
-                                 char *error, size_t cap);
 
 /* Pegasus package adapter and validation of queued remote snapshots. */
 int pegasus_entry_to_release(const cJSON *entry, const char *source_id, Release *release);

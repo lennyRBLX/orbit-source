@@ -297,7 +297,7 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
 }
 
 /* A mirror supplies the bytes; the queue still uses the selected option's
- * identity, source settings, and stable provider page. */
+ * identity and stable provider page. */
 static void community_file(Release *selected, const Release *file) {
     copy_text(selected->url, sizeof selected->url, file->url);
     copy_text(selected->filename, sizeof selected->filename, file->filename);
@@ -1011,7 +1011,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
                 goto done;
             }
             if (!source_enabled_locked(r)) {
-                copy_text(error, cap, "Enable this PSPKG catalogue in Sources first."); code = 409;
+                copy_text(error, cap, "This download option is no longer available."); code = 409;
                 goto done;
             }
             Storage drives[ORBIT_MAX_STORAGE], *storage = NULL;
@@ -1068,7 +1068,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
         } else if (!r || (!remote_page_pending(r) && !provider_browser_supported(r))) {
             copy_text(error, cap, "This option has no supported provider browser page."); code = 400;
         } else if (!source_enabled_locked(r)) {
-            copy_text(error, cap, "Enable this source and acknowledge the download notice in Sources first."); code = 409;
+            copy_text(error, cap, "This download option is no longer available."); code = 409;
         } else if (!s) {
             copy_text(error, cap, "Reconnect the selected drive first."); code = 409;
         } else if (refreshing && (strcmp(s->root, job->root) || s->device != job->device || s->inode != job->inode)) {
@@ -1094,9 +1094,6 @@ int browser_action(const cJSON *input, char *error, size_t cap) {
     return perform_action(input, json_text(input, "action"), error, cap);
 }
 
-void browser_source_changed_locked(void) {
-    if (session.busy && !session.account && !source_enabled_locked(&session.release)) atomic_store(&session.cancel, true);
-}
 void browser_job_changed_locked(const char *id) {
     if (session.busy && session.refresh_job.id[0] && !strcmp(session.refresh_job.id, id))
         atomic_store(&session.cancel, true);

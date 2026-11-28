@@ -101,23 +101,6 @@ export interface Game extends AddonIdentity {
   releases: Release[];
 }
 export type SourceId = "vikingfile" | "archive" | "akirabox" | "datanodes" | "1fichier" | "remote";
-export interface RemoteSource {
-  id: string;
-  name: string;
-  url: string;
-  enabled: boolean;
-  builtIn: boolean;
-  bundled?: boolean;
-  lastFetchedAt: number;
-  lastError: string;
-  entryCount: number;
-  skippedEntries: number;
-}
-export interface RemoteSources {
-  sources: RemoteSource[];
-  refreshing: boolean;
-  retryAfter?: number;
-}
 export const releaseProvider = (release: Release) => {
   const name = release.sourceId === "remote" && release.provider === "Community catalogues"
     ? t("Community catalogues") : release.provider;
@@ -131,18 +114,6 @@ export const releaseSize = (release: Release) =>
     : release.sizeEstimateBytes
       ? `${release.sizeEstimateExact ? "" : "≈"}${bytes(release.sizeEstimateBytes)}`
       : t("Unknown size");
-export interface SourceSettings {
-  enabled: SourceId[];
-  acknowledged: boolean;
-  noticeVersion: number;
-  remoteGeneration?: number;
-  options: {
-    id: SourceId;
-    label: string;
-    releaseCount: number;
-    downloadReady: boolean;
-  }[];
-}
 export interface Storage {
   id: string;
   label: string;
@@ -340,6 +311,7 @@ export interface LibraryTarget {
 }
 export interface System {
   catalogueRevision: number;
+  remoteGeneration?: number;
   instanceId?: string;
   name: string;
   version: string;

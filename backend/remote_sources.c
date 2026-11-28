@@ -17,11 +17,10 @@
 #include <unistd.h>
 
 #define SOURCE_FILE "remote-sources-v1.json"
+#define SOURCE_SCHEMA 1
 #define CACHE_DIRECTORY "remote-cache"
 #define STATE_LIMIT (256 * 1024)
 #define BODY_LIMIT (8 * 1024 * 1024)
-#define SOURCE_LIMIT 32
-#define CUSTOM_LIMIT 24
 #define REFRESH_INTERVAL (6 * 60 * 60)
 #define PSPKG_REFRESH_INTERVAL (24 * 60 * 60)
 #define REFRESH_COOLDOWN_MS 60000
@@ -30,51 +29,38 @@
 #define METADATA_LIMIT 512
 
 
-/* Mirrors the Pegasus default-sources manifest, with a revision stored alongside
- * the user's choices. Future defaults are merged by id, never by enabled state. */
+/* These IDs also identify cached options and persisted downloads. */
 static const struct {
-    unsigned schema_version, revision, onboarding_revision;
-    struct { const char *id, *name, *description, *url; bool default_enabled; } sources[8];
-} manifest = {1, 4, 1, {
-    {"dlps", "DLPS Catalog", "Games and DLCs from DLPSGAME in various formats",
-     "https://pegasus-dl.dev/catalogs/dlps.json", true},
-    {"pippo-exfat", "Pippo .exFAT", "Games and DLCs in .exfat and .pkg format",
-     "https://pegasus-dl.dev/catalogs/pippo.json", true},
-    {"pfs", "PFS Catalog", "Games and DLCs in .ffpfsc and .pkg format",
-     "https://pegasus-dl.dev/catalogs/pfs.json", true},
-    {"evox-coreos", "evoX-CoreOS", "Homebrew apps and community utilities",
-     "https://raw.githubusercontent.com/nexgen999/evoX-CoreOS/refs/heads/main/json/pegasus-dl/catalog.json", true},
-    {"zer0", "ZER0GAME Catalog", "Games and DLCs in .pkg format",
-     "https://pegasus-dl.dev/catalogs/zer0.json", true},
-    {PADRINO_SOURCE, "Padrino Store", "Bundled PS4 and PS5 catalog snapshot, without ZSTD",
-     "https://github.com/B4ckd0orl/Padrino-Store", true},
-    {PSPKG_PS5_SOURCE, "PSPKG PS5", "Public links from the general PSPKG PS5 games catalogue",
-     "https://pspkg.com/ps5/", true},
-    {PSPKG_PS4_SOURCE, "PSPKG PS4", "Public links from the general PSPKG PS4 games catalogue",
-     "https://pspkg.com/ps4/", true},
-}};
+    const char *id, *url;
+} builtin_sources[] = {
+    {"dlps", "https://pegasus-dl.dev/catalogs/dlps.json"},
+    {"pippo-exfat", "https://pegasus-dl.dev/catalogs/pippo.json"},
+    {"pfs", "https://pegasus-dl.dev/catalogs/pfs.json"},
+    {"evox-coreos", "https://raw.githubusercontent.com/nexgen999/evoX-CoreOS/refs/heads/main/json/pegasus-dl/catalog.json"},
+    {"zer0", "https://pegasus-dl.dev/catalogs/zer0.json"},
+    {PADRINO_SOURCE, "https://github.com/B4ckd0orl/Padrino-Store"},
+    {PSPKG_PS5_SOURCE, "https://pspkg.com/ps5/"},
+    {PSPKG_PS4_SOURCE, "https://pspkg.com/ps4/"},
+};
+enum { SOURCE_COUNT = sizeof builtin_sources / sizeof *builtin_sources };
 
 typedef struct {
-    char id[25], name[128], url[URL_LIMIT + 1], etag[256], cache_hash[65];
+    char id[25], url[URL_LIMIT + 1], etag[256], cache_hash[65];
     const char *error;
-    bool enabled, built_in;
     time_t fetched;
     size_t entries, skipped, discovered;
     bool truncated;
-    unsigned long epoch;
 } RemoteSource;
 
 static struct {
-    RemoteSource sources[SOURCE_LIMIT];
-    size_t count;
-    unsigned revision, onboarding_revision;
-    unsigned long epoch, generation;
+    RemoteSource sources[SOURCE_COUNT];
+    unsigned long generation;
     int cache_fd;
     pthread_t thread;
     pthread_cond_t changed;
-    bool pending, empty_pending, busy, started, unavailable;
+    bool empty_pending, busy, started;
     time_t next;
-    int64_t empty_after, manual_after;
+    int64_t empty_after;
 } remote = {.cache_fd = -1, .changed = PTHREAD_COND_INITIALIZER};
 
 enum MetadataState { META_EMPTY, META_QUEUED, META_LOADING, META_DONE };
@@ -98,23 +84,26 @@ static const char *const errors[] = {
 };
 
 static RemoteSource *find(const char *id) {
-    for (size_t i = 0; i < remote.count; i++)
+    if (!*id) return NULL;
+    for (size_t i = 0; i < SOURCE_COUNT; i++)
         if (!strcmp(remote.sources[i].id, id)) return &remote.sources[i];
     return NULL;
 }
 
-static bool notice_acknowledged_locked(void) {
-    return orbit.sources.notice_version == ORBIT_SOURCE_NOTICE_VERSION &&
-           orbit.sources.acknowledged_at > 0;
+static bool pspkg_source(const char *id) {
+    return !strcmp(id, PSPKG_PS5_SOURCE) || !strcmp(id, PSPKG_PS4_SOURCE);
 }
 
-static bool sources_available_locked(bool empty_only) {
-    for (size_t i = 0; i < remote.count; i++)
-        if (remote.sources[i].enabled && strcmp(remote.sources[i].id, PADRINO_SOURCE) &&
-            (!empty_only || (strcmp(remote.sources[i].id, PSPKG_PS5_SOURCE) &&
-                             strcmp(remote.sources[i].id, PSPKG_PS4_SOURCE))) &&
-            (!empty_only || !remote.sources[i].entries)) return true;
-    return false;
+static bool refreshable(const RemoteSource *source) {
+#ifdef ORBIT_TEST
+    return !strncmp(source->url, "http://127.0.0.1:", 17);
+#else
+    return strcmp(source->id, PADRINO_SOURCE) != 0;
+#endif
+}
+
+static bool needs_empty_retry(const RemoteSource *source) {
+    return refreshable(source) && !pspkg_source(source->id) && !source->entries;
 }
 
 static int64_t refresh_clock(void) {
@@ -128,15 +117,8 @@ static int64_t refresh_clock(void) {
 #endif
 }
 
-unsigned remote_sources_retry_after_locked(void) {
-    int64_t remaining = remote.manual_after - refresh_clock();
-    return remaining > 0 ? (unsigned)((remaining + 999) / 1000) : 0;
-}
-
 bool remote_source_enabled_locked(const Release *r) {
-    const RemoteSource *source = find(r->remote_catalog_id);
-    return notice_acknowledged_locked() && (orbit.sources.enabled & ORBIT_SOURCE_REMOTE) &&
-           source && source->enabled;
+    return find(r->remote_catalog_id) != NULL;
 }
 
 static bool mirror_enabled(const Release *original, const Release *other) {
@@ -172,32 +154,21 @@ bool remote_mirror_file(const Release *selected, const Release *file) {
 
 unsigned long remote_sources_generation_locked(void) { return remote.generation; }
 
-size_t remote_sources_entry_count_locked(void) {
-    size_t count = 0;
-    for (size_t i = 0; i < remote.count; i++)
-        if (remote.sources[i].enabled) count += remote.sources[i].entries;
-    return count;
-}
-
 static void invalidate_locked(void) {
     remote.generation++;
     catalog_view_invalidate_locked();
 }
 
-void remote_sources_changed_locked(void) {
-    remote.pending = true;
-    pthread_cond_signal(&remote.changed);
-}
-
-/* The existing service tick queues retries for empty catalogues. The worker
- * keeps its normal refresh interval for sources that already have options. */
+/* Retry empty catalogues between the regular refreshes. */
 void remote_sources_tick(void) {
     pthread_mutex_lock(&orbit.mutex);
-    if (remote.started && notice_acknowledged_locked() &&
-        !remote.pending && !remote.empty_pending && !remote.busy &&
-        refresh_clock() >= remote.empty_after && sources_available_locked(true)) {
-        remote.empty_pending = true;
-        pthread_cond_signal(&remote.changed);
+    if (remote.started && !remote.empty_pending && !remote.busy && refresh_clock() >= remote.empty_after) {
+        for (size_t i = 0; i < SOURCE_COUNT; i++) {
+            if (!needs_empty_retry(&remote.sources[i])) continue;
+            remote.empty_pending = true;
+            pthread_cond_signal(&remote.changed);
+            break;
+        }
     }
     pthread_mutex_unlock(&orbit.mutex);
 }
@@ -206,33 +177,6 @@ static void hash_text(const char *data, size_t length, char out[65]) {
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256((const unsigned char *)data, length, digest);
     for (size_t i = 0; i < sizeof digest; i++) snprintf(out + 2 * i, 3, "%02x", digest[i]);
-}
-
-/* Host and normalized path define a custom catalogue. Queries may carry
- * private parameters, so neither the URL nor its query becomes part of the id. */
-static bool custom_id(const char *url, char id[25]) {
-    if (strlen(url) > URL_LIMIT || !remote_https_url(url)) return false;
-    CURLU *parsed = curl_url();
-    char *host = NULL, *path = NULL;
-    bool valid = parsed && !curl_url_set(parsed, CURLUPART_URL, url, CURLU_DISALLOW_USER) &&
-                 !curl_url_get(parsed, CURLUPART_HOST, &host, 0) &&
-                 !curl_url_get(parsed, CURLUPART_PATH, &path, 0);
-    if (valid) {
-        for (char *p = host; *p; p++) *p = (char)tolower((unsigned char)*p);
-        size_t n = strlen(host);
-        if (n && host[n - 1] == '.') host[n - 1] = 0;
-        char key[URL_LIMIT + 2], hash[65];
-        int length = snprintf(key, sizeof key, "%s%s", host, path);
-        valid = length > 0 && (size_t)length < sizeof key;
-        if (valid) {
-            hash_text(key, (size_t)length, hash);
-            snprintf(id, 25, "custom-%.16s", hash);
-        }
-    }
-    curl_free(host);
-    curl_free(path);
-    curl_url_cleanup(parsed);
-    return valid;
 }
 
 static bool valid_etag(const char *etag) {
@@ -244,69 +188,74 @@ static bool valid_etag(const char *etag) {
     return true;
 }
 
-static cJSON *sources_json(bool disk) {
+static cJSON *cache_metadata_json(void) {
     cJSON *root = cJSON_CreateObject();
-    if (!root) return NULL;
     cJSON *rows = cJSON_AddArrayToObject(root, "sources");
-    bool ok = rows && cJSON_AddNumberToObject(root, "schemaVersion", manifest.schema_version) &&
-        cJSON_AddNumberToObject(root, "revision", remote.revision) &&
-        cJSON_AddNumberToObject(root, "onboardingRevision", remote.onboarding_revision);
-    if (!disk) {
-        bool queued = remote.started && notice_acknowledged_locked() &&
-                      (remote.empty_pending || (remote.pending && sources_available_locked(false)));
-        ok = ok && cJSON_AddBoolToObject(root, "refreshing", remote.busy || queued) &&
-                  cJSON_AddNumberToObject(root, "retryAfter", remote_sources_retry_after_locked());
-    }
-    for (size_t i = 0; ok && i < remote.count; i++) {
+    bool ok = rows && cJSON_AddNumberToObject(root, "schemaVersion", SOURCE_SCHEMA);
+    for (size_t i = 0; ok && i < SOURCE_COUNT; i++) {
         const RemoteSource *s = &remote.sources[i];
-        cJSON *r = cJSON_CreateObject();
-        ok = r && cJSON_AddItemToArray(rows, r);
-        if (!ok) { cJSON_Delete(r); break; }
-        ok = cJSON_AddStringToObject(r, "id", s->id) &&
-            cJSON_AddStringToObject(r, "name", s->name) &&
-            cJSON_AddStringToObject(r, "url", s->url) &&
-            cJSON_AddBoolToObject(r, "enabled", s->enabled) &&
-            cJSON_AddBoolToObject(r, "builtIn", s->built_in) &&
-            cJSON_AddNumberToObject(r, "lastFetchedAt", (double)s->fetched) &&
-            cJSON_AddStringToObject(r, "etag", s->etag) &&
-            cJSON_AddStringToObject(r, "lastError", s->error ? s->error : "") &&
-            cJSON_AddNumberToObject(r, "entryCount", s->entries) &&
-            cJSON_AddNumberToObject(r, "skippedEntries", s->skipped);
-        if (ok && (!strcmp(s->id, PSPKG_PS4_SOURCE) || !strcmp(s->id, PSPKG_PS5_SOURCE)))
-            ok = cJSON_AddNumberToObject(r, "discovered", s->discovered) &&
-                 cJSON_AddBoolToObject(r, "truncated", s->truncated);
-        if (disk) ok = ok && cJSON_AddStringToObject(r, "cacheHash", s->cache_hash);
-        else if (s->built_in) {
-            if (!strcmp(s->id, PADRINO_SOURCE)) ok = ok && cJSON_AddTrueToObject(r, "bundled");
-            for (size_t j = 0; j < sizeof manifest.sources / sizeof *manifest.sources; j++) {
-                if (strcmp(s->id, manifest.sources[j].id)) continue;
-                ok = ok && cJSON_AddStringToObject(r, "description", manifest.sources[j].description) &&
-                     cJSON_AddBoolToObject(r, "defaultEnabled", manifest.sources[j].default_enabled);
-                break;
-            }
+        if (!strcmp(s->id, PADRINO_SOURCE)) continue;
+        cJSON *row = cJSON_CreateObject();
+        if (!row || !cJSON_AddItemToArray(rows, row)) {
+            cJSON_Delete(row);
+            ok = false;
+            break;
         }
+        ok = cJSON_AddStringToObject(row, "id", s->id) &&
+            cJSON_AddStringToObject(row, "url", s->url) &&
+            cJSON_AddNumberToObject(row, "lastFetchedAt", (double)s->fetched) &&
+            cJSON_AddStringToObject(row, "etag", s->etag) &&
+            cJSON_AddStringToObject(row, "lastError", s->error ? s->error : "") &&
+            cJSON_AddStringToObject(row, "cacheHash", s->cache_hash);
+        if (ok && pspkg_source(s->id))
+            ok = cJSON_AddNumberToObject(row, "discovered", s->discovered) &&
+                 cJSON_AddBoolToObject(row, "truncated", s->truncated);
     }
     if (ok) return root;
     cJSON_Delete(root);
     return NULL;
 }
 
-cJSON *remote_sources_json_locked(void) { return sources_json(false); }
+#ifdef ORBIT_REMOTE_TEST_CLOCK
+cJSON *remote_sources_test_status_locked(void) {
+    cJSON *root = cache_metadata_json();
+    if (!root) return NULL;
+    cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "sources");
+    RemoteSource *padrino = find(PADRINO_SOURCE);
+    cJSON *bundled = cJSON_CreateObject();
+    cJSON_AddStringToObject(bundled, "id", padrino->id);
+    cJSON_AddItemToArray(rows, bundled);
+    cJSON *row;
+    cJSON_ArrayForEach(row, rows) {
+        const RemoteSource *source = find(json_text(row, "id"));
+        cJSON_AddNumberToObject(row, "entryCount", source->entries);
+        cJSON_AddNumberToObject(row, "skippedEntries", source->skipped);
+    }
+    cJSON_AddBoolToObject(root, "refreshing", remote.started &&
+        (remote.busy || remote.empty_pending || time(NULL) >= remote.next));
+    return root;
+}
+
+void remote_sources_test_refresh_locked(void) {
+    remote.next = 0;
+    pthread_cond_signal(&remote.changed);
+}
+#endif
 
 cJSON *remote_sources_diagnostics_locked(void) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "count", remote.count);
+    cJSON_AddNumberToObject(root, "count", SOURCE_COUNT);
     cJSON_AddNumberToObject(root, "entryCount", orbit.remote_release_count);
     cJSON *codes = cJSON_AddArrayToObject(root, "lastErrorCodes");
-    for (size_t i = 0; i < remote.count; i++)
+    for (size_t i = 0; i < SOURCE_COUNT; i++)
         if (remote.sources[i].error && *remote.sources[i].error)
             cJSON_AddItemToArray(codes, cJSON_CreateString(remote.sources[i].error));
-    if (remote.unavailable) cJSON_AddItemToArray(codes, cJSON_CreateString("storage"));
+    if (remote.cache_fd < 0) cJSON_AddItemToArray(codes, cJSON_CreateString("storage"));
     return root;
 }
 
 static int save_locked(void) {
-    cJSON *root = sources_json(true);
+    cJSON *root = cache_metadata_json();
     char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!body) return -1;
@@ -368,20 +317,7 @@ cJSON *remote_source_package_diagnostics_locked(const char *source, const char *
     return result;
 }
 
-static bool read_row(const cJSON *row, RemoteSource *s) {
-    const char *id = json_text(row, "id"), *url = json_text(row, "url"), *name = json_text(row, "name");
-    const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(row, "enabled"),
-                *built_in = cJSON_GetObjectItemCaseSensitive(row, "builtIn");
-    char canonical[25];
-    if (!cJSON_IsBool(enabled) || !cJSON_IsBool(built_in) || !*id || strlen(id) >= sizeof s->id ||
-        strspn(id, "abcdefghijklmnopqrstuvwxyz0123456789-") != strlen(id) ||
-        !*name || strlen(name) >= sizeof s->name || !utf8_text(name) ||
-        !custom_id(url, canonical) || (!cJSON_IsTrue(built_in) && strcmp(id, canonical))) return false;
-    copy_text(s->id, sizeof s->id, id);
-    copy_text(s->name, sizeof s->name, name);
-    copy_text(s->url, sizeof s->url, url);
-    s->enabled = cJSON_IsTrue(enabled);
-    s->built_in = cJSON_IsTrue(built_in);
+static void load_cache_metadata(const cJSON *row, RemoteSource *s) {
     const char *etag = json_text(row, "etag"), *hash = json_text(row, "cacheHash");
     if (valid_etag(etag)) copy_text(s->etag, sizeof s->etag, etag);
     if (strlen(hash) == 64 && strspn(hash, "0123456789abcdef") == 64)
@@ -393,43 +329,6 @@ static bool read_row(const cJSON *row, RemoteSource *s) {
     s->truncated = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "truncated"));
     for (size_t i = 0; i < sizeof errors / sizeof *errors; i++)
         if (!strcmp(json_text(row, "lastError"), errors[i])) s->error = errors[i];
-    return true;
-}
-
-static bool merge_manifest(void) {
-    bool changed = remote.revision < manifest.revision ||
-                   remote.onboarding_revision < manifest.onboarding_revision;
-    for (size_t i = 0; i < sizeof manifest.sources / sizeof *manifest.sources; i++) {
-        RemoteSource *s = find(manifest.sources[i].id);
-        if (!s) {
-            if (remote.count == SOURCE_LIMIT) continue;
-            s = &remote.sources[remote.count++];
-            *s = (RemoteSource){.enabled = manifest.sources[i].default_enabled, .built_in = true};
-            copy_text(s->id, sizeof s->id, manifest.sources[i].id);
-            changed = true;
-        }
-        if (strcmp(s->url, manifest.sources[i].url)) {
-            if (*s->url && remote.cache_fd >= 0) {
-                char filename[32];
-                snprintf(filename, sizeof filename, "%s.json", s->id);
-                unlinkat(remote.cache_fd, filename, 0);
-            }
-            s->etag[0] = s->cache_hash[0] = 0;
-            s->fetched = 0;
-            s->error = NULL;
-            copy_text(s->url, sizeof s->url, manifest.sources[i].url);
-            changed = true;
-        }
-        if (strcmp(s->name, manifest.sources[i].name)) {
-            copy_text(s->name, sizeof s->name, manifest.sources[i].name);
-            changed = true;
-        }
-        s->built_in = true;
-    }
-    if (remote.revision < manifest.revision) remote.revision = manifest.revision;
-    if (remote.onboarding_revision < manifest.onboarding_revision)
-        remote.onboarding_revision = manifest.onboarding_revision;
-    return changed;
 }
 
 /* Caller commits the cache only after the replacement backing array is
@@ -438,9 +337,9 @@ static int reserve_locked(const RemoteSource *source, size_t count) {
     size_t total = orbit.remote_release_count - source->entries + count;
     const RemoteSource *padrino = find(PADRINO_SOURCE);
     size_t index_entries = 0;
-    for (size_t i = 0; i < remote.count; i++) {
+    for (size_t i = 0; i < SOURCE_COUNT; i++) {
         const RemoteSource *candidate = &remote.sources[i];
-        if (!strcmp(candidate->id, PSPKG_PS4_SOURCE) || !strcmp(candidate->id, PSPKG_PS5_SOURCE))
+        if (pspkg_source(candidate->id))
             index_entries += candidate == source ? count : candidate->entries;
     }
     if (total < index_entries || total - index_entries > REMOTE_RELEASE_LIMIT + (padrino ? padrino->entries : 0)) return -1;
@@ -500,46 +399,57 @@ static void cache_load(RemoteSource *s) {
 }
 
 int remote_sources_load(void) {
+    for (size_t i = 0; i < SOURCE_COUNT; i++) {
+        RemoteSource *source = &remote.sources[i];
+        const char *url = builtin_sources[i].url;
+#ifdef ORBIT_TEST
+        const char *fixture = !strcmp(builtin_sources[i].id, "dlps") ? getenv("ORBIT_TEST_CATALOGUE_URL") :
+            !strcmp(builtin_sources[i].id, "pfs") ? getenv("ORBIT_TEST_SECOND_CATALOGUE_URL") : NULL;
+        if (fixture && !strncmp(fixture, "http://127.0.0.1:", 17) && strlen(fixture) < sizeof source->url)
+            url = fixture;
+#endif
+        copy_text(source->id, sizeof source->id, builtin_sources[i].id);
+        copy_text(source->url, sizeof source->url, url);
+    }
     if (mkdirat(orbit.state_fd, CACHE_DIRECTORY, 0700) == 0 || errno == EEXIST)
         remote.cache_fd = openat(orbit.state_fd, CACHE_DIRECTORY, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+
     size_t size = 0;
     char *body = read_file(orbit.state_fd, SOURCE_FILE, STATE_LIMIT, &size);
-    bool missing = !body && errno == ENOENT;
     cJSON *root = body && !memchr(body, 0, size) ? cJSON_ParseWithLengthOpts(body, size + 1, NULL, true) : NULL;
     free(body);
-    const cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "sources"), *row;
-    int64_t revision = json_int(root, "revision"), onboarding = json_int(root, "onboardingRevision");
-    bool valid = json_int(root, "schemaVersion") == manifest.schema_version && cJSON_IsArray(rows) &&
-        revision > 0 && revision <= UINT32_MAX && onboarding > 0 && onboarding <= UINT32_MAX;
-    if (valid) {
-        remote.revision = (unsigned)revision;
-        remote.onboarding_revision = (unsigned)onboarding;
-        cJSON_ArrayForEach(row, rows) {
-            RemoteSource s = {0};
-            if (remote.count == SOURCE_LIMIT || !read_row(row, &s) || find(s.id)) { valid = false; break; }
-            remote.sources[remote.count++] = s;
+    const cJSON *rows = json_int(root, "schemaVersion") == SOURCE_SCHEMA
+        ? cJSON_GetObjectItemCaseSensitive(root, "sources") : NULL;
+    RemoteSource *padrino = find(PADRINO_SOURCE);
+    if (padrino_catalog_load(&orbit.remote_releases, &orbit.remote_release_count, &padrino->fetched))
+        padrino->error = "invalid-catalogue";
+    else {
+        padrino->entries = orbit.remote_release_count;
+        invalidate_locked();
+    }
+
+    if (remote.cache_fd >= 0) {
+        for (size_t i = 0; i < SOURCE_COUNT; i++) {
+            RemoteSource *source = &remote.sources[i];
+            if (source == padrino) continue;
+            /* Only the compiled list supplies IDs and URLs. The previous file
+             * can still provide validators for the same built-in cache. */
+            const cJSON *row;
+            cJSON_ArrayForEach(row, rows) {
+                if (!strcmp(json_text(row, "id"), source->id)) break;
+            }
+            if (row && strcmp(json_text(row, "url"), source->url)) {
+                char filename[32];
+                snprintf(filename, sizeof filename, "%s.json", source->id);
+                unlinkat(remote.cache_fd, filename, 0);
+                continue;
+            }
+            if (row) load_cache_metadata(row, source);
+            cache_load(source);
         }
     }
     cJSON_Delete(root);
-    remote.unavailable = remote.cache_fd < 0 || (!valid && !missing);
-    if (!valid) remote.count = 0;
-    bool changed = merge_manifest();
-    RemoteSource *padrino = find(PADRINO_SOURCE);
-    if (padrino) {
-        if (padrino_catalog_load(&orbit.remote_releases, &orbit.remote_release_count, &padrino->fetched))
-            padrino->error = "invalid-catalogue";
-        else {
-            padrino->entries = orbit.remote_release_count;
-            padrino->error = NULL;
-            invalidate_locked();
-        }
-    }
-    if (!remote.unavailable) {
-        for (size_t i = 0; i < remote.count; i++)
-            if (&remote.sources[i] != padrino) cache_load(&remote.sources[i]);
-        if (changed && save_locked()) remote.unavailable = true;
-    }
-    return remote.unavailable ? -1 : 0;
+    return remote.cache_fd < 0 ? -1 : 0;
 }
 
 typedef struct {
@@ -592,14 +502,8 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
 }
 
 static int progress(void *context, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
-    (void)a; (void)b; (void)c; (void)d;
-    const RemoteSource *snapshot = context;
-    if (stopping()) return 1;
-    pthread_mutex_lock(&orbit.mutex);
-    const RemoteSource *live = find(snapshot->id);
-    bool cancel = !notice_acknowledged_locked() || !live || !live->enabled || live->epoch != snapshot->epoch;
-    pthread_mutex_unlock(&orbit.mutex);
-    return cancel;
+    (void)context; (void)a; (void)b; (void)c; (void)d;
+    return stopping();
 }
 
 static int before_request(void *context, char *remote_ip, char *local_ip, int remote_port, int local_port) {
@@ -647,7 +551,6 @@ static const char *fetch(const RemoteSource *s, Response *response, long *status
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headers);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, s);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     CURLcode result = curl_easy_perform(curl);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
@@ -660,10 +563,6 @@ static const char *fetch(const RemoteSource *s, Response *response, long *status
     if (result != CURLE_OK) return "network";
     if (*status != 200 && (*status != 304 || !*s->etag || !*s->cache_hash)) return "http";
     return "";
-}
-
-static bool pspkg_source(const char *id) {
-    return !strcmp(id, PSPKG_PS5_SOURCE) || !strcmp(id, PSPKG_PS4_SOURCE);
 }
 
 static bool pspkg_text(const char *start, size_t length, char *out, size_t cap) {
@@ -866,7 +765,7 @@ static void refresh_one(const RemoteSource *snapshot) {
 
     pthread_mutex_lock(&orbit.mutex);
     RemoteSource *live = find(snapshot->id);
-    if (live && live->enabled && notice_acknowledged_locked() && live->epoch == snapshot->epoch && !stopping()) {
+    if (!stopping()) {
         if (!*error && status == 200) {
             char filename[32];
             snprintf(filename, sizeof filename, "%s.json", live->id);
@@ -1056,32 +955,25 @@ static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
     while (!orbit.stop) {
-        if (!notice_acknowledged_locked()) {
-            pthread_cond_wait(&remote.changed, &orbit.mutex);
-            continue;
-        }
         time_t now = time(NULL);
-        bool forced = remote.pending;
-        bool full = remote.pending || now >= remote.next;
+        bool full = now >= remote.next;
         if (!full && !remote.empty_pending) {
             struct timespec deadline = {.tv_sec = remote.next};
             pthread_cond_timedwait(&remote.changed, &orbit.mutex, &deadline);
             continue;
         }
-        remote.pending = false;
         remote.empty_pending = false;
         remote.busy = true;
-        /* Membership changes during a fetch trigger another pass. Take a
-         * snapshot so an add or remove cannot invalidate an in-flight pointer. */
-        RemoteSource snapshots[SOURCE_LIMIT];
-        size_t count = remote.count;
-        memcpy(snapshots, remote.sources, count * sizeof *snapshots);
+        RemoteSource snapshots[SOURCE_COUNT];
+        memcpy(snapshots, remote.sources, sizeof snapshots);
         pthread_mutex_unlock(&orbit.mutex);
-        for (size_t i = 0; i < count && !stopping(); i++)
-            if (snapshots[i].enabled && strcmp(snapshots[i].id, PADRINO_SOURCE) && (full || !snapshots[i].entries) &&
-                (!pspkg_source(snapshots[i].id) || forced || !snapshots[i].fetched ||
-                 now - snapshots[i].fetched >= PSPKG_REFRESH_INTERVAL) &&
-                !progress(&snapshots[i], 0, 0, 0, 0)) refresh_one(&snapshots[i]);
+        for (size_t i = 0; i < SOURCE_COUNT && !stopping(); i++) {
+            const RemoteSource *source = &snapshots[i];
+            if (!refreshable(source) || (!full && !needs_empty_retry(source))) continue;
+            if (pspkg_source(source->id) && source->fetched &&
+                now - source->fetched < PSPKG_REFRESH_INTERVAL) continue;
+            refresh_one(source);
+        }
         pthread_mutex_lock(&orbit.mutex);
         if (full) remote.next = time(NULL) + REFRESH_INTERVAL;
         remote.empty_after = refresh_clock() + REFRESH_COOLDOWN_MS;
@@ -1092,7 +984,7 @@ static void *worker(void *unused) {
 }
 
 int remote_sources_start(void) {
-    if (remote.unavailable) return -1;
+    if (remote.cache_fd < 0) return -1;
     pthread_attr_t attr;
     if (pthread_attr_init(&attr)) return -1;
     int rc = pthread_attr_setstacksize(&attr, ORBIT_THREAD_STACK);
@@ -1124,110 +1016,4 @@ void remote_sources_stop(void) {
     orbit.remote_releases = NULL;
     orbit.remote_release_count = 0;
     pthread_mutex_unlock(&orbit.mutex);
-}
-
-static void pause_disabled_locked(void) {
-    bool changed = false;
-    for (size_t i = 0; i < orbit.job_count; i++) {
-        Job *j = &orbit.jobs[i];
-        if (strcmp(j->release.source, "remote") || remote_source_enabled_locked(&j->release)) continue;
-        if (job_active(j) || !strcmp(j->status, "queued") || !strcmp(j->status, "retrying")) {
-            if (!job_active(j)) copy_text(j->status, sizeof j->status, "paused");
-            j->pause = true;
-            copy_text(j->error, sizeof j->error, "Source disabled. Enable it in Sources before resuming.");
-            changed = true;
-        }
-    }
-    if (changed) (void)state_save_locked();
-    pthread_cond_broadcast(&orbit.changed);
-}
-
-static int refuse(char *error, size_t cap, unsigned status, const char *message) {
-    copy_text(error, cap, message);
-    return (int)status;
-}
-
-int remote_sources_change_locked(const char *method, const char *id, const cJSON *input,
-                                 char *error, size_t cap) {
-    if (stopping()) return refuse(error, cap, 503, "Orbit is stopping.");
-    if (remote.unavailable) return refuse(error, cap, 503, "Could not save community catalogues.");
-    if (!strcmp(method, "POST") && !strcmp(id, "refresh")) {
-        if (!notice_acknowledged_locked())
-            return refuse(error, cap, 409, "Enable this source and acknowledge the download notice in Sources first.");
-        if (!remote.started) return refuse(error, cap, 503, "Could not start catalogue refresh.");
-        if (!sources_available_locked(false))
-            return refuse(error, cap, 409, "No sources enabled");
-        if (remote_sources_retry_after_locked())
-            return refuse(error, cap, 429, "Please wait before refreshing the catalogue again.");
-        remote.manual_after = refresh_clock() + REFRESH_COOLDOWN_MS;
-        remote_sources_changed_locked();
-        return 202;
-    }
-    size_t old_count = remote.count;
-    bool add = !*id && !strcmp(method, "POST"), remove = !strcmp(method, "DELETE");
-    RemoteSource old = {0}, *s = NULL;
-    size_t index;
-    if (add) {
-        const char *url = json_text(input, "url"), *name = json_text(input, "name");
-        char canonical[25];
-        if (!custom_id(url, canonical))
-            return refuse(error, cap, 400, "Enter a valid HTTPS catalogue URL.");
-        const cJSON *name_field = cJSON_GetObjectItemCaseSensitive(input, "name");
-        if ((name_field && !cJSON_IsString(name_field)) || strlen(name) >= sizeof old.name ||
-            (*name && !utf8_text(name)))
-            return refuse(error, cap, 400, "Enter a shorter catalogue name.");
-        size_t custom_count = 0;
-        for (size_t i = 0; i < remote.count; i++) {
-            if (!remote.sources[i].built_in) custom_count++;
-            char existing[25];
-            if (custom_id(remote.sources[i].url, existing) && !strcmp(existing, canonical))
-                return refuse(error, cap, 409, "This catalogue is already listed.");
-        }
-        if (remote.count >= SOURCE_LIMIT || custom_count >= CUSTOM_LIMIT)
-            return refuse(error, cap, 409, "Community catalogues are full.");
-        index = remote.count;
-        s = &remote.sources[remote.count++];
-        *s = (RemoteSource){.enabled = true, .epoch = ++remote.epoch};
-        copy_text(s->id, sizeof s->id, canonical);
-        copy_text(s->name, sizeof s->name, *name ? name : "Custom catalogue");
-        copy_text(s->url, sizeof s->url, url);
-        /* A previously removed source must not inherit an orphaned cache. */
-        char filename[32];
-        snprintf(filename, sizeof filename, "%s.json", s->id);
-        if (unlinkat(remote.cache_fd, filename, 0) && errno != ENOENT) {
-            remote.count = old_count;
-            return refuse(error, cap, 503, "Could not save community catalogues.");
-        }
-    } else {
-        s = find(id);
-        if (!s) return refuse(error, cap, 404, "Community catalogue was not found.");
-        index = (size_t)(s - remote.sources);
-        old = *s;
-        if (remove) {
-            if (s->built_in) return refuse(error, cap, 409, "Built-in catalogues can be disabled.");
-            remote.count--;
-            memmove(s, s + 1, (remote.count - index) * sizeof *s);
-        } else {
-            const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(input, "enabled");
-            if (!cJSON_IsBool(enabled)) return refuse(error, cap, 400, "Choose whether to enable this catalogue.");
-            if (s->enabled == cJSON_IsTrue(enabled)) return 200;
-            s->enabled = cJSON_IsTrue(enabled);
-            s->epoch = ++remote.epoch;
-        }
-    }
-    if (save_locked()) {
-        if (remove) memmove(s + 1, s, (remote.count - index) * sizeof *s);
-        if (!add) *s = old;
-        remote.count = old_count;
-        return refuse(error, cap, 503, "Could not save community catalogues.");
-    }
-    if (remove) {
-        char filename[32];
-        snprintf(filename, sizeof filename, "%s.json", old.id);
-        unlinkat(remote.cache_fd, filename, 0);
-        install_locked(&old, NULL, 0);
-    } else if (!add) invalidate_locked();
-    if (remove || !s->enabled) pause_disabled_locked();
-    if (add || (!remove && s->enabled)) remote_sources_changed_locked();
-    return add ? 201 : 200;
 }
