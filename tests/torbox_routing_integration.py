@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = os.environ.get("ORBIT_TEST_BINARY", ROOT / "build/orbit-test")
 FILE = b"\x7fFIH" + b"test" * 1023
+VIKING_PAGE = "/pspkg-provider/vikingfile.com/metadata"
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -134,6 +135,14 @@ class Fixture(BaseHTTPRequestHandler):
                 self.reply(b"<h1>FiLe <b>not</b> found</h1>", 404, {"Content-Type": "text/html"})
             else:
                 self.reply(b"", 302, {"Location": "/original"})
+        elif path == VIKING_PAGE:
+            self.server.calls.append(path)
+            if self.headers.get("Range"):
+                self.reply(b"", 416)
+                return
+            self.reply(b'<div id="file-information"><h2 id="filename">fixture-release.7z</h2>'
+                       b'<p id="size">199.55 GB</p></div>',
+                       headers={"Content-Type": "text/html"})
         elif path in ("/original", "/torbox-file", "/mirror-1.pkg", "/mirror-2.pkg") or path.startswith("/pspkg-provider/"):
             self.server.calls.append(path)
             if (path == "/original" and self.server.original_fails) or path == self.server.dead_mirror:
@@ -227,6 +236,8 @@ class TorBoxRouting(unittest.TestCase):
                         '<span class="dpx-group-label"><i></i> Base Game</span>' + anchor("5")
                     )
                     reveal["fields"]["999"] = '<a href="download.php?route=not-this-listing">Unrelated</a>'
+                    if pspkg == "metadata":
+                        reveal["fields"]["1"] = f'<a href="{fixture.base}{VIKING_PAGE}">Viki</a>'
                     env.update(ORBIT_TEST_PSPKG_PS5_URL=fixture.base + "/ps5/",
                                ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
                     if pspkg == "cancel":
@@ -310,6 +321,13 @@ class TorBoxRouting(unittest.TestCase):
         self.assertNotIn("download.php", json.dumps(choices))
         available = [link for link in choices if not link["reason"]]
         self.assertEqual(len(available), 2)
+        if mode == "metadata":
+            link = next(link for link in available if link["providerHost"] == "vikingfile.com")
+            self.assertEqual((link["filename"], link["sizeBytes"], link["sizeExact"]),
+                             ("fixture-release.7z", 199_550_000_000, False))
+            self.assertTrue(link["torboxAvailable"])
+            self.assertEqual(call("/downloads"), [])
+            return
         for choice in available:
             self.assertEqual((choice["filename"], choice["sizeBytes"], choice["sizeExact"]),
                              ("file.pkg", len(FILE), True))
@@ -342,6 +360,12 @@ class TorBoxRouting(unittest.TestCase):
         for mode in ("cancel", "expire", "empty", "missing"):
             with self.subTest(mode=mode):
                 self.run_download([], pspkg=mode)
+
+    def test_pspkg_reads_resolved_provider_page_without_downloading(self):
+        calls = self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="metadata")
+        self.assertEqual(calls.count(VIKING_PAGE), 1)
+        self.assertNotIn("create", calls)
+        self.assertNotIn("/original", calls)
 
     def check_download(self, port, fixture, original_url, cached, explicit, drive, interrupt):
         token = ""

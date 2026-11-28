@@ -1342,7 +1342,8 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
                                char *out, size_t cap, RemoteFileMetadata *metadata) {
     if (!remote_https_url(url)) return "unsafe-url";
-    Response response = {.cancel = cancel, .collect_page = true, .range = !intermediate};
+    bool file_candidate = !intermediate && !*remote_browser_provider(url);
+    Response response = {.cancel = cancel, .collect_page = true, .range = file_candidate};
     bool ok = fetch(url, &response);
     const char *status = "";
     if (response.redirect_rejected || response.code == CURLE_TOO_MANY_REDIRECTS ||
