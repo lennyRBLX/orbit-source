@@ -881,6 +881,40 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_buzzheavier_recovery_notice_marks_the_file_missing(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        html = {"Content-Type": "text/html"}
+        deleted = "/pspkg-provider/buzzheavier.com/deleted"
+        live = "/pspkg-provider/buzzheavier.com/live"
+        other = "/metadata/other"
+        notice = (b"<p>Try <strong>recovering this file</strong>.</p>"
+                  b"<p>File size: 1 MB</p><button>Download file</button>")
+        server.downloads.update({
+            deleted: (200, html, notice),
+            live: (200, html, b"<h1>Try recovering this file.pkg</h1><p>File size: 1 MB</p>"),
+            other: (200, html, notice),
+        })
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                url = base + deleted
+                self.assertEqual(service.command("metadata-page", url=url),
+                                 {"status": "missing", "sizeBytes": 0, "exact": False})
+                self.assertEqual(service.command("resolve", entry={
+                    "title": "BuzzHeavier fixture", "titleId": "PPSA12345",
+                    "downloadLinks": [{"name": "BuzzHeavier", "url": url}],
+                }), -2)
+                for path in (live, other):
+                    with self.subTest(path=path):
+                        self.assertEqual(service.command("metadata-page", url=base + path),
+                                         {"status": "found", "sizeBytes": 1_000_000, "exact": False})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_metadata_batches_cover_all_releases_on_selected_title(self):
         server = FixtureServer()
         base = server.url.removesuffix("/catalogue.json")

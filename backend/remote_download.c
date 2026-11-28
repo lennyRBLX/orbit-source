@@ -466,6 +466,21 @@ static bool phrase(const char *text, const char *word) {
     return false;
 }
 
+static bool status_phrase(const char *text, const char *message) {
+    for (const char *p = text; *p; p++) {
+        if (p != text && isalnum((unsigned char)p[-1])) continue;
+        const char *word = message, *end = p;
+        while (*word && *end && (*word == ' ' ? isspace((unsigned char)*end) :
+               *word == tolower((unsigned char)*end))) {
+            word++;
+            end++;
+        }
+        if (!*word && !isalnum((unsigned char)*end) && (*end != '.' || !isalnum((unsigned char)end[1])))
+            return true;
+    }
+    return false;
+}
+
 static bool missing_text(const char *text) {
     const char *messages[] = {"file not found", "file missing", "file is missing",
         "file removed", "file was removed", "file has been removed",
@@ -480,19 +495,8 @@ static bool missing_text(const char *text) {
         p += length;
         if (*p) p++;
     }
-    for (const char *p = text; *p; p++) {
-        if (p != text && isalnum((unsigned char)p[-1])) continue;
-        for (size_t i = 0; i < sizeof messages / sizeof *messages; i++) {
-            const char *word = messages[i], *end = p;
-            while (*word && *end && (*word == ' ' ? isspace((unsigned char)*end) :
-                   *word == tolower((unsigned char)*end))) {
-                word++;
-                end++;
-            }
-            if (!*word && !isalnum((unsigned char)*end) && (*end != '.' || !isalnum((unsigned char)end[1])))
-                return true;
-        }
-    }
+    for (size_t i = 0; i < sizeof messages / sizeof *messages; i++)
+        if (status_phrase(text, messages[i])) return true;
     return false;
 }
 
@@ -509,7 +513,7 @@ static bool page_has_download(const char *html);
 static bool element_text(const char *tag, const char *end, char *out, size_t cap);
 static void page_size(const char *html, const char *anchor, const char *name, RemoteFileMetadata *file);
 
-static bool page_message_missing(const char *body, size_t length, bool json_body) {
+static bool page_message_missing(const char *body, size_t length, bool json_body, bool buzzheavier) {
     char *text = malloc(length + 1);
     if (!text) return false;
     bool missing = false;
@@ -524,6 +528,10 @@ static bool page_message_missing(const char *body, size_t length, bool json_body
         cJSON_Delete(json);
     } else {
         visible_text(body, body + length, text, length + 1);
+        if (buzzheavier && status_phrase(text, "try recovering this file")) {
+            free(text);
+            return true;
+        }
         missing = missing_text(text);
         for (const char *tag = body; (tag = strchr(tag, '<')) != NULL; tag++) {
             const char *next = skip_markup(tag);
@@ -564,14 +572,19 @@ static bool page_message_missing(const char *body, size_t length, bool json_body
 static bool response_missing(const Response *response) {
     if (cancelled(response) || response_challenge(response)) return false;
     if (response->status == 404 || response->status == 410) return true;
-    return response->status == 200 && response->body && response->used && !response->truncated &&
-           response->code == CURLE_OK && page_message_missing(response->body, response->used, response->json);
+    if (response->status != 200 || !response->body || !response->used || response->truncated ||
+        response->code != CURLE_OK) return false;
+    bool buzzheavier = !strcasecmp(response->effective_host, "buzzheavier.com");
+#ifdef ORBIT_TEST
+    buzzheavier = buzzheavier || !strcmp(remote_browser_provider(response->url), "buzzheavier");
+#endif
+    return page_message_missing(response->body, response->used, response->json, buzzheavier);
 }
 
 bool remote_download_html_missing(long status, const char *html, bool challenge) {
     if (challenge || page_challenge(html)) return false;
     if (status == 404 || status == 410) return true;
-    return status == 200 && html && *html && page_message_missing(html, strlen(html), false);
+    return status == 200 && html && *html && page_message_missing(html, strlen(html), false, false);
 }
 
 bool remote_download_confirm_missing(const char *url, atomic_bool *cancel) {
