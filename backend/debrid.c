@@ -789,12 +789,12 @@ DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, t
     if (match && using_mirror) {
         Release file_from_mirror = *route;
         file_from_mirror.size = size;
-        match = !remote_file_format(&file_from_mirror, name) && remote_mirror_file(resolved, &file_from_mirror) &&
-            (!needs_metadata || !remote_file_format(&selected, resolved->filename[0] ? resolved->filename : name));
+        match = !remote_provider_file_format(&file_from_mirror, name, NULL) && remote_mirror_file(resolved, &file_from_mirror) &&
+            (!needs_metadata || !remote_provider_file_format(&selected, resolved->filename[0] ? resolved->filename : name, NULL));
     } else if (match) {
         match = (!resolved->size || resolved->size == size) &&
             (!resolved->filename[0] || !strcmp(name, resolved->filename)) &&
-            (!needs_metadata || !remote_file_format(&selected, name));
+            (!needs_metadata || !remote_provider_file_format(&selected, name, NULL));
     }
     cJSON_Delete(list);
     if (!match) { copy_text(err, cap, "TorBox's file does not match the selected single-file download. Nothing was transferred."); goto end; }

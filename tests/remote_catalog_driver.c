@@ -219,7 +219,8 @@ int main(int argc, char **argv) {
                 cJSON_ArrayForEach(id, ids) {
                     Release *r = cJSON_IsString(id) ? release_find(id->valuestring) : NULL;
                     if (r && !strcmp(r->source, "remote")) {
-                        r->remote_group = r->remote_alias = 0;
+                        r->remote_alias = 0;
+                        copy_text(r->remote_group, sizeof r->remote_group, "fixture");
                         memset(r->mirror_key, 'a', sizeof r->mirror_key - 1);
                     }
                 }

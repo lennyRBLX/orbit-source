@@ -221,6 +221,10 @@ class RemoteCatalogueTests(unittest.TestCase):
                            b'<a href="/game.zip">ZIP</a><a href="/alt.rar">RAR</a>'),
             "/wrong": (200, {"Content-Disposition": "attachment; filename=bad.zip"}, b"not a zip"),
             "/invalid": (200, {"Content-Disposition": "attachment; filename=game.7z"}, b"not accepted"),
+            "/image-page": (200, {"Content-Type": "text/html"},
+                            b'<h1>game.7z</h1><a href="/game.7z" download="game.7z">Download</a>'),
+            "/game.7z": (206, {"Content-Type": "application/x-7z-compressed", "Content-Range": "bytes 0-7/42"},
+                         b"7z\xbc\xaf\x27\x1ctt"),
         })
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -241,6 +245,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 for path, label, fmt, filename, size in (
                     ("/folder", "Mirror", "Game folder", "game.zip", 29),
                     ("/mirror", "FPKG · Mirror", "FPKG", "game.pkg", 42),
+                    ("/image-page", "exFAT", "Game folder", "game.7z", 42),
                 ):
                     row = entry(path, label)
                     pending = service.command("map", entry=row)
@@ -251,7 +256,9 @@ class RemoteCatalogueTests(unittest.TestCase):
                     self.assertEqual(resolved["id"], pending["id"])
                     self.assertEqual((resolved["format"], resolved["filename"], resolved["sizeBytes"]),
                                      (fmt, filename, size))
-                    self.assertEqual(resolved["url"], address + ("/game.zip" if path == "/folder" else path))
+                    self.assertEqual(resolved["url"], address + {
+                        "/folder": "/game.zip", "/image-page": "/game.7z",
+                    }.get(path, path))
                 for path in ("/unknown", "/ambiguous", "/wrong", "/invalid"):
                     self.assertEqual(service.command("resolve", entry=entry(path, "Mirror")), -1)
 
@@ -400,6 +407,11 @@ class RemoteCatalogueTests(unittest.TestCase):
         pages = {
             "akira": (200, b'<title>Fixture.rar \xc2\xb7 AkiraBox</title>'
                            b'<meta name="description" content="RAR file \xc2\xb7 118.40 GB \xe2\x80\x94 download it free on AkiraBox.">'),
+                        "akira-image": (200, b'<title>Fixture.7z</title>'
+                                 b'<meta name="description" content="7Z file: 109.65 GB">'
+                                 b'<h1>Fixture.7z</h1><span>109.65 GB</span>'
+                                 + b' ' * 300 +
+                                 b'<div><span>your-big-file.zip</span><span>12.00 GB</span></div>'),
             "1fichier": (200, b'<div><span id="file-title" class="heading tier-name">Fixture.fpkg</span>'
                               b'<span class="tier-feat"><strong>127.13 GB</strong></span></div>'),
             "rapidgator": (200, b'<title>Download Fixture.rar - Rapidgator</title>'
@@ -451,7 +463,9 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.downloads[f"/api/files/download-by-short?shortId={key}"] = (
                 200, {"Content-Type": "application/json"}, json.dumps(obj).encode())
         server.feed = {"packages": [{"title": "Metadata fixture", "titleId": "PPSA12345",
-                        "downloadLinks": [{"name": key, "url": address + "/metadata/" + key} for key in pages]}]}
+                        "downloadLinks": [{"name": key, "url": address + "/metadata/" + key,
+                                           **({"format": "exFAT"} if key == "akira-image" else {})}
+                                          for key in pages]}]}
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -474,6 +488,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertEqual(len(results), len(pages))
                 for key, filename, fmt, compression, size, exact in (
                     ("akira", "Fixture.rar", "Game folder", "rar", 118400000000, False),
+                    ("akira-image", "Fixture.7z", "Game folder", "7z", 109650000000, False),
                     ("1fichier", "Fixture.fpkg", "FPKG", None, 127130000000, False),
                     ("rapidgator", "Fixture.rar", "Game folder", "rar", 118400000000, False),
                     ("buzz", "Fixture.zip", "Game folder", "zip", int(3.75 * 1024 ** 3), False),
@@ -547,6 +562,52 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertEqual([row["provider"] for row in overflow], ["Overflow A"])
                 details = service.command("title-options", id=overflow[0]["id"])
                 self.assertEqual({row["provider"] for row in details["releases"]}, {"Overflow B"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_details_splits_different_size_mirrors_beyond_the_catalogue_scan_limit(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        crowded = {"title": "Crowded fixture", "titleId": "PPSA98765"}
+        selected = {"title": "On-demand fixture", "titleId": "PPSA98766"}
+        html = {"Content-Type": "text/html"}
+        paths = {"/metadata/akirabox.com/file": ("AkiraBox", "118.40 GB"),
+                 "/metadata/1fichier.com/file": ("1fichier", "127.13 GB")}
+        for path, (_, size) in paths.items():
+            server.downloads[path] = (200, html, f"<p>File size: {size}</p>".encode())
+        server.feed = {"packages": [
+            *[dict(crowded, downloadLinks=[{"url": base + f"/crowd-{i}.pkg", "name": f"Choice {i}"}])
+              for i in range(6150)],
+            dict(selected, downloadLinks=[{"url": base + path, "name": f"Game - {provider}"}
+                                          for path, (provider, _) in paths.items()]),
+        ]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
+                self.assertEqual(service.command("start"), 0)
+                service.idle()
+                installed, = [row for row in service.command("view", sourcePrefix="rs-dlps-")["remote"]
+                              if row["titleId"] == selected["titleId"]]
+                self.assertEqual(installed["provider"], "Game - AkiraBox")
+                self.assertEqual(service.command("title-options", id=installed["id"])["releases"], [])
+                deadline = time.monotonic() + 8
+                while True:
+                    result = service.command("metadata", ids=installed["id"])
+                    if not result["pending"] or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.02)
+                self.assertFalse(result["pending"])
+                primary, = result["files"]
+                self.assertEqual(primary["sizeBytes"], 118400000000)
+                separate, = service.command("title-options", id=installed["id"])["releases"]
+                self.assertEqual(separate["provider"], "Game - 1fichier")
+                file, = service.command("metadata", ids=separate["id"])["files"]
+                self.assertEqual(file["sizeBytes"], 127130000000)
+                self.assertNotIn("mirrorCount", file)
+                self.assertCountEqual(server.paths[1:], paths)
         finally:
             server.shutdown()
             server.server_close()
@@ -1046,7 +1107,7 @@ class RemoteCatalogueTests(unittest.TestCase):
         server.downloads.update({
             first: (403, {**html, "cf-mitigated": "challenge"}, b"Verify"),
             second: (200, html, b"<p>File size: 1 GB</p>"),
-            third: (200, html, b'<p data-size-bytes="930000000">0.93 GB</p>'),
+            third: (200, html, b"<p>File size: 0.93 GB</p>"),
         })
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1066,11 +1127,18 @@ class RemoteCatalogueTests(unittest.TestCase):
                         break
                     time.sleep(.02)
                 self.assertFalse(result["pending"])
-                self.assertEqual(len(result["options"]), 3)
-                self.assertEqual([row["status"] for row in result["options"]].count("challenge"), 1)
-                group, = result["files"]
-                member = next(row for row in result["options"] if row["label"] == group["provider"] and row["visible"])
-                self.assertEqual((group["sizeBytes"], group["exact"]), (member["sizeBytes"], member["exact"]))
+                rows = [row for row in service.command("view")["remote"]
+                        if row["id"].startswith(("rs-dlps-", "rs-pfs-"))]
+                self.assertEqual(len(rows), 2)
+                sizes = []
+                for row in rows:
+                    group = service.command("metadata", ids=row["id"])
+                    file, = group["files"]
+                    self.assertNotIn("mirrorSizeConflict", file)
+                    reported = {option["sizeBytes"] for option in group["options"] if option["sizeBytes"]}
+                    size, = reported
+                    sizes.append(size)
+                self.assertCountEqual(sizes, [930000000, 1000000000])
                 self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, second, third])
                 duplicate, = service.command("replay", source="pfs", entry=server.feeds["/second.json"]["packages"][0])["links"]
                 self.assertFalse(duplicate["visible"])

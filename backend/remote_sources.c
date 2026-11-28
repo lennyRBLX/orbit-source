@@ -71,6 +71,7 @@ typedef struct {
     unsigned sequence;
     time_t expires;
     RemoteFileMetadata file;
+    int64_t mirror_size; /* Last usable provider size, retained across temporary failures. */
     cJSON *public_links;
     enum MetadataState torbox_state;
     unsigned torbox_revision;
@@ -100,9 +101,12 @@ static TitleOptions title_options[4];
 static unsigned long title_usage;
 
 Release *remote_title_find_locked(const char *id) {
-    for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++)
-        for (size_t i = 0; i < title_options[slot].count; i++)
-            if (!strcmp(title_options[slot].rows[i].id, id)) return &title_options[slot].rows[i];
+    for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++) {
+        const TitleOptions *options = &title_options[slot];
+        if (options->generation != remote.data_generation) continue;
+        for (size_t i = 0; i < options->count; i++)
+            if (!strcmp(options->rows[i].id, id)) return &options->rows[i];
+    }
     return NULL;
 }
 
@@ -149,9 +153,7 @@ bool remote_source_enabled_locked(const Release *r) {
 }
 
 const char *remote_mirror_group_locked(const Release *r) {
-    if (r->remote_group == SIZE_MAX) return "";
-    return r->remote_group && r->remote_group <= orbit.remote_release_count
-        ? orbit.remote_releases[r->remote_group - 1].id : r->mirror_key;
+    return r->remote_group;
 }
 
 static const Release *mirror_route(const Release *r) {
@@ -159,18 +161,29 @@ static const Release *mirror_route(const Release *r) {
         ? &orbit.remote_releases[r->remote_alias - 1] : r;
 }
 
+static int64_t mirror_size_locked(const Release *r) {
+    if (r->size) return r->size;
+    for (size_t i = 0; i < METADATA_LIMIT; i++)
+        if (!strcmp(metadata.requests[i].id, r->id)) return metadata.requests[i].mirror_size;
+    return 0;
+}
+
 static bool mirror_enabled(const Release *original, const Release *live, const Release *other) {
-    const char *group = live ? remote_mirror_group_locked(live) : original->mirror_key;
-    const char *other_group = live ? remote_mirror_group_locked(other) : other->mirror_key;
-    bool declared = original->mirror_key[0] && !strcmp(original->mirror_key, other->mirror_key);
-    return ((*group && !strcmp(group, other_group)) || declared) && strcmp(original->id, other->id) &&
-           (!live || mirror_route(live) != mirror_route(other)) && remote_source_enabled_locked(other);
+    if (live) {
+        const char *group = remote_mirror_group_locked(live);
+        return *group && !strcmp(group, remote_mirror_group_locked(other)) &&
+               mirror_route(live) != mirror_route(other) && remote_source_enabled_locked(other);
+    }
+    if (!original->mirror_key[0] || strcmp(original->mirror_key, other->mirror_key) ||
+        !strcmp(original->id, other->id) || !remote_source_enabled_locked(other)) return false;
+    int64_t size = mirror_size_locked(original), alternate_size = mirror_size_locked(mirror_route(other));
+    return !size || !alternate_size || size == alternate_size;
 }
 
 static bool next_mirror_locked(const Release *release, const char *after, Release *mirror, bool include_missing) {
     if (strcmp(release->source, "remote")) return false;
     const Release *live = release_find(release->id);
-    if (!release->mirror_key[0] && !(live && *remote_mirror_group_locked(live))) return false;
+    if (live ? !*remote_mirror_group_locked(live) : !release->mirror_key[0]) return false;
     const Release *best = NULL;
     for (size_t i = 0; i < orbit.remote_release_count; i++) {
         const Release *next = &orbit.remote_releases[i];
@@ -181,7 +194,8 @@ static bool next_mirror_locked(const Release *release, const char *after, Releas
     }
     for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++) {
         const TitleOptions *options = &title_options[slot];
-        if (!release->mirror_key[0] || strcmp(options->title_id, release->title_id)) continue;
+        if (options->generation != remote.data_generation ||
+            strcmp(options->title_id, release->title_id)) continue;
         for (size_t i = 0; i < options->count; i++) {
             const Release *next = &options->rows[i];
             if (release_find(next->id) != next) continue;
@@ -242,9 +256,11 @@ typedef struct {
     Release *release;
     const char *key, *format, *compression;
     int64_t size;
+    size_t index;
 } MirrorEvidence;
 
 typedef struct {
+    Release *release;
     size_t parent, alias;
     const char *checksum;
     int64_t size;
@@ -305,15 +321,26 @@ static bool exact_file_metadata(const RemoteFileMetadata *file) {
 
 bool remote_mirror_file(const Release *selected, const Release *file) {
     if ((selected->size && selected->size != file->size) ||
-        (selected->compression[0] && strcmp(selected->compression, file->compression)) ||
-        (selected->format[0] && strcmp(selected->format, "Unknown") &&
-         strcmp(selected->format, file->format))) return false;
-    if (selected->sha256[0] || (selected->mirror_key[0] && !strcmp(selected->mirror_key, file->mirror_key)))
-        return true;
-    if (selected->size && selected->filename[0] && strcmp(selected->filename, file->filename)) return false;
-    bool matches = true;
+        (selected->compression[0] && strcmp(selected->compression, file->compression))) return false;
+    if (selected->format[0] && strcmp(selected->format, "Unknown") && strcmp(selected->format, file->format)) {
+        if (strcmp(selected->id, file->id) || selected->filename[0] || !selected->remote_page) return false;
+        Release expected = *selected;
+        if (remote_provider_file_format(&expected, file->filename, NULL) ||
+            strcmp(expected.format, file->format)) return false;
+    }
     pthread_mutex_lock(&orbit.mutex);
-    for (size_t i = 0; i < METADATA_LIMIT; i++) {
+    const Release *live = release_find(selected->id);
+    const Release *other = release_find(file->id);
+    if (other && strcmp(selected->id, file->id) && !mirror_enabled(selected, live, other)) {
+        pthread_mutex_unlock(&orbit.mutex);
+        return false;
+    }
+    if (selected->sha256[0] || (selected->mirror_key[0] && !strcmp(selected->mirror_key, file->mirror_key))) {
+        pthread_mutex_unlock(&orbit.mutex);
+        return true;
+    }
+    bool matches = !selected->size || !selected->filename[0] || !strcmp(selected->filename, file->filename);
+    for (size_t i = 0; matches && i < METADATA_LIMIT; i++) {
         const MetadataRequest *request = &metadata.requests[i];
         const RemoteFileMetadata *known = &request->file;
         if (!strcmp(request->id, selected->id) && exact_file_metadata(known)) {
@@ -325,77 +352,128 @@ bool remote_mirror_file(const Release *selected, const Release *file) {
     return matches;
 }
 
-/* A provider URL is one route even when several catalogues publish it.
- * Joining it to the feed's mirror group keeps the other routes reachable. */
-static bool rebuild_mirrors_locked(void) {
-    Release *rows = orbit.remote_releases;
-    size_t count = orbit.remote_release_count;
-    if (!count) return false;
-    MirrorGroup *groups = calloc(count, sizeof *groups);
-    MirrorEvidence *evidence = malloc((3 * count + METADATA_LIMIT) * sizeof *evidence);
-    bool changed = false;
-    if (groups && evidence) {
-        size_t used = 0;
-        for (size_t i = 0; i < count; i++) {
-            Release *r = &rows[i];
-            groups[i].parent = i;
-            if (r->sha256[0]) groups[i].checksum = r->sha256;
-            groups[i].size = r->size;
-            const char *url = provider_torbox_url(r);
-            /* A PSPKG landing page can expose several different files. */
-            if (*url && !pspkg_source(r->remote_catalog_id)) {
-                const char *selector = !strncmp(url, "https://archive.org/details/", 28) &&
-                    !r->remote_filename_synthetic ? r->remote_filename : "";
-                evidence[used++] = (MirrorEvidence){.type = MIRROR_URL, .release = r, .key = url, .format = selector};
-            }
-            if (r->mirror_key[0])
-                evidence[used++] = (MirrorEvidence){.type = MIRROR_DECLARED, .release = r, .key = r->mirror_key};
-            if (r->sha256[0] || (!r->remote_page && r->size > 0 && r->filename[0]))
-                evidence[used++] = (MirrorEvidence){r->sha256[0] ? MIRROR_CHECKSUM : MIRROR_EXACT_FILE,
-                    r, r->sha256[0] ? r->sha256 : r->filename, r->format, r->compression, r->size};
-        }
-        for (size_t i = 0; i < METADATA_LIMIT; i++) {
-            const MetadataRequest *request = &metadata.requests[i];
-            const RemoteFileMetadata *file = &request->file;
-            if (!exact_file_metadata(file)) continue;
-            size_t row_index = 0;
-            while (row_index < count && strcmp(rows[row_index].id, request->id)) row_index++;
-            if (row_index == count) continue;
-            Release *r = &rows[row_index];
-            if (pspkg_source(r->remote_catalog_id)) continue;
-            groups[row_index].size = file->size;
-            evidence[used++] = (MirrorEvidence){MIRROR_EXACT_FILE, r, file->filename,
-                file->format, file->compression, file->size};
-        }
-        qsort(evidence, used, sizeof *evidence, compare_evidence);
-        for (size_t i = 1, first = 0; i < used; i++) {
-            if (compare_evidence_keys(&evidence[first], &evidence[i])) { first = i; continue; }
-            size_t anchor = (size_t)(evidence[first].release - rows), member = (size_t)(evidence[i].release - rows);
-            size_t a = mirror_root(groups, anchor), b = mirror_root(groups, member);
-            if ((groups[a].size && groups[b].size && groups[a].size != groups[b].size) ||
-                (groups[a].checksum && groups[b].checksum && strcmp(groups[a].checksum, groups[b].checksum))) continue;
-            if (evidence[i].type == MIRROR_URL) groups[member].alias = anchor + 1;
+static bool mirror_files_conflict(const MirrorGroup *a, const MirrorGroup *b) {
+    return (a->size && b->size && a->size != b->size) ||
+           (a->checksum && b->checksum && strcmp(a->checksum, b->checksum));
+}
+
+static void join_mirror_evidence(MirrorGroup *groups, const MirrorEvidence *evidence,
+                                 size_t first, size_t end) {
+    for (size_t i = first + 1; i < end; i++) {
+        const MirrorEvidence *member = &evidence[i];
+        size_t b = mirror_root(groups, member->index);
+        /* A declared group can have several distinct files. Keep equal-size
+         * alternates together even when the first route serves a different file. */
+        for (size_t j = first; j < i; j++) {
+            const MirrorEvidence *anchor = &evidence[j];
+            size_t a = mirror_root(groups, anchor->index);
+            if (mirror_files_conflict(&groups[a], &groups[b])) continue;
+            if (member->type == MIRROR_URL) groups[member->index].alias = anchor->index + 1;
             if (a != b) {
                 groups[b].parent = a;
                 groups[a].shared = true;
                 if (!groups[a].size) groups[a].size = groups[b].size;
                 if (!groups[a].checksum) groups[a].checksum = groups[b].checksum;
             }
+            break;
         }
     }
-    /* Clear stale indices if an allocation failed after replacing the backing array. */
+}
+
+/* Installed and on-demand routes use the same groups for presentation and retries. */
+static bool rebuild_mirrors_locked(void) {
+    size_t installed = orbit.remote_release_count, capacity = installed;
+    for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++)
+        if (title_options[slot].generation == remote.data_generation)
+            capacity += title_options[slot].count;
+    if (!capacity) return false;
+    MirrorGroup *groups = calloc(capacity, sizeof *groups);
+    MirrorEvidence *evidence = malloc((3 * capacity + METADATA_LIMIT) * sizeof *evidence);
+    size_t count = installed;
+    for (size_t i = 0; groups && i < installed; i++) groups[i].release = &orbit.remote_releases[i];
+    for (size_t slot = 0; groups && slot < sizeof title_options / sizeof *title_options; slot++) {
+        TitleOptions *options = &title_options[slot];
+        if (options->generation != remote.data_generation) continue;
+        for (size_t i = 0; i < options->count; i++) {
+            Release *r = &options->rows[i];
+            if (release_find(r->id) == r) groups[count++].release = r;
+        }
+    }
+    if (groups && evidence) {
+        size_t used = 0;
+        for (size_t i = 0; i < count; i++) {
+            Release *r = groups[i].release;
+            groups[i].parent = i;
+            if (r->sha256[0]) groups[i].checksum = r->sha256;
+            groups[i].size = r->size;
+            const char *url = provider_torbox_url(r);
+            /* Only installed routes participate in URL aliasing and exact-file discovery. */
+            if (i < installed && *url && !pspkg_source(r->remote_catalog_id)) {
+                const char *selector = !strncmp(url, "https://archive.org/details/", 28) &&
+                    !r->remote_filename_synthetic ? r->remote_filename : "";
+                evidence[used++] = (MirrorEvidence){.type = MIRROR_URL, .release = r, .key = url,
+                    .format = selector, .index = i};
+            }
+            if (r->mirror_key[0])
+                evidence[used++] = (MirrorEvidence){.type = MIRROR_DECLARED, .release = r,
+                    .key = r->mirror_key, .index = i};
+            if (i < installed && (r->sha256[0] || (!r->remote_page && r->size > 0 && r->filename[0])))
+                evidence[used++] = (MirrorEvidence){r->sha256[0] ? MIRROR_CHECKSUM : MIRROR_EXACT_FILE,
+                    r, r->sha256[0] ? r->sha256 : r->filename, r->format, r->compression, r->size, i};
+        }
+        /* A scan capped mid-package can see fewer declared mirrors than
+         * Details. Apply the full declaration to the installed copy too. */
+        for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++) {
+            const TitleOptions *options = &title_options[slot];
+            if (options->generation != remote.data_generation) continue;
+            for (size_t i = 0; i < options->count; i++) {
+                const Release *r = &options->rows[i];
+                if (!r->mirror_key[0]) continue;
+                for (size_t j = 0; j < installed; j++) {
+                    Release *live = groups[j].release;
+                    if (strcmp(r->id, live->id) || !strcmp(r->mirror_key, live->mirror_key)) continue;
+                    evidence[used++] = (MirrorEvidence){.type = MIRROR_DECLARED, .release = live,
+                        .key = r->mirror_key, .index = j};
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < METADATA_LIMIT; i++) {
+            const MetadataRequest *request = &metadata.requests[i];
+            const RemoteFileMetadata *file = &request->file;
+            if (!request->mirror_size) continue;
+            size_t index = 0;
+            while (index < count && strcmp(groups[index].release->id, request->id)) index++;
+            if (index == count) continue;
+            Release *r = groups[index].release;
+            if (pspkg_source(r->remote_catalog_id)) continue;
+            if (!groups[index].size || file->exact) groups[index].size = request->mirror_size;
+            if (index < installed && exact_file_metadata(file))
+                evidence[used++] = (MirrorEvidence){MIRROR_EXACT_FILE, r, file->filename,
+                    file->format, file->compression, file->size, index};
+        }
+        qsort(evidence, used, sizeof *evidence, compare_evidence);
+        for (size_t first = 0, end; first < used; first = end) {
+            end = first + 1;
+            while (end < used && !compare_evidence_keys(&evidence[first], &evidence[end])) end++;
+            join_mirror_evidence(groups, evidence, first, end);
+        }
+    }
+    bool changed = false;
     for (size_t i = 0; i < count; i++) {
-        size_t group = SIZE_MAX, alias = 0;
+        Release *r = groups ? groups[i].release : &orbit.remote_releases[i];
+        const char *group = "";
+        size_t alias = 0;
         if (groups && evidence) {
             size_t root = mirror_root(groups, i);
             if (groups[root].shared) {
-                group = root + 1;
+                group = groups[root].release->id;
                 alias = groups[i].alias;
             }
         }
-        changed |= rows[i].remote_group != group || rows[i].remote_alias != alias;
-        rows[i].remote_group = group;
-        rows[i].remote_alias = alias;
+        changed |= strcmp(r->remote_group, group) || r->remote_alias != alias;
+        copy_text(r->remote_group, sizeof r->remote_group, group);
+        r->remote_alias = alias;
     }
     free(evidence);
     free(groups);
@@ -610,6 +688,7 @@ static TitleOptions *load_title_options_locked(const char *title_id) {
         free(rows);
         free(body);
     }
+    if (rebuild_mirrors_locked()) invalidate_locked();
     return slot;
 }
 
@@ -657,19 +736,31 @@ cJSON *remote_title_options_locked(const Release *selected) {
     TitleOptions *slot = load_title_options_locked(title.title_id);
     for (size_t i = 0; i < slot->count; i++) {
         const Release *row = &slot->rows[i];
-        if (release_find(row->id) != row) continue;
-        const Release *members[128];
-        size_t count = 0;
-        for (size_t j = 0; row->mirror_key[0] && j < slot->count && count < 128; j++) {
-            const Release *member = &slot->rows[j];
-            if (strcmp(row->mirror_key, member->mirror_key)) continue;
-            const Release *live = release_find(member->id);
-            if (live && !live->remote_alias) members[count++] = live;
+        if (release_find(row->id) != row || row->remote_alias) continue;
+        const Release *members[128] = {row};
+        size_t count = 1;
+        const char *group = remote_mirror_group_locked(row);
+        bool represented = false;
+        for (size_t j = 0; *group && j < orbit.remote_release_count; j++) {
+            const Release *member = &orbit.remote_releases[j];
+            if (!member->remote_alias && !strcmp(group, remote_mirror_group_locked(member)) &&
+                remote_link_listed_locked(member)) {
+                represented = true;
+                break;
+            }
         }
-        bool installed = false;
-        for (size_t j = 0; j < count; j++) installed |= remote_title_find_locked(members[j]->id) != members[j];
-        if (installed || (count && members[0] != row)) continue;
-        bool listed = remote_link_listed_locked(row);
+        bool missing = remote_link_missing_locked(row);
+        for (size_t j = 0; !represented && *group && j < slot->count && count < 128; j++) {
+            const Release *member = &slot->rows[j];
+            if (member == row || strcmp(group, remote_mirror_group_locked(member)) ||
+                release_find(member->id) != member || member->remote_alias) continue;
+            bool member_missing = remote_link_missing_locked(member);
+            if (member_missing != missing ? !member_missing : strcmp(member->id, row->id) < 0)
+                represented = true;
+            else members[count++] = member;
+        }
+        if (represented) continue;
+        bool listed = false;
         for (size_t j = 0; !listed && j < count; j++) listed = remote_link_listed_locked(members[j]);
         if (!listed) continue;
         cJSON *entry = catalog_remote_choice_locked(row, members, count);
@@ -1258,18 +1349,26 @@ static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
     if (metadata_missing(entry, now)) invalidate_locked();
     bool same = !strcmp(entry->id, id);
     RemoteFileMetadata previous = entry->file;
+    int64_t previous_size = entry->mirror_size;
     cJSON_Delete(entry->public_links);
     *entry = (MetadataRequest){.state = META_QUEUED, .sequence = ++metadata.sequence};
     copy_text(entry->id, sizeof entry->id, id);
-    if (same) entry->file = previous;
-    else if (exact_file_metadata(&previous) && rebuild_mirrors_locked()) invalidate_locked();
+    if (same) {
+        entry->file = previous;
+        entry->mirror_size = previous_size;
+    } else if (previous_size && rebuild_mirrors_locked()) invalidate_locked();
     pthread_cond_signal(&metadata.changed);
     return entry;
 }
 
 static void metadata_done_locked(MetadataRequest *request, const RemoteFileMetadata *file) {
+    bool size_changed = file->status == REMOTE_METADATA_FOUND && file->size > 0 &&
+                        request->mirror_size != file->size;
+    const Release *r = size_changed ? release_find(request->id) : NULL;
     bool check_group = !strncmp(request->id, "rs-", 3) &&
-                       (exact_file_metadata(&request->file) || exact_file_metadata(file));
+                       ((r && (r->mirror_key[0] || r->remote_group[0])) ||
+                        exact_file_metadata(&request->file) || exact_file_metadata(file));
+    if (size_changed) request->mirror_size = file->size;
     request->file = *file;
     request->expires = time(NULL) + (file->size || file->filename[0] || file->status == REMOTE_METADATA_MISSING ? 1800 : 300);
     request->state = META_DONE;

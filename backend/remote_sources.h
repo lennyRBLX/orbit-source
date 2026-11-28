@@ -54,6 +54,7 @@ void remote_mark_missing_locked(const Release *release);
 bool remote_url_filename(const char *url, char *name, size_t cap);
 int remote_file_format(Release *release, const char *name);
 int remote_file_detected_format(Release *release, const char *name, const char *suffix);
+int remote_provider_file_format(Release *release, const char *name, const char *detected);
 int direct_file_format(Release *release, const char *name);
 bool direct_release_init(Release *release, const char *url);
 int direct_release_parse(const cJSON *entry, Release *release);

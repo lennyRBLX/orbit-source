@@ -289,7 +289,7 @@ static int file_from_response(Release *r, const Response *response, const char *
     Release file = *r;
     const char *suffix = sample_suffix(response->sample, response->used);
     int format = response->direct ? direct_file_format(&file, actual) :
-        remote_file_detected_format(&file, actual, r->remote_page ? suffix : NULL);
+        remote_provider_file_format(&file, actual, r->remote_page ? suffix : NULL);
     if (format) return format;
     if (r->compression[0] && strcmp(r->compression, file.compression)) return 1;
     if (response->page || response->size < SAMPLE_BYTES || response->size > 9007199254740991LL ||
@@ -662,20 +662,20 @@ static bool page_has_download(const char *html) {
 
 static bool title_filename(char *name, Release *file) {
     if (safe_page_name(name)) {
-        int format = remote_file_format(file, name);
+        int format = remote_provider_file_format(file, name, NULL);
         if (format >= 0) return format == 0;
     }
     if (!strncasecmp(name, "Download ", 9)) {
         memmove(name, name + 9, strlen(name + 9) + 1);
         if (*name == '"') memmove(name, name + 1, strlen(name));
     }
-    if (safe_page_name(name) && !remote_file_format(file, name)) return true;
+    if (safe_page_name(name) && !remote_provider_file_format(file, name, NULL)) return true;
     const char *separators[] = {" - ", " | ", " · ", " — ", "\""};
     for (size_t i = 0; i < sizeof separators / sizeof *separators; i++) {
         for (char *suffix = name; (suffix = strstr(suffix, separators[i])); suffix++) {
             char saved = *suffix;
             *suffix = 0;
-            if (safe_page_name(name) && !remote_file_format(file, name)) return true;
+            if (safe_page_name(name) && !remote_provider_file_format(file, name, NULL)) return true;
             *suffix = saved;
         }
     }
@@ -958,7 +958,7 @@ static int page_link(const Response *page, const Release *r, const Release *loca
         if (locator) {
             Release match = *locator;
             if (!match.filename[0] && safe_page_name(candidate.filename)) {
-                int format = remote_file_format(&match, candidate.filename);
+                int format = remote_provider_file_format(&match, candidate.filename, NULL);
                 if (format > 0) continue;
                 if (format < 0 && candidate.pinned)
                     copy_text(match.filename, sizeof match.filename, candidate.filename);
@@ -969,7 +969,7 @@ static int page_link(const Response *page, const Release *r, const Release *loca
                 candidate.pinned = true;
             }
         } else {
-            int format = remote_file_format(&file, candidate.filename);
+            int format = remote_provider_file_format(&file, candidate.filename, NULL);
             if (format > 0) continue;
             candidate.recognized = !format;
             if (!download && !candidate.recognized) {
@@ -1452,7 +1452,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
             metadata->size = 0;
             metadata->exact = false;
         } else if (named) {
-            int format = remote_file_format(&file, name);
+            int format = remote_provider_file_format(&file, name, NULL);
             if (!format && r->compression[0] && strcmp(r->compression, file.compression)) format = 1;
             if (!format) file_metadata(&file, metadata);
             else if (format > 0) {
@@ -1607,7 +1607,7 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         *locator = *r;
         char name[sizeof r->filename];
         if (page_filename(page.body, r, name, sizeof name, NULL)) {
-            if (remote_file_format(locator, name) > 0) goto done;
+            if (remote_provider_file_format(locator, name, NULL) > 0) goto done;
             copy_text(locator->filename, sizeof locator->filename, name);
         }
         copy_text(locator->source, sizeof locator->source, provider);

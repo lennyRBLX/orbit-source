@@ -364,6 +364,19 @@ int remote_file_detected_format(Release *r, const char *name, const char *suffix
     return file_format(r, name, true, suffix);
 }
 
+int remote_provider_file_format(Release *r, const char *name, const char *detected) {
+    Release file = *r;
+    const char *suffix = strrchr(name, '.');
+    /* A feed can label the contents as an image while the provider serves an archive.
+     * Use the archive's actual format so the normal inspection verifies its contents. */
+    if (file.remote_page && image_format(&file) &&
+        ((suffix && *compression(suffix)) || (detected && *compression(detected))))
+        copy_text(file.format, sizeof file.format, "Unknown");
+    int result = file_format(&file, name, true, detected);
+    if (!result) *r = file;
+    return result;
+}
+
 int direct_file_format(Release *r, const char *name) {
     int result = file_format(r, name, false, NULL);
     if (!result) {
