@@ -549,10 +549,11 @@ export function Details({
                   disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
                   onClick={() => void selectPspkgLink(link.id)}>
                   <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
-                  <small>{[link.providerHost, link.edition || [link.titleId, link.version, link.region, link.format, link.compression].filter(Boolean).join(" · "),
+                  <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
                     link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
-                  {(link.filename || link.sizeBytes || link.hasArchivePassword) ? (
-                    <small>{[link.filename, link.sizeBytes && `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}`,
+                  {(link.version || link.filename || link.sizeBytes || link.hasArchivePassword) ? (
+                    <small>{[link.version && t("version {version}", { version: link.version }),
+                      link.filename, link.sizeBytes && `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}`,
                       link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
                   ) : null}
                 </button>

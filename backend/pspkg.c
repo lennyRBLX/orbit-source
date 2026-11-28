@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 static bool origin(const char *url, const char **path) {
     const char *prefix = "https://pspkg.com";
@@ -105,6 +106,84 @@ bool pspkg_link_matches(const char *url, const char *page, const char *platform,
     size_t link_length = strspn(name, "0123456789");
     return link_length && link_length <= 12 &&
         (!name[link_length] || !strcmp(name + link_length, "&route=browser"));
+}
+
+const char *pspkg_title_id(const char *text) {
+    for (const char *p = text; *p; p++) {
+        if (p > text && isalnum((unsigned char)p[-1])) continue;
+        if (strncasecmp(p, "PPSA", 4) && strncasecmp(p, "CUSA", 4)) continue;
+        if (strspn(p + 4, "0123456789") == 5 && !isalnum((unsigned char)p[9])) return p;
+    }
+    return NULL;
+}
+
+static bool version_next_to_id(const char *start, const char *end, const char *id) {
+    if (!id) return false;
+    const char *separators = " \t._-:()[]";
+    return (end < id && end + strspn(end, separators) == id) ||
+           (id + 9 < start && id + 9 + strspn(id + 9, separators) == start);
+}
+
+static bool version_size_suffix(const char *end) {
+    const char *unit = end + strspn(end, " \t");
+    const char *units[] = {"KB", "MB", "GB", "TB", "KiB", "MiB", "GiB", "TiB"};
+    for (size_t i = 0; i < sizeof units / sizeof *units; i++) {
+        size_t n = strlen(units[i]);
+        if (!strncasecmp(unit, units[i], n) && !isalnum((unsigned char)unit[n])) return true;
+    }
+    return false;
+}
+
+static bool find_version(const char *text, bool filename, char *out, size_t cap) {
+    enum { BARE_FILENAME = 1, PADDED_FILENAME, MARKED_VERSION, TITLE_VERSION, MARKED_TITLE_VERSION };
+    const char *id = pspkg_title_id(text);
+    unsigned best = 0;
+    for (const char *start = text; *start; start++) {
+        if (start > text && isalnum((unsigned char)start[-1])) continue;
+        bool prefixed = *start == 'v' || *start == 'V';
+        const char *number = start + prefixed;
+        if (!isdigit((unsigned char)*number)) continue;
+
+        const char *end = number;
+        size_t width[3] = {0}, parts = 0;
+        do {
+            if (parts) end++;
+            size_t digits = strspn(end, "0123456789");
+            if (parts < 3) width[parts] = digits;
+            parts++;
+            end += digits;
+        } while (*end == '.' && isdigit((unsigned char)end[1]) &&
+                 !(filename && !strcasecmp(end, ".7z")));
+        const char *token = start;
+        // Skip the whole numeric token, including invalid versions and title years.
+        start = end - 1;
+        if (parts > 3 || width[0] > 3 || width[1] > 3 || width[2] > 3 ||
+            isalnum((unsigned char)*end) || version_size_suffix(end)) continue;
+
+        bool adjacent = parts > 1 && version_next_to_id(token, end, id);
+        unsigned rank = 0;
+        if (adjacent) rank = prefixed ? MARKED_TITLE_VERSION : TITLE_VERSION;
+        else if (prefixed) rank = MARKED_VERSION;
+        else if (filename && parts > 1 && width[0] <= 2)
+            rank = width[0] == 2 && width[1] == 3 ? PADDED_FILENAME : BARE_FILENAME;
+        if (rank <= best) continue;
+
+        while (*number == '0' && isdigit((unsigned char)number[1])) number++;
+        // Sony's two-component PS5 form pads the minor version to three digits.
+        if (parts == 2 && width[1] == 3 && end[-1] == '0') end--;
+        size_t length = (size_t)(end - number);
+        if (length >= cap) continue;
+        memcpy(out, number, length);
+        out[length] = 0;
+        best = rank;
+    }
+    return best > 0;
+}
+
+void pspkg_version(const char *edition, const char *filename, char *out, size_t cap) {
+    if (!cap) return;
+    out[0] = 0;
+    if (!find_version(edition, false, out, cap)) find_version(filename, true, out, cap);
 }
 
 static bool read_char(const unsigned char *bytes, size_t length, size_t *at,

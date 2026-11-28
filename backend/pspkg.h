@@ -27,6 +27,8 @@ bool pspkg_page_identity(const char *page, char *platform, size_t platform_cap,
 bool pspkg_page_redirect(const char *page, const char *redirect);
 bool pspkg_link_matches(const char *url, const char *page, const char *platform,
                         const char *game_id, const char *edition_id);
+const char *pspkg_title_id(const char *text);
+void pspkg_version(const char *edition, const char *filename, char *out, size_t cap);
 /* Reads only PSPKG link IDs for the selected game from browser memory. */
 void pspkg_scan_links(const unsigned char *bytes, size_t length, const char *platform,
                       const char *game_id, PspkgLink *links, size_t *count, size_t cap);

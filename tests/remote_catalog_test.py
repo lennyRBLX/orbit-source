@@ -806,6 +806,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             self.assertEqual([row["filterReason"] for row in links],
                              ["", "", "unsupported-format", "multipart", "unsupported-category"])
             self.assertEqual(links[0]["titleId"], "PPSA12345")
+            self.assertEqual(links[0]["version"], "2.31")
             self.assertEqual(links[0]["sizeEstimateBytes"], 54_250_000_000)
             self.assertIn("ZSTD", links[2]["edition"])
 
@@ -842,6 +843,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                                   f'<section>Game PKG <a href="{ad}">Download</a>'
                                   f'<a href="{pkg}">Download</a></section>'.encode())
         server.downloads[pkg] = (206, {"Content-Type": "application/octet-stream",
+                                       "Content-Disposition": 'attachment; filename="Cyberpunk 2077 02.120 PPSA04029.pkg"',
                                        "Content-Range": "bytes 0-7/42"}, b"\x7fFIHtest")
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
@@ -851,7 +853,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertEqual(server.paths, [page, pkg])
                 self.assertEqual(server.ranges, [(page, None), (pkg, "bytes=0-7")])
                 link, = metadata["links"]
-                self.assertEqual((link["sizeBytes"], link["exact"]), (42, True))
+                self.assertEqual((link["sizeBytes"], link["exact"], link["version"]), (42, True, "2.12"))
         finally:
             server.shutdown()
             server.server_close()

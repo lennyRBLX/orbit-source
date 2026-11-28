@@ -818,8 +818,10 @@ static void download_pspkg(void) {
 }
 
 static void update_pspkg_metadata(PspkgLink *link, const RemoteFileMetadata *metadata) {
-    if (metadata->filename[0])
+    if (metadata->filename[0]) {
         copy_text(link->filename, sizeof link->filename, metadata->filename);
+        pspkg_version(link->edition, link->filename, link->version, sizeof link->version);
+    }
     if (metadata->size) {
         link->size = metadata->size;
         link->size_exact = metadata->exact;

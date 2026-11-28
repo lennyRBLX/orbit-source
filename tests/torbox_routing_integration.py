@@ -127,6 +127,8 @@ class Fixture(BaseHTTPRequestHandler):
             else:
                 headings = ["PPSA04029 v02.120 EUR PKG", "PPSA04029 v02.120 EUR PKG",
                             "PPSA04029 v02.120 EUR PKG", "PPSA04027 ZSTD", "PPSA04029 PKG"]
+                if self.server.pspkg_mode == "metadata":
+                    headings[0] = "PPSA04029 EUR PKG"
                 if self.server.pspkg_mode == "unavailable":
                     headings.append("PPSA04029 PKG")
                 gates = "".join(f'<h3 class="dpx-edition-title">{heading}</h3>'
@@ -173,7 +175,7 @@ class Fixture(BaseHTTPRequestHandler):
                 self.reply(b"", 416)
                 return
             name = ("CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode in ("pages", "pages-missing")
-                    else "fixture-release.7z")
+                    else "02.120 PPSA04029-[DLPSGAME.COM].rar")
             self.reply(f'<div id="file-information"><h2 id="filename">{name}</h2>'
                        '<p id="size">199.55 GB</p></div>'.encode(),
                        headers={"Content-Type": "text/html"})
@@ -376,8 +378,9 @@ class TorBoxRouting(unittest.TestCase):
             self.assertEqual(result["pspkgStatus"], "partial", result)
             choices = {link["handoffId"]: link for link in result["pspkgLinks"]}
             first, redirect = choices[GTA_HANDOFFS[0]], choices[GTA_HANDOFFS[2]]
-            self.assertEqual((first["filename"], first["sizeBytes"], first["sizeExact"], first["torboxAvailable"]),
-                             ("CODENAME-VICE-Compressed.7z", 199_550_000_000, False, True))
+            self.assertEqual((first["filename"], first["version"], first["sizeBytes"],
+                              first["sizeExact"], first["torboxAvailable"]),
+                             ("CODENAME-VICE-Compressed.7z", "1.002.001", 199_550_000_000, False, True))
             if mode == "pages-missing":
                 self.assertNotIn(GTA_HANDOFFS[1], choices)
             else:
@@ -420,8 +423,8 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual(len(available), 2)
         if mode == "metadata":
             link = next(link for link in available if link["providerHost"] == "vikingfile.com")
-            self.assertEqual((link["filename"], link["sizeBytes"], link["sizeExact"]),
-                             ("fixture-release.7z", 199_550_000_000, False))
+            self.assertEqual((link["filename"], link["version"], link["sizeBytes"], link["sizeExact"]),
+                             ("02.120 PPSA04029-[DLPSGAME.COM].rar", "2.12", 199_550_000_000, False))
             self.assertTrue(link["torboxAvailable"])
             self.assertEqual(call("/downloads"), [])
             return
@@ -430,7 +433,7 @@ class TorBoxRouting(unittest.TestCase):
                              ("file.pkg", len(FILE), True))
         link = available[0 if mode == "viking" else 1]
         self.assertEqual((link["titleId"], link["version"], link["region"], link["format"]),
-                         ("PPSA04029", "02.120", "EUR", "PKG"))
+                         ("PPSA04029", "2.12", "EUR", "PKG"))
         self.assertEqual(link.get("torboxAvailable"), mode == "supported")
         self.assertEqual(bool(link.get("torboxCached")), mode == "supported")
         call("/browser", {"action": "pspkg-download", "releaseId": release["id"],

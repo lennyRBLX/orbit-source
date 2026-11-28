@@ -1286,6 +1286,7 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         Release detected = {0};
         if (safe_page_name(filename) && !remote_provider_file_format(&detected, filename, NULL))
             cJSON_AddStringToObject(item, "filename", filename);
+        else filename[0] = 0;
         bool unsupported = phrase(edition, "zstd") || phrase(edition, "lz4") ||
                            phrase(label, "zstd") || phrase(label, "lz4") || phrase(edition, "pfs");
         bool multipart = phrase(edition, "part") || phrase(edition, "multipart") ||
@@ -1308,18 +1309,9 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
                 cJSON_AddStringToObject(item, "region", regions[i]);
                 break;
             }
-        for (const char *at = edition; *at; at++) {
-            if ((*at != 'v' && *at != 'V') || !isdigit((unsigned char)at[1]) ||
-                (at > edition && isalnum((unsigned char)at[-1]))) continue;
-            size_t n = strspn(at + 1, "0123456789.");
-            char version[24];
-            if (n < sizeof version && n > 1) {
-                memcpy(version, at + 1, n);
-                version[n] = 0;
-                cJSON_AddStringToObject(item, "version", version);
-            }
-            break;
-        }
+        char version[sizeof ((PspkgLink *)0)->version];
+        pspkg_version(edition, filename, version, sizeof version);
+        if (version[0]) cJSON_AddStringToObject(item, "version", version);
         const char *part = find_text(label, "part");
         if (!part) part = find_text(edition, "part");
         if (part && multipart) {
@@ -1338,14 +1330,11 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         offer_size(&size, &text_candidates, edition, 2, false, false);
         offer_size(&size, &text_candidates, label, 2, false, false);
         if (size.size && !size.ambiguous) cJSON_AddNumberToObject(item, "sizeEstimateBytes", (double)size.size);
-        for (const char *at = edition; *at; at++) {
-            if (strncasecmp(at, "CUSA", 4) && strncasecmp(at, "PPSA", 4)) continue;
-            if (strspn(at + 4, "0123456789") != 5) continue;
+        const char *title_id = pspkg_title_id(edition);
+        if (title_id) {
             char id[10];
-            memcpy(id, at, 9);
-            id[9] = 0;
+            snprintf(id, sizeof id, "%.9s", title_id);
             cJSON_AddStringToObject(item, "titleId", id);
-            break;
         }
         cJSON_AddItemToArray(links, item);
     }
@@ -1640,12 +1629,9 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         cJSON_ArrayForEach(edition, fields) {
             const char *label = edition->valuestring;
             if (!label || count == sizeof metadata->pspkg_title_ids / sizeof *metadata->pspkg_title_ids) break;
-            for (const char *p = label; *p; p++) {
-                if (strncasecmp(p, "CUSA", 4) && strncasecmp(p, "PPSA", 4)) continue;
-                if (strspn(p + 4, "0123456789") != 5) continue;
+            const char *p = pspkg_title_id(label);
+            if (p)
                 snprintf(metadata->pspkg_title_ids[count++], 10, "%.9s", p);
-                break;
-            }
         }
         cJSON_Delete(fields);
     }
@@ -1667,6 +1653,12 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
             else copy_text(provider.url, sizeof provider.url, target);
             RemoteFileMetadata downstream;
             remote_download_metadata(&provider, &downstream, NULL);
+            if (downstream.filename[0]) {
+                char version[sizeof ((PspkgLink *)0)->version];
+                pspkg_version(json_text(row, "edition"), downstream.filename, version, sizeof version);
+                cJSON_DeleteItemFromObjectCaseSensitive(row, "version");
+                if (version[0]) cJSON_AddStringToObject(row, "version", version);
+            }
             cJSON_AddBoolToObject(row, "getAttempted", downstream.attempted);
             cJSON_AddStringToObject(row, "status", remote_metadata_status(downstream.status));
             cJSON_AddNumberToObject(row, "httpStatus", downstream.http_status);
