@@ -34,6 +34,7 @@ typedef struct {
     bool remote_filename_synthetic;
     char remote_provider_page[256]; /* Public provider selected for a PSPKG job. */
     char mirror_key[65]; /* Shared identity of verified community mirrors, when available. */
+    size_t remote_group, remote_alias; /* Live one-based indices. SIZE_MAX denotes a reconciled singleton group. */
     bool remote_page; /* Stable catalogue identity is the selected provider page. */
     char compression[8]; /* "zip", "7z" or "rar"; empty for a plain file. */
     char archive_password[129]; /* Public source password, optional. */

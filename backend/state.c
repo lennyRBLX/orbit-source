@@ -503,7 +503,7 @@ int state_load(void) {
         const char *mirror_ids[] = {json_text(x, "mirrorId"), json_text(x, "mirrorFirst")};
         for (size_t i = 0; i < sizeof mirror_ids / sizeof *mirror_ids; i++) {
             const char *id = mirror_ids[i];
-            if (*id && (strcmp(r->source, "remote") || !r->mirror_key[0] ||
+            if (*id && (strcmp(r->source, "remote") ||
                 strlen(id) >= sizeof j->mirror_id || strncmp(id, "rs-", 3) ||
                 strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(id) ||
                 !strcmp(id, r->id))) {

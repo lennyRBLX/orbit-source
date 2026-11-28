@@ -138,7 +138,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             view = service.command("view", sourcePrefix="rs-padrin-")
             self.assertGreater(view["curatedCount"], 0)
             rows = view["remote"]
-            self.assertEqual(len(rows), state["entryCount"])
+            self.assertLess(len(rows), state["entryCount"])
             self.assertGreater(len({row["titleId"] for row in rows}), 3500)
             self.assertEqual({row["platform"] for row in rows}, {"ps4", "ps5"})
             self.assertTrue(view["sameAddons"])
@@ -791,8 +791,8 @@ class RemoteCatalogueTests(unittest.TestCase):
                 service.idle()
                 rows = [row for row in service.command("view")["remote"]
                         if row["id"].startswith(("rs-dlps-", "rs-pfs-"))]
-                self.assertEqual(len(rows), 2)
-                self.assertEqual(max(row.get("mirrorCount", 0) for row in rows), 3)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["mirrorCount"], 3)
                 ids = ",".join(row["id"] for row in rows)
                 deadline = time.monotonic() + 8
                 while True:
@@ -801,11 +801,61 @@ class RemoteCatalogueTests(unittest.TestCase):
                         break
                     time.sleep(.02)
                 self.assertFalse(result["pending"])
-                self.assertEqual(len(result["options"]), 4)
-                self.assertEqual([row["status"] for row in result["options"]].count("challenge"), 2)
+                self.assertEqual(len(result["options"]), 3)
+                self.assertEqual([row["status"] for row in result["options"]].count("challenge"), 1)
                 self.assertEqual([(row["sizeBytes"], row["exact"]) for row in result["files"]],
                                  [(930_000_000, True)])
-                self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, first, second, third])
+                self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, second, third])
+                duplicate, = service.command("replay", source="pfs", entry=server.feeds["/second.json"]["packages"][0])["links"]
+                self.assertFalse(duplicate["visible"])
+                self.assertTrue(duplicate["mirrorGroup"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_exact_provider_files_become_mirrors_across_catalogues(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        game = {"title": "File identity test", "titleId": "PPSA12345"}
+
+        def option(label, filename="game.pkg", size='data-size-bytes="930000000"', **fields):
+            path = f"/metadata/{label}"
+            server.downloads[path] = (
+                200, {"Content-Type": "text/html"}, f"<h1>{filename}</h1><p {size}>0.93 GB</p>".encode()
+            )
+            return {"name": label, "url": base + path, **fields}
+
+        server.feed = {"packages": [dict(game, downloadLinks=[option("alpha"), option("estimate", size="")])]}
+        server.feeds["/second.json"] = {"packages": [dict(game, downloadLinks=[
+            option("beta"), option("different-file", filename="other.pkg"), option("different-version", version="2.0"),
+            option("different-size", size='data-size-bytes="930000001"'),
+        ])]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url, base + "/second.json") as service:
+                self.assertEqual(service.command("start"), 0)
+                service.idle()
+                before = [row for row in service.command("view")["remote"] if row["titleId"] == game["titleId"]]
+                self.assertEqual(len(before), 6)
+                ids = ",".join(row["id"] for row in before)
+                deadline = time.monotonic() + 8
+                while True:
+                    result = service.command("metadata", ids=ids)
+                    if not result["pending"] or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.02)
+                self.assertFalse(result["pending"])
+                after = [row for row in service.command("view")["remote"] if row["titleId"] == game["titleId"]]
+                mirror, = [row for row in after if row.get("mirrorCount")]
+                self.assertEqual(mirror["mirrorCount"], 2)
+                self.assertIn(mirror["provider"], {"alpha", "beta"})
+                self.assertCountEqual([row["provider"] for row in after if row != mirror],
+                                      ["estimate", "different-file", "different-version", "different-size"])
+                metadata = service.command("metadata", ids=mirror["id"])
+                self.assertCountEqual([row["label"] for row in metadata["options"]], ["alpha", "beta"])
+                self.assertCountEqual([path for path in server.paths if path.startswith("/metadata/")], server.downloads)
         finally:
             server.shutdown()
             server.server_close()

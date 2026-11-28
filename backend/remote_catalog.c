@@ -656,8 +656,8 @@ cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_
             result == 3 ? "wrong-platform-or-section" : result ? "invalid-url-or-fields" : "";
         const Release *installed = result ? NULL : release_find(mapped.id);
         bool enabled = installed && remote_source_enabled_locked(installed);
-        bool visible = enabled && !remote_link_missing_locked(installed);
-        if (visible && installed->mirror_key[0]) {
+        bool visible = enabled && !installed->remote_alias && !remote_link_missing_locked(installed);
+        if (visible && *remote_mirror_group_locked(installed)) {
             Release first;
             if (remote_next_mirror_locked(installed, "", &first) && strcmp(first.id, installed->id) < 0)
                 visible = false;
@@ -667,7 +667,7 @@ cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_
         cJSON_AddStringToObject(row, "mapResult", result ? "rejected" : installed ? "retained" : "not-retained");
         if (installed) {
             cJSON_AddStringToObject(row, "releaseId", installed->id);
-            cJSON_AddStringToObject(row, "mirrorGroup", installed->mirror_key);
+            cJSON_AddStringToObject(row, "mirrorGroup", remote_mirror_group_locked(installed));
         }
         cJSON_AddBoolToObject(row, "visible", visible);
         cJSON_AddBoolToObject(row, "metadataEligible", enabled && remote_metadata_option(installed));
@@ -713,6 +713,9 @@ const cJSON *padrino_game(const char *title_id) {
     return NULL;
 }
 
+typedef struct { size_t package; const cJSON *link; } OptionOrigin;
+static void identify_mirrors(Release *releases, const OptionOrigin *origin, size_t count);
+
 int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at) {
     *releases = NULL;
     *count = 0;
@@ -730,6 +733,7 @@ int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at)
     int size = cJSON_GetArraySize(games);
     const cJSON **titles = NULL;
     Release *rows = NULL;
+    OptionOrigin *origins = NULL;
     if (json_int(snapshot, "schemaVersion") != 1 || !cJSON_IsArray(games) || size < 1 || size > PADRINO_OPTION_LIMIT)
         goto fail;
     size_t options = 0, used = 0, title_count = 0;
@@ -745,15 +749,20 @@ int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at)
     if (!options) goto fail;
     titles = malloc((size_t)size * sizeof *titles);
     rows = calloc(options, sizeof *rows);
-    if (!titles || !rows) goto fail;
+    origins = calloc(options, sizeof *origins);
+    if (!titles || !rows || !origins) goto fail;
     cJSON_ArrayForEach(game, games) {
         cJSON *links = cJSON_GetObjectItemCaseSensitive(game, "downloadLinks"), *link;
         size_t before = used;
-        cJSON_ArrayForEach(link, links)
-            if (!map_link(game, link, PADRINO_SOURCE, &rows[used])) used++;
+        cJSON_ArrayForEach(link, links) {
+            if (map_link(game, link, PADRINO_SOURCE, &rows[used])) continue;
+            origins[used++] = (OptionOrigin){title_count, link};
+        }
         if (before < used) titles[title_count++] = game;
     }
     if (!used) goto fail;
+    identify_mirrors(rows, origins, used);
+    free(origins);
     qsort(rows, used, sizeof *rows, compare_releases);
     for (size_t i = 0; i < used; i++) {
         if (*count && !strcmp(rows[*count - 1].id, rows[i].id)) continue;
@@ -768,6 +777,7 @@ int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at)
     return 0;
 fail:
     cJSON_Delete(snapshot);
+    free(origins);
     free(titles);
     free(rows);
     return -1;
@@ -795,13 +805,13 @@ static const struct {
     {{"datanodes.to", "datanodes.co"}, {"datanodes to", "datanodes co", "data nodes", "datanodes", "data"}},
     {{"rootz.so"}, {"rootz so", "rootz"}},
     {{"gofile.io"}, {"gofile io", "gofile"}},
-    {{"filekeeper.net"}, {"filekeeper net", "file keeper", "filekeeper"}},
+    {{"filekeeper.net"}, {"filekeeper net", "file keeper", "filekeeper", "filek"}},
     {{"1fichier.com"}, {"1fichier com", "1fichier"}},
     {{"archive.org"}, {"archive org", "archive"}},
     {{"mediafire.com"}, {"mediafire com", "mediafire"}},
     {{"buzzheavier.com"}, {"buzzheavier com", "buzzheavier"}},
     {{"rapidgator.net"}, {"rapidgator net", "rapidgator"}},
-    {{"datavaults.co"}, {"datavaults co", "datavaults"}},
+    {{"datavaults.co"}, {"datavaults co", "datavaults", "vault"}},
 };
 
 static int mirror_variant(const Release *r, char *out, size_t cap) {
@@ -864,7 +874,6 @@ static int mirror_variant(const Release *r, char *out, size_t cap) {
     return -1;
 }
 
-typedef struct { size_t package; const cJSON *link; } OptionOrigin;
 typedef struct {
     Release *release;
     OptionOrigin origin;
@@ -872,11 +881,19 @@ typedef struct {
     unsigned provider;
 } MirrorOption;
 
-static int compare_mirror_options(const void *a, const void *b) {
-    const MirrorOption *x = a, *y = b;
+static int compare_mirror_variants(const MirrorOption *x, const MirrorOption *y) {
     if (x->origin.package != y->origin.package)
         return x->origin.package < y->origin.package ? -1 : 1;
     int variant = strcmp(x->variant, y->variant);
+    if (variant || strcmp(x->release->remote_catalog_id, PADRINO_SOURCE)) return variant;
+    variant = strcmp(x->release->remote_version, y->release->remote_version);
+    if (variant || x->release->display_size == y->release->display_size) return variant;
+    return x->release->display_size < y->release->display_size ? -1 : 1;
+}
+
+static int compare_mirror_options(const void *a, const void *b) {
+    const MirrorOption *x = a, *y = b;
+    int variant = compare_mirror_variants(x, y);
     return variant ? variant : strcmp(x->release->id, y->release->id);
 }
 
@@ -907,6 +924,8 @@ static void group_package_mirrors(MirrorOption *rows, size_t count) {
 }
 
 static void identify_mirrors(Release *releases, const OptionOrigin *origin, size_t count) {
+    if (!count) return;
+    bool bundled = !strcmp(releases[0].remote_catalog_id, PADRINO_SOURCE);
     MirrorOption *opaque = calloc(count, sizeof *opaque);
     size_t pending = 0;
     for (size_t i = 0; i < count; i++) {
@@ -922,6 +941,9 @@ static void identify_mirrors(Release *releases, const OptionOrigin *origin, size
         const cJSON *link = origin[i].link;
         if (!opaque || !remote_page_pending(r) || cJSON_GetObjectItemCaseSensitive(link, "part") ||
             *json_text(link, "checksum") || *json_text(link, "sha256") || token(r->remote_label, "part")) continue;
+        /* Padrino collects multiple editions under one title. A provider
+         * label by itself is insufficient evidence within that title. */
+        if (bundled && (!r->remote_version[0] || !r->display_size)) continue;
         int provider = mirror_variant(r, opaque[pending].variant, sizeof opaque[pending].variant);
         if (provider < 0) continue;
         opaque[pending].release = r;
@@ -933,8 +955,7 @@ static void identify_mirrors(Release *releases, const OptionOrigin *origin, size
         qsort(opaque, pending, sizeof *opaque, compare_mirror_options);
         for (size_t i = 0; i < pending;) {
             size_t next = i + 1;
-            while (next < pending && opaque[i].origin.package == opaque[next].origin.package &&
-                   !strcmp(opaque[i].variant, opaque[next].variant)) next++;
+            while (next < pending && !compare_mirror_variants(&opaque[i], &opaque[next])) next++;
             if (next - i > 1) group_package_mirrors(opaque + i, next - i);
             i = next;
         }

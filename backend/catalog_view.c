@@ -99,7 +99,7 @@ static const cJSON *match_title(const TitleEntry *titles, size_t count, const ch
 
 static int compare_mirrors(const void *a, const void *b) {
     const Release *x = *(const Release *const *)a, *y = *(const Release *const *)b;
-    int key = strcmp(x->mirror_key, y->mirror_key);
+    int key = strcmp(remote_mirror_group_locked(x), remote_mirror_group_locked(y));
     return key ? key : strcmp(x->id, y->id);
 }
 
@@ -107,7 +107,7 @@ static size_t first_mirror(const Release *const *rows, size_t count, const char 
     size_t lo = 0, hi = count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (strcmp(rows[mid]->mirror_key, key) < 0) lo = mid + 1;
+        if (strcmp(remote_mirror_group_locked(rows[mid]), key) < 0) lo = mid + 1;
         else hi = mid;
     }
     return lo;
@@ -145,7 +145,8 @@ static bool append_remote_locked(cJSON *out) {
     size_t mirror_count = 0;
     for (i = 0; i < orbit.remote_release_count; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (r->mirror_key[0] && source_enabled_locked(r) && !remote_link_missing_locked(r))
+        if (!r->remote_alias && *remote_mirror_group_locked(r) && source_enabled_locked(r) &&
+            !remote_link_missing_locked(r))
             mirrors[mirror_count++] = r;
     }
     qsort(mirrors, mirror_count, sizeof *mirrors, compare_mirrors);
@@ -159,13 +160,14 @@ static bool append_remote_locked(cJSON *out) {
     bool ok = true;
     for (i = 0; i < orbit.remote_release_count && ok; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (!source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
+        if (r->remote_alias || !source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
         size_t begin = 0, end = 0;
-        if (r->mirror_key[0]) {
-            begin = first_mirror(mirrors, mirror_count, r->mirror_key);
+        const char *group = remote_mirror_group_locked(r);
+        if (*group) {
+            begin = first_mirror(mirrors, mirror_count, group);
             if (begin == mirror_count || mirrors[begin] != r) continue;
             end = begin + 1;
-            while (end < mirror_count && !strcmp(mirrors[end]->mirror_key, r->mirror_key)) end++;
+            while (end < mirror_count && !strcmp(remote_mirror_group_locked(mirrors[end]), group)) end++;
         }
         cJSON *entry = release_json(r);
         if (!entry) { ok = false; break; }

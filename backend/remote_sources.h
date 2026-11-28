@@ -35,8 +35,11 @@ const char *remote_browser_provider(const char *url);
 bool remote_link_host(const Release *release, char *host, size_t cap);
 bool remote_link_missing_locked(const Release *release);
 void remote_mark_missing_locked(const Release *release);
+/* The release must be a live catalogue entry. */
+const char *remote_mirror_group_locked(const Release *release);
 bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror);
 bool remote_mirror_locked(const Release *release, const char *id, Release *mirror);
+/* Acquires orbit.mutex to check provider metadata. */
 bool remote_mirror_file(const Release *selected, const Release *file);
 bool remote_metadata_url(const char *url);
 bool remote_metadata_option(const Release *release);
