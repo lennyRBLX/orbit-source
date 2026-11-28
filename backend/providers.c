@@ -500,13 +500,9 @@ bool provider_capture_url(const Release *release, const char *candidate) {
     if (!strcmp(release->source, "pspkg")) {
         const char *provider = remote_browser_provider(candidate);
         if (!*provider) return pspkg_file_candidate(candidate);
-        Release page = *release;
-        copy_text(page.source, sizeof page.source, provider);
-        copy_text(page.browser_url, sizeof page.browser_url, candidate);
-        copy_text(page.url, sizeof page.url, candidate);
-        page.remote_page = true;
-        page.filename[0] = 0;
-        return provider_browser_supported(&page);
+        /* This is a stable landing page. Resolution or the existing
+         * browser matcher still validates the eventual file route. */
+        return strcmp(provider, "pspkg") != 0;
     }
     Release resolved = *release;
     strcpy(resolved.url, candidate);
@@ -515,7 +511,8 @@ bool provider_capture_url(const Release *release, const char *candidate) {
 }
 
 const char *provider_torbox_url(const Release *r) {
-    /* Submit the stable page for these providers, including after capture. */
+    /* Submit the stable provider page, including after browser capture. */
+    if (r->remote_page && r->remote_provider_page[0]) return r->remote_provider_page;
     if (r->remote_page || ((!strcmp(r->source, "datanodes") || !strcmp(r->source, "1fichier") ||
         !strcmp(r->source, "akirabox")) && provider_browser_supported(r))) return r->browser_url;
     return r->url;

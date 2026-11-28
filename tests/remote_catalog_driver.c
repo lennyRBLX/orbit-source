@@ -107,12 +107,41 @@ int main(int argc, char **argv) {
             atomic_fetch_add(&scheduler_clock, json_int(request, "milliseconds"));
             if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(request, "tick"))) remote_sources_tick();
             puts("true");
+        } else if (!strcmp(op, "provider-page")) {
+            print_json(cJSON_CreateString(remote_browser_provider(json_text(request, "url"))));
+        } else if (!strcmp(op, "metadata-page")) {
+            Release release = {.remote_page = true};
+            copy_text(release.browser_url, sizeof release.browser_url, json_text(request, "url"));
+            RemoteFileMetadata file;
+            cJSON *links = NULL;
+            remote_download_metadata(&release, &file, &links);
+            cJSON *result = cJSON_CreateObject();
+            cJSON_AddStringToObject(result, "status", remote_metadata_status(file.status));
+            cJSON_AddNumberToObject(result, "sizeBytes", (double)file.size);
+            cJSON_AddBoolToObject(result, "exact", file.exact);
+            if (links) cJSON_AddItemToObject(result, "links", links);
+            print_json(result);
+        } else if (!strcmp(op, "replay")) {
+            pthread_mutex_lock(&orbit.mutex);
+            print_json(remote_catalog_diagnostics_locked(cJSON_GetObjectItemCaseSensitive(request, "entry"),
+                                                         json_text(request, "source")));
+            pthread_mutex_unlock(&orbit.mutex);
         } else if (!strcmp(op, "pspkg-scan")) {
             print_json(remote_pspkg_preview(json_text(request, "source"), json_text(request, "url"),
-                                            (unsigned)json_int(request, "listingLimit"),
                                             (size_t)json_int(request, "gameLimit")));
         } else if (!strcmp(op, "pspkg-links")) {
-            print_json(remote_pspkg_links_test(json_text(request, "html")));
+            print_json(remote_pspkg_links(json_text(request, "html")));
+        } else if (!strcmp(op, "pspkg-job-page")) {
+            Release release, saved;
+            const char *source = json_text(request, "source");
+            const cJSON *entry = cJSON_GetObjectItemCaseSensitive(request, "entry");
+            assert(!pegasus_entry_to_release(entry, source, &release));
+            copy_text(release.remote_provider_page, sizeof release.remote_provider_page, json_text(request, "url"));
+            cJSON *snapshot = release_json(&release);
+            bool valid = !remote_release_parse(snapshot, &saved);
+            cJSON_AddBoolToObject(snapshot, "valid", valid);
+            if (valid) cJSON_AddStringToObject(snapshot, "torboxUrl", provider_torbox_url(&saved));
+            print_json(snapshot);
         } else if (!strcmp(op, "pspkg-candidate")) {
             Release release = {0};
             copy_text(release.source, sizeof release.source, "pspkg");

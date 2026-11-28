@@ -27,7 +27,8 @@ static bool section(const char *path, const char **platform, const char **name) 
 static bool game_name(const char *name, const char **digits, const char **suffix) {
     *suffix = strstr(name, ".html");
     if (!*suffix || (*suffix)[5] || *suffix == name || strchr(name, '?') || strchr(name, '#') ||
-        strchr(name, '/')) return false;
+        strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") != strlen(name) ||
+        *name == '.' || strstr(name, "..")) return false;
     *digits = *suffix;
     while (*digits > name && isdigit((unsigned char)(*digits)[-1])) (*digits)--;
     return *digits != *suffix && *digits > name && (*digits)[-1] == '-' &&
@@ -46,7 +47,11 @@ bool pspkg_download_page(const char *game, char *out, size_t cap) {
 
 bool pspkg_page_matches(const char *game, const char *page) {
     char expected[2048];
-    return page && pspkg_download_page(game, expected, sizeof expected) && !strcmp(expected, page);
+    if (!page || !pspkg_download_page(game, expected, sizeof expected)) return false;
+    if (!strcmp(expected, page)) return true;
+    char *query = strchr(expected, '?');
+    if (query) *query = 0;
+    return !strcmp(expected, page);
 }
 
 bool pspkg_page_identity(const char *page, char *platform, size_t platform_cap,
@@ -55,24 +60,18 @@ bool pspkg_page_identity(const char *page, char *platform, size_t platform_cap,
     const char *path, *part, *name, *digits, *suffix;
     if (!origin(page, &path) || !section(path, &part, &name) ||
         strncmp(name, "download-", 9)) return false;
-    const char *query = strstr(name, ".html?id=");
-    if (!query || query[9] == 0) return false;
-    size_t id_length = strlen(query + 9);
-    if (id_length >= id_cap || id_length > 12 ||
-        strspn(query + 9, "0123456789") != id_length) return false;
-    char game[2048], expected[2048];
-    int n = snprintf(game, sizeof game, "%.*s%s", (int)(name - page), page, name + 9);
-    if (n <= 0 || (size_t)n >= sizeof game) return false;
-    /* Strip the query while retaining the original game slug. */
-    char *q = strchr(game, '?');
-    if (q) *q = 0;
-    if (!game_name(game + (name - page), &digits, &suffix) ||
-        (size_t)(suffix - digits) != id_length ||
-        strncmp(digits, query + 9, id_length) ||
-        !pspkg_download_page(game, expected, sizeof expected) || strcmp(expected, page)) return false;
+    size_t prefix = (size_t)(name - page), length = strcspn(name + 9, "?");
+    char game[2048];
+    if (prefix + length >= sizeof game) return false;
+    memcpy(game, page, prefix);
+    memcpy(game + prefix, name + 9, length);
+    game[prefix + length] = 0;
+    if (!game_name(game + prefix, &digits, &suffix) || !pspkg_page_matches(game, page)) return false;
+    length = (size_t)(suffix - digits);
+    if (length >= id_cap) return false;
     memcpy(platform, part, 4);
-    memcpy(game_id, query + 9, id_length);
-    game_id[id_length] = 0;
+    memcpy(game_id, digits, length);
+    game_id[length] = 0;
     return true;
 }
 

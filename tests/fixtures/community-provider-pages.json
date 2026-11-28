@@ -1,0 +1,96 @@
+{
+  "providers": [
+    [
+      "BuzzHeavier",
+      "https://buzzheavier.com/a1b2c3d4e5f6"
+    ],
+    [
+      "AkiraBox",
+      "https://akirabox.com/a1b2c3d4e5f6/file"
+    ],
+    [
+      "AkiraBox",
+      "https://akirabox.to/a1b2c3d4e5f6/file"
+    ],
+    [
+      "VikingFile",
+      "https://vikingfile.com/f/a1b2c3d4e5"
+    ],
+    [
+      "VikingFile",
+      "https://vik1ngfile.site/f/a1b2c3d4e5"
+    ],
+    [
+      "VikingFile",
+      "https://vik1ngf1le.online/f/a1b2c3d4e5"
+    ],
+    [
+      "1fichier",
+      "https://1fichier.com/?A1b2C3d4E5f6G7h8I9j0"
+    ],
+    [
+      "Rootz",
+      "https://rootz.so/d/abc123"
+    ],
+    [
+      "Rootz",
+      "https://www.rootz.so/d/abc123"
+    ],
+    [
+      "RapidGator",
+      "https://rapidgator.net/file/0123456789abcdef0123456789abcdef/Game.pkg.html"
+    ],
+    [
+      "DataNodes",
+      "https://datanodes.to/a1b2c3d4e5f6"
+    ],
+    [
+      "FileKeeper",
+      "https://filekeeper.net/a1b2c3d4e5f6"
+    ],
+    [
+      "DataVaults",
+      "https://datavaults.co/a1b2c3d4e5f6"
+    ],
+    [
+      "Archive.org",
+      "https://archive.org/details/fixture-game"
+    ],
+    [
+      "PSPKG PS4",
+      "https://pspkg.com/ps4/download-cyberpunk-fixture-123.html?id=123"
+    ],
+    [
+      "PSPKG PS5",
+      "https://pspkg.com/ps5/download-cyberpunk-fixture-321.html?id=321"
+    ]
+  ],
+  "sources": {
+    "dlps": [
+      0,
+      1,
+      9
+    ],
+    "pippo-exfat": [
+      7,
+      10
+    ],
+    "pfs": [
+      2,
+      11
+    ],
+    "padrino": [
+      3,
+      6,
+      8,
+      12,
+      13
+    ],
+    "pspkg-ps4": [
+      14
+    ],
+    "pspkg-ps5": [
+      15
+    ]
+  }
+}

@@ -16,7 +16,7 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / 'catalog/padrino.json.gz'
 TITLE_ID = re.compile(r'(CUSA|PPSA)[0-9]{5}\Z')
-ZSTD = re.compile(r'(?<![a-z0-9])(?:zstd|zst|zstandard)(?![a-z0-9])', re.I)
+UNSUPPORTED_COMPRESSION = re.compile(r'(?<![a-z0-9])(?:lz4|zstd|zst|zstandard)(?![a-z0-9])', re.I)
 FILE = re.compile(r'\.(?:pkg|fpkg|exfat|ffpfsc|zip|7z|rar)\Z', re.I)
 VOLUME = re.compile(r'(?:\.part[0-9]+\.rar|\.r[0-9]{2}|\.z[0-9]{2}|\.[0-9]{3})\Z', re.I)
 VIKING = {'vikingfile.com', 'vik1ngfile.site', 'vik1ngf1le.online'}
@@ -25,28 +25,63 @@ VIKING = {'vikingfile.com', 'vik1ngfile.site', 'vik1ngf1le.online'}
 def https(value, limit=2048):
     if not isinstance(value, str) or not value.startswith('https://') or len(value.encode()) >= limit:
         return None
-    if re.search(r'[\x00-\x20\\\x7f]', value):
+    if re.search(r'[\x00-\x20\\#\x7f]', value):
         return None
     try:
         parts = urlsplit(value)
-        if parts.hostname and parts.username is None and (parts.port is None or parts.port > 0):
+        if parts.hostname and parts.netloc == parts.hostname and not any(
+                segment in ('.', '..') for segment in unquote(parts.path).split('/')):
             return parts
     except ValueError:
         pass
     return None
 
 
+PAGE_PATHS = {
+    'buzzheavier.com': r'/[A-Za-z0-9_-]{6,64}',
+    'akirabox.com': r'/[A-Za-z0-9]{12}/file',
+    'akirabox.to': r'/[A-Za-z0-9]{12}/file',
+    **dict.fromkeys(VIKING, r'/f/[A-Za-z0-9]{10}'),
+    'rootz.so': r'/d/[A-Za-z0-9_-]{4,64}',
+    'www.rootz.so': r'/d/[A-Za-z0-9_-]{4,64}',
+    'rapidgator.net': r'/file/[A-Fa-f0-9]{32}/[^/]+\.html',
+    'datanodes.to': r'/[A-Za-z0-9]{12}',
+    'datanodes.co': r'/[A-Za-z0-9]{12}',
+    'filekeeper.net': r'/(?:[A-Za-z0-9_-]{6,64}|f/[A-Za-z0-9]{32})',
+    'datavaults.co': r'/(?:[A-Za-z0-9_-]{6,64}|f/[A-Za-z0-9]{32})',
+    'archive.org': r'/details/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}',
+}
+
+
 def provider_page(parts):
     host, path = parts.hostname, parts.path
-    return (
-        (not parts.query and (
-            (host in VIKING and re.fullmatch(r'/f/[A-Za-z0-9]{10}/?', path))
-            or (host in {'akirabox.com', 'akirabox.to'} and re.fullmatch(r'/[A-Za-z0-9]{12}/file/?', path))
-            or (host == 'datanodes.to' and re.fullmatch(r'/[A-Za-z0-9]{12}/?', path))
-        ))
-        or (host == 'archive.org' and path.startswith('/details/'))
-        or (parts.netloc == '1fichier.com' and path == '/' and re.fullmatch(r'[A-Za-z0-9]{20}', parts.query))
-    )
+    if '..' in path:
+        return False
+    if host == '1fichier.com':
+        return path == '/' and re.fullmatch(r'[A-Za-z0-9]{20}', parts.query) is not None
+    if host == 'pspkg.com':
+        game = re.fullmatch(r'/ps[45]/download-[A-Za-z0-9_-][A-Za-z0-9_.-]*-([0-9]{1,12})\.html', path)
+        return bool(game and parts.query in ('', f'id={game[1]}'))
+    if host == 'rapidgator.net':
+        name = unquote(path.rsplit('/', 1)[-1])
+        if not name or name.startswith('.') or len(name.encode()) >= 160 or re.search(r'[/\\:?#%\x00-\x1f\x7f]|\.\.', name):
+            return False
+    pattern = PAGE_PATHS.get(host)
+    return bool(pattern and not parts.query and re.fullmatch(pattern, path))
+
+
+def diagnostic_url(value):
+    if not isinstance(value, str):
+        return None
+    parts = https(value)
+    if parts and provider_page(parts):
+        return value
+    if not parts:
+        return '[invalid URL]'
+    host = parts.hostname
+    if not parts.query and not re.search(r'(?i)/(?:download|token|signed)/', parts.path):
+        return value
+    return f'https://{host}/[redacted]'
 
 
 def supported_filename(name):
@@ -58,11 +93,13 @@ def option(row):
     if row.get('category') not in ('game', None):
         return None, 'unsupported_category'
     filename = row.get('filename')
-    if row.get('volume') or (isinstance(filename, str) and VOLUME.search(filename)):
+    if (row.get('volume') or row.get('part') or row.get('multipart')
+            or re.search(r'\b(?:part|volume)[ ._-]*[0-9]+\b', row.get('label') or '', re.I)
+            or (isinstance(filename, str) and VOLUME.search(filename))):
         return None, 'multipart'
     if row.get('unavailableReason') or row.get('health') in ('dead', 'broken', 'unavailable'):
         return None, 'unavailable'
-    if any(ZSTD.search(str(row.get(key, ''))) for key in
+    if any(UNSUPPORTED_COMPRESSION.search(str(row.get(key, ''))) for key in
            ('assetCompression', 'compression', 'format', 'source', 'label', 'filename', 'url', 'browserUrl')):
         return None, 'unsupported_compression'
 
@@ -73,21 +110,27 @@ def option(row):
         parts = https(url)
         if not parts:
             continue
-        if ZSTD.search(unquote(url)):
+        if UNSUPPORTED_COMPRESSION.search(unquote(url)):
             rejection = rejection or 'unsupported_compression'
             continue
-        recognized_page = provider_page(parts)
-        base_url, fragment, _ = url.partition('#')
-        if fragment and (not recognized_page or parts.hostname not in VIKING):
+        if url.endswith('?') or (parts.hostname == '1fichier.com' and parts.path != '/'):
             continue
-        if recognized_page and len(base_url.encode()) < 128:
-            url = urlunsplit(parts._replace(fragment='', path=parts.path.rstrip('/') or '/'))
+        path = parts.path.rstrip('/') or '/'
+        name = unquote(path.rsplit('/', 1)[-1])
+        if (parts.hostname in {'filekeeper.net', 'datavaults.co', 'datanodes.to'}
+                and supported_filename(name) and path.count('/') == 2):
+            path = path.rsplit('/', 1)[0]
+        canonical = parts._replace(path=path)
+        recognized_page = provider_page(canonical)
+        if recognized_page and len(urlunsplit(canonical).encode()) < 256:
+            url = urlunsplit(canonical)
             page = True
             break
-        name = unquote(parts.path.rsplit('/', 1)[-1])
         if VOLUME.search(name):
             rejection = rejection or 'multipart'
-        elif not requires_browser and not fragment and supported_filename(name):
+        elif not requires_browser and supported_filename(name):
+            if parts.query and parts.hostname in PAGE_PATHS:
+                continue
             filename = name
             break
         elif not recognized_page and requires_browser:
@@ -98,11 +141,23 @@ def option(row):
         return None, rejection or 'invalid_url_or_filename'
 
     result = {'url': url, 'name': row.get('provider') or 'Padrino Store'}
+    for key, cap in (('label', 128), ('version', 32), ('region', 32),
+                     ('assetCompression', 8), ('compression', 8)):
+        value = row.get(key)
+        if isinstance(value, str) and value.isprintable() and len(value.encode()) < cap:
+            result[key] = value
+    source_page = row.get('sourcePage') or row.get('downloadSource')
+    if https(source_page, 256) and '?' not in source_page:
+        result['sourcePage'] = source_page
     if supported_filename(filename):
         result['filename'] = filename
+        if page and isinstance(row.get('id'), str) and filename.rsplit('.', 1)[0].endswith('-' + row['id']):
+            result['syntheticFilename'] = True
     # Padrino's package labels distinguish PS4 fake packages from official PKGs.
     if re.search(r'\bfpkg\b', row.get('label') or '', re.I):
         result['format'] = 'FPKG'
+    elif re.search(r'\bexfat\b', row.get('label') or '', re.I):
+        result['format'] = 'exfat'
     elif row.get('format') in ('pkg', 'zip', 'rar', '7z', 'exfat', 'ffpfsc'):
         result['format'] = row['format']
     if page:
@@ -144,11 +199,14 @@ def convert(checkout, show_skips=False):
             for row in json.loads(path.read_text()):
                 link, reason = option(row)
                 if link:
-                    links.setdefault(link['url'], link)
+                    links.setdefault((link['url'], link.get('version'), link.get('region')), link)
                 else:
                     skipped[reason] += 1
                     if show_skips:
-                        details = {key: row.get(key) for key in ('id', 'provider', 'url', 'browserUrl')}
+                        details = {key: row.get(key) for key in ('id', 'provider', 'label', 'format',
+                                                                 'compression', 'assetCompression', 'part', 'volume')}
+                        details = {key: value for key, value in details.items() if value is not None}
+                        details.update({key: diagnostic_url(row.get(key)) for key in ('url', 'browserUrl')})
                         print(json.dumps({'titleId': tid, 'reason': reason, **details}), file=sys.stderr)
         if not links:
             continue

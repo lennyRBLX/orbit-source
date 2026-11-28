@@ -611,9 +611,21 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         return json_response(c, 200, catalog_status());
     if (get && (!strcmp(url, "/api/v1/catalog") || !strcmp(url, "/api/v1/addons")))
         return catalog_response(c, !strcmp(url, "/api/v1/addons"));
+    if (get && !strcmp(url, "/api/v1/community-diagnostics")) {
+        if (!authorized(c)) return error(c, 401, "Pair this device first.");
+        const char *source = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "source");
+        const char *package = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "package");
+        pthread_mutex_lock(&orbit.mutex);
+        cJSON *o = remote_source_package_diagnostics_locked(source, package);
+        pthread_mutex_unlock(&orbit.mutex);
+        return o ? json_response(c, 200, o) : error(c, 400, "Choose a community source and package.");
+    }
     if (get && !strcmp(url, "/api/v1/community-metadata")) {
         if (!authorized(c)) return error(c, 401, "Pair this device first.");
         const char *ids = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "ids");
+        size_t count = ids && *ids ? 1 : 0;
+        for (const char *at = ids; at && (at = strchr(at, ',')); at++) count++;
+        if (count > METADATA_REQUEST_LIMIT) return error(c, 400, "Request at most 32 metadata options at a time.");
         pthread_mutex_lock(&orbit.mutex);
         cJSON *o = remote_metadata_json_locked(ids);
         pthread_mutex_unlock(&orbit.mutex);

@@ -19,13 +19,9 @@ DIRECT = 'https://example.org/download/Game%20Disc.rar'
 
 class PadrinoImporterTests(unittest.TestCase):
     def test_supported_provider_pages(self):
-        cases = (
-            (FICHIER, FICHIER),
-            ('https://vikingfile.com/f/abcd123456/#browser', 'https://vikingfile.com/f/abcd123456'),
-            ('https://akirabox.to/abcd12345678/file/', 'https://akirabox.to/abcd12345678/file'),
-            ('https://datanodes.to/abcd12345678/', 'https://datanodes.to/abcd12345678'),
-            ('https://archive.org/details/example', 'https://archive.org/details/example'),
-        )
+        fixture = Path(__file__).parent / 'fixtures/community-provider-pages.json'
+        cases = [(url, url) for _, url in json.loads(fixture.read_text())['providers']]
+        cases += [('https://akirabox.to/abcd12345678/file/', 'https://akirabox.to/abcd12345678/file')]
         for url, canonical in cases:
             with self.subTest(url=url):
                 link, reason = import_padrino.option({
@@ -68,11 +64,9 @@ class PadrinoImporterTests(unittest.TestCase):
 
     def test_skip_reasons(self):
         cases = (
-            ({'url': 'https://buzzheavier.com/abcd12345678', 'requiresBrowser': True}, 'unsupported_provider_page'),
-            ({'url': 'https://filekeeper.net/abcd12345678', 'requiresBrowser': True}, 'unsupported_provider_page'),
-            ({'url': 'https://datavaults.co/abcd12345678', 'requiresBrowser': True}, 'unsupported_provider_page'),
-            ({'url': 'https://www.rootz.so/d/1DlFAW', 'filename': 'game.rar'}, 'opaque_nonfile_url'),
             ({'url': DIRECT, 'requiresBrowser': True}, 'unsupported_provider_page'),
+            ({'url': DIRECT, 'label': 'LZ4 game folder'}, 'unsupported_compression'),
+            ({'url': DIRECT, 'label': 'Game part 2'}, 'multipart'),
             ({'url': DIRECT, 'category': 'update'}, 'unsupported_category'),
             ({'url': DIRECT, 'volume': 1}, 'multipart'),
             ({'url': DIRECT, 'filename': 'game.part01.rar'}, 'multipart'),
@@ -89,6 +83,19 @@ class PadrinoImporterTests(unittest.TestCase):
         for row, reason in cases:
             with self.subTest(row=row):
                 self.assertEqual(import_padrino.option(row), (None, reason))
+
+    def test_preserves_provider_metadata(self):
+        link, reason = import_padrino.option({
+            'id': 'fixture', 'label': 'EUR · exFAT', 'provider': '1fichier', 'url': FICHIER,
+            'version': '2.10', 'region': 'EUR', 'filename': 'Cyberpunk.exfat', 'sizeBytes': 5678,
+            'sourcePage': 'https://example.org/game', 'archivePassword': 'example',
+        })
+        self.assertIsNone(reason)
+        self.assertEqual(link, {
+            'name': '1fichier', 'url': FICHIER, 'page': True, 'label': 'EUR · exFAT',
+            'version': '2.10', 'region': 'EUR', 'filename': 'Cyberpunk.exfat', 'format': 'exfat',
+            'sizeEstimateBytes': 5678, 'sourcePage': 'https://example.org/game', 'archivePassword': 'example',
+        })
 
     def test_convert_reports_rejected_rows_without_changing_the_snapshot_schema(self):
         rows = [

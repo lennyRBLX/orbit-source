@@ -4,7 +4,9 @@
 #define PADRINO_SOURCE "padrino"
 #define PSPKG_PS5_SOURCE "pspkg-ps5"
 #define PSPKG_PS4_SOURCE "pspkg-ps4"
-#define PADRINO_OPTION_LIMIT 16384
+#define PADRINO_OPTION_LIMIT 24576
+#define PSPKG_INDEX_LIMIT 8192
+#define METADATA_REQUEST_LIMIT 32
 
 #include "orbit.h"
 
@@ -12,9 +14,9 @@
 int remote_sources_load(void);
 #ifdef ORBIT_TEST
 cJSON *remote_pspkg_preview(const char *source_id, const char *url,
-                            unsigned listing_limit, size_t game_limit);
-cJSON *remote_pspkg_links_test(const char *html);
+                            size_t game_limit);
 #endif
+cJSON *remote_pspkg_links(const char *html);
 int remote_sources_start(void);
 void remote_sources_stop(void);
 void remote_sources_changed_locked(void);
@@ -37,6 +39,7 @@ bool remote_next_mirror_locked(const Release *release, const char *after, Releas
 bool remote_mirror_locked(const Release *release, const char *id, Release *mirror);
 bool remote_mirror_file(const Release *selected, const Release *file);
 bool remote_metadata_url(const char *url);
+bool remote_metadata_option(const Release *release);
 bool remote_url_filename(const char *url, char *name, size_t cap);
 int remote_file_format(Release *release, const char *name);
 int remote_file_detected_format(Release *release, const char *name, const char *suffix);
@@ -48,17 +51,32 @@ int remote_download_resolve(Release *release, Release *locator, atomic_bool *can
                             char *error, size_t cap);
 int remote_download_verify(Release *release, const char *url, atomic_bool *cancel,
                            char *error, size_t cap);
+typedef enum {
+    REMOTE_METADATA_NONE, REMOTE_METADATA_FOUND, REMOTE_METADATA_MISSING, REMOTE_METADATA_INTERACTIVE,
+    REMOTE_METADATA_CHALLENGE, REMOTE_METADATA_TIMEOUT, REMOTE_METADATA_NETWORK, REMOTE_METADATA_HTTP,
+    REMOTE_METADATA_REDIRECT, REMOTE_METADATA_TOO_LARGE, REMOTE_METADATA_NO_SIZE,
+    REMOTE_METADATA_AMBIGUOUS, REMOTE_METADATA_UNSUPPORTED,
+} RemoteMetadataStatus;
+const char *remote_metadata_status(RemoteMetadataStatus status);
 typedef struct {
+    RemoteMetadataStatus status;
+    unsigned confidence, candidate_count;
+    long http_status;
+    bool attempted;
+    int64_t candidates[12];
+    char effective_host[254];
     char filename[160];
     char format[24], compression[16];
     int64_t size;
     bool exact;
 } RemoteFileMetadata;
-bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, atomic_bool *cancel);
+bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, cJSON **links);
 cJSON *remote_metadata_json_locked(const char *ids);
 int remote_release_parse(const cJSON *entry, Release *release);
 int remote_catalog_parse(const char *body, size_t length, const char *source_id,
                          Release **releases, size_t *count, size_t *skipped);
+cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_id);
+cJSON *remote_source_package_diagnostics_locked(const char *source, const char *package);
 int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at);
 const cJSON *padrino_game(const char *title_id);
 void padrino_catalog_clear(void);

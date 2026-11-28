@@ -53,10 +53,6 @@ static cJSON *padrino_snapshot;
 static const cJSON **padrino_titles;
 static size_t padrino_title_count;
 
-static bool padrino_release(const Release *r) {
-    return !strcmp(r->remote_catalog_id, PADRINO_SOURCE);
-}
-
 static const char *pspkg_platform(const char *source_id) {
     if (!strcmp(source_id, PSPKG_PS5_SOURCE)) return "PS5";
     if (!strcmp(source_id, PSPKG_PS4_SOURCE)) return "PS4";
@@ -73,12 +69,19 @@ static bool source_package(const cJSON *entry, const char *source_id) {
     const char *description = json_text(entry, "description");
     if (strncmp(id, "pspkg-", 6) || !strncmp(id, "pspkg-arabic-", 13) ||
         strcmp(json_text(entry, "category"), platform)) return false;
+#ifdef ORBIT_TEST
+    const char *local = strstr(description, "\nSource: http://127.0.0.1:");
+    if (local) {
+        const char *path = strchr(local + strlen("\nSource: http://127.0.0.1:"), '/');
+        if (path && !strncasecmp(path + 1, platform, 3) && path[4] == '/') return true;
+    }
+#endif
     return strstr(description, !strcmp(platform, "PS5")
         ? "\nSource: https://pspkg.com/ps5/" : "\nSource: https://pspkg.com/ps4/") != NULL;
 }
 
 static bool image_format(const Release *r) {
-    return padrino_release(r) && (!strcmp(r->format, "exFAT") || !strcmp(r->format, "FFPFSC"));
+    return !strcmp(r->format, "exFAT") || !strcmp(r->format, "FFPFSC");
 }
 
 static int file_format(Release *r, const char *name, bool community, const char *detected);
@@ -86,12 +89,16 @@ static int file_format(Release *r, const char *name, bool community, const char 
 /* Include the full source id in the digest even when its displayed prefix is shortened. */
 static void identify(Release *r) {
     char identity[sizeof r->remote_catalog_id + sizeof r->url + sizeof r->sha256 +
-                  sizeof r->filename + sizeof r->title_id];
+                  sizeof r->filename + sizeof r->title_id + sizeof r->remote_version + sizeof r->remote_region + 16];
     if (r->remote_page)
         snprintf(identity, sizeof identity, "%s/%s\n%s", r->remote_catalog_id, r->browser_url, r->title_id);
     else
         snprintf(identity, sizeof identity, "%s/%s\n%s\n%s\n%s",
                  r->remote_catalog_id, r->url, r->filename, r->title_id, r->sha256);
+    if (r->remote_version[0] || r->remote_region[0]) {
+        size_t used = strlen(identity);
+        snprintf(identity + used, sizeof identity - used, "\n%s\n%s", r->remote_version, r->remote_region);
+    }
     unsigned char hash[SHA256_DIGEST_LENGTH];
     SHA256((const unsigned char *)identity, strlen(identity), hash);
     snprintf(r->id, sizeof r->id, "rs-%.6s-%02x%02x%02x%02x%02x%02x",
@@ -106,11 +113,17 @@ static bool valid(const Release *r) {
         (strcmp(r->platform, "ps4") && strcmp(r->platform, "ps5")) ||
         ((r->browser_url[0] || r->remote_page) && !remote_https_url(r->browser_url)) ||
         ((!r->remote_page || r->url[0]) && !remote_https_url(r->url))) return false;
-    if (r->archive_password[0] && (!padrino_release(r) || (!remote_page_pending(r) && !r->compression[0])))
+    if (r->remote_provider_page[0]) {
+        const char *provider = remote_browser_provider(r->remote_provider_page);
+        if (!r->remote_page || !pspkg_platform(r->remote_catalog_id) ||
+            strcmp(remote_browser_provider(r->browser_url), "pspkg") ||
+            !*provider || !strcmp(provider, "pspkg")) return false;
+    }
+    if (r->archive_password[0] && (!remote_page_pending(r) && !r->compression[0]))
         return false;
     if (remote_page_pending(r) && !r->filename[0])
         return (!r->compression[0] || !strcmp(r->compression, "zip") || !strcmp(r->compression, "rar") ||
-                (padrino_release(r) && !strcmp(r->compression, "7z"))) &&
+                !strcmp(r->compression, "7z")) &&
             !r->extracted_size && !r->sha256[0] &&
             (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
              !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG") || image_format(r));
@@ -144,6 +157,7 @@ int remote_release_parse(const cJSON *entry, Release *r) {
     const cJSON *page = cJSON_GetObjectItemCaseSensitive(entry, "remotePage");
     if (page && !cJSON_IsTrue(page)) return -1;
     r->remote_page = cJSON_IsTrue(page);
+    r->remote_filename_synthetic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "syntheticFilename"));
     if (!FIELD("sourceId", source) || strcmp(r->source, "remote") ||
         !FIELD("remoteCatalogId", remote_catalog_id) || !FIELD("title", title) ||
         !FIELD("mirrorKey", mirror_key) || (r->mirror_key[0] &&
@@ -151,6 +165,9 @@ int remote_release_parse(const cJSON *entry, Release *r) {
         !FIELD("titleId", title_id) || !FIELD("platform", platform) ||
         !FIELD("format", format) || !FIELD("filename", filename) || !FIELD("url", url) ||
         !FIELD("browserUrl", browser_url) || !FIELD("remoteLabel", remote_label) ||
+        !FIELD("providerPage", remote_provider_page) ||
+        !FIELD("version", remote_version) || !FIELD("region", remote_region) ||
+        !FIELD("filenameHint", remote_filename) || !FIELD("sourcePage", remote_source_page) ||
         (r->remote_page && !*r->browser_url) || !FIELD("sha256", sha256) || !FIELD("compression", compression) ||
         !FIELD("archivePassword", archive_password) ||
         !bytes(entry, "sizeBytes", &r->size) || !bytes(entry, "extractedBytes", &r->extracted_size) ||
@@ -218,13 +235,11 @@ bool remote_metadata_url(const char *url) {
         if (path && !strncmp(path, "/metadata/", 10)) return true;
     }
 #endif
-    const char *hosts[] = {"akirabox.com", "akirabox.to", "rootz.so", "vikingfile.com",
-        "vik1ngfile.site", "vik1ngf1le.online", "gofile.io", "datanodes.to", "datanodes.co", "filekeeper.net", "1fichier.com"};
-    char host[254];
-    if (!url_host(url, host, sizeof host)) return false;
-    for (size_t i = 0; i < sizeof hosts / sizeof *hosts; i++)
-        if (!strcmp(host, hosts[i])) return true;
-    return false;
+    return *remote_browser_provider(url) != 0;
+}
+
+bool remote_metadata_option(const Release *r) {
+    return remote_page_pending(r) && remote_metadata_url(r->browser_url);
 }
 
 static bool token(const char *label, const char *word) {
@@ -235,19 +250,27 @@ static bool token(const char *label, const char *word) {
     return false;
 }
 
-static bool unsupported_label(const char *label, bool padrino) {
-    return token(label, "lz4") || token(label, "zstd") || token(label, "zst") || token(label, "pfs") ||
-           (padrino ? token(label, "zstandard") :
-               token(label, "exfat") || token(label, "ffpfsc") || token(label, "7z"));
+static bool unsupported_label(const char *label) {
+    return token(label, "lz4") || token(label, "zstd") || token(label, "zst") ||
+           token(label, "zstandard") || token(label, "pfs");
 }
 
-static const char *label_format(const char *label, bool padrino) {
+static bool multipart_label(const char *label) {
+    for (const char *p = label; *p; p++) {
+        if (p != label && isalnum((unsigned char)p[-1])) continue;
+        size_t length = !strncasecmp(p, "part", 4) ? 4 : !strncasecmp(p, "volume", 6) ? 6 : 0;
+        if (length && isdigit((unsigned char)p[length + strspn(p + length, " ._-")])) return true;
+    }
+    return false;
+}
+
+static const char *label_format(const char *label) {
     if (token(label, "fpkg")) return "FPKG";
     if (token(label, "pkg")) return "PKG";
-    if (padrino && token(label, "exfat")) return "exFAT";
-    if (padrino && token(label, "ffpfsc")) return "FFPFSC";
+    if (token(label, "exfat")) return "exFAT";
+    if (token(label, "ffpfsc")) return "FFPFSC";
     if (token(label, "folder") || token(label, "rar") || token(label, "zip") ||
-        (padrino && token(label, "7z"))) return "Game folder";
+        token(label, "7z")) return "Game folder";
     return "";
 }
 
@@ -255,9 +278,10 @@ static const char *label_format(const char *label, bool padrino) {
  * describes what is inside a supported archive. Unlabeled archives are folders. */
 static int file_format(Release *r, const char *name, bool community, const char *detected) {
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
-    bool padrino = community && padrino_release(r);
-    if (community && unsupported_label(name, padrino)) return 1;
+    if (community && unsupported_label(name)) return 1;
     const char *suffix = strrchr(name, '.');
+    if (community && suffix && ((strlen(suffix) == 4 && strspn(suffix + 1, "0123456789") == 3) ||
+        (strlen(suffix) == 4 && strchr("rRzZ", suffix[1]) && strspn(suffix + 2, "0123456789") == 2))) return 1;
     const char *excluded[] = {".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; i++)
         if (suffix && !strcasecmp(suffix, excluded[i])) return 1;
@@ -267,23 +291,23 @@ static int file_format(Release *r, const char *name, bool community, const char 
         if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 1;
     }
     if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
-        !(padrino && (!strcasecmp(suffix, ".exfat") || !strcasecmp(suffix, ".ffpfsc")))))
+        strcasecmp(suffix, ".exfat") && strcasecmp(suffix, ".ffpfsc")))
         suffix = detected;
-    if (!suffix) return -1;
+    if (!suffix || (!community && (!strcasecmp(suffix, ".exfat") || !strcasecmp(suffix, ".ffpfsc")))) return -1;
     const char *archive = compression(suffix);
-    if (community && !padrino && !strcmp(archive, "7z")) return 1;
+    if (community && image_format(r) && strcasecmp(r->format, suffix + 1)) return 1;
     bool fpkg = !strcasecmp(suffix, ".fpkg");
     bool pkg = !strcasecmp(suffix, ".pkg");
     const char *format = "Game folder";
-    if (padrino && !strcasecmp(suffix, ".exfat")) format = "exFAT";
-    else if (padrino && !strcasecmp(suffix, ".ffpfsc")) format = "FFPFSC";
+    if (community && !strcasecmp(suffix, ".exfat")) format = "exFAT";
+    else if (community && !strcasecmp(suffix, ".ffpfsc")) format = "FFPFSC";
     else if (fpkg || !strcmp(r->format, "FPKG")) format = "FPKG";
     else if (pkg || !strcmp(r->format, "PKG")) format = "PKG";
     memset(r->format, 0, sizeof r->format);
     copy_text(r->format, sizeof r->format, format);
     memset(r->compression, 0, sizeof r->compression);
     copy_text(r->compression, sizeof r->compression, archive);
-    if (padrino && !*archive) memset(r->archive_password, 0, sizeof r->archive_password);
+    if (!*archive) memset(r->archive_password, 0, sizeof r->archive_password);
     copy_text(r->filename, sizeof r->filename, name);
     return 0;
 }
@@ -325,26 +349,125 @@ int direct_release_parse(const cJSON *entry, Release *r) {
     return 0;
 }
 
+static size_t page_id(const char *text, bool punctuation) {
+    return strspn(text, punctuation
+        ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
+}
+
 const char *remote_browser_provider(const char *url) {
-    const char *viking[] = {"https://vikingfile.com/f/", "https://vik1ngfile.site/f/", "https://vik1ngf1le.online/f/"};
-    for (size_t i = 0; i < sizeof viking / sizeof *viking; i++)
-        if (!strncmp(url, viking[i], strlen(viking[i]))) return "vikingfile";
-    if (!strncmp(url, "https://akirabox.com/", 21) || !strncmp(url, "https://akirabox.to/", 20))
-        return strstr(url + 20, "/file") ? "akirabox" : "";
-    if (!strncmp(url, "https://datanodes.to/", 21) && strcspn(url + 21, "/?#") == 12)
-        return "datanodes";
-    if (!strncmp(url, "https://1fichier.com/?", 22)) return "1fichier";
+    if (!url || strlen(url) >= sizeof ((Release *)0)->browser_url) return "";
+    for (const unsigned char *p = (const void *)url; *p; p++)
+        if (*p <= 32 || *p >= 127 || *p == '\\' || *p == '#') return "";
+    char platform[4], game_id[13];
+    if (pspkg_page_identity(url, platform, sizeof platform, game_id, sizeof game_id)) return "pspkg";
+    if (strncmp(url, "https://", 8)) return "";
+    const char *host = url + 8, *path = strchr(host, '/');
+    if (!path) return "";
+    static const struct {
+        const char *host, *prefix, *suffix, *provider;
+        unsigned min, max;
+        bool punctuation;
+    } pages[] = {
+        {"buzzheavier.com", "/", "", "buzzheavier", 6, 64, true},
+        {"akirabox.com", "/", "/file", "akirabox", 12, 12, false},
+        {"akirabox.to", "/", "/file", "akirabox", 12, 12, false},
+        {"vikingfile.com", "/f/", "", "vikingfile", 10, 10, false},
+        {"vik1ngfile.site", "/f/", "", "vikingfile", 10, 10, false},
+        {"vik1ngf1le.online", "/f/", "", "vikingfile", 10, 10, false},
+        {"1fichier.com", "/?", "", "1fichier", 20, 20, false},
+        {"rootz.so", "/d/", "", "rootz", 4, 64, true},
+        {"www.rootz.so", "/d/", "", "rootz", 4, 64, true},
+        {"rapidgator.net", "/file/", "/", "rapidgator", 32, 32, false},
+        {"datanodes.to", "/", "", "datanodes", 12, 12, false},
+        {"datanodes.co", "/", "", "datanodes", 12, 12, false},
+        {"filekeeper.net", "/f/", "", "filekeeper", 32, 32, false},
+        {"datavaults.co", "/f/", "", "datavaults", 32, 32, false},
+        {"filekeeper.net", "/", "", "filekeeper", 6, 64, true},
+        {"datavaults.co", "/", "", "datavaults", 6, 64, true},
+        {"archive.org", "/details/", "", "archive", 1, 120, true},
+    };
+    for (size_t i = 0; i < sizeof pages / sizeof *pages; i++) {
+        size_t prefix = strlen(pages[i].prefix);
+        if ((size_t)(path - host) != strlen(pages[i].host) ||
+            memcmp(host, pages[i].host, (size_t)(path - host)) ||
+            strncmp(path, pages[i].prefix, prefix)) continue;
+        const char *id = path + prefix;
+        size_t n = page_id(id, pages[i].punctuation);
+        if (!strcmp(pages[i].provider, "archive"))
+            n = strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-");
+        if (n < pages[i].min || n > pages[i].max ||
+            (!strcmp(pages[i].provider, "archive") && (*id == '.' || strstr(id, "..")))) return "";
+        if (strcmp(pages[i].provider, "rapidgator"))
+            return !strcmp(id + n, pages[i].suffix) ? pages[i].provider : "";
+        if (strspn(id, "0123456789abcdefABCDEF") != n || id[n] != '/') return "";
+        const char *name = id + n + 1;
+        size_t length = strlen(name);
+        char decoded[160];
+        if (length <= 5 || strcmp(name + length - 5, ".html") ||
+            strpbrk(name, "/?#") || !provider_percent_decode(name, length, decoded, sizeof decoded) ||
+            !filename_valid(decoded) || strpbrk(decoded, "?#%")) return "";
+        return pages[i].provider;
+    }
     return "";
 }
 
+static bool legacy_opaque_url(const char *url) {
+#ifdef ORBIT_TEST
+    if (!strncmp(url, "http://127.0.0.1:", 17)) return true;
+#endif
+    char host[254];
+    if (!url_host(url, host, sizeof host)) return false;
+    const char *legacy[] = {"mediafire.com", "pixeldrain.com", "gofile.io", "mega.nz", "gamedrive.org"};
+    for (size_t i = 0; i < sizeof legacy / sizeof *legacy; i++)
+        if (!strcmp(host, legacy[i])) return true;
+    return false;
+}
+
+static void canonical_page(char *url) {
+    if (strchr(url, '?')) return;
+    size_t n = strlen(url);
+    if (n && url[n - 1] == '/') {
+        url[n - 1] = 0;
+        if (!*remote_browser_provider(url)) url[n - 1] = '/';
+    }
+    const char *prefixes[] = {"https://filekeeper.net/", "https://datavaults.co/", "https://datanodes.to/"};
+    for (size_t i = 0; i < sizeof prefixes / sizeof *prefixes; i++) {
+        size_t length = strlen(prefixes[i]);
+        if (strncmp(url, prefixes[i], length)) continue;
+        char *decoration = strchr(url + length, '/');
+        if (!decoration || strchr(decoration + 1, '/')) return;
+        char filename[160];
+        Release file = {0};
+        if (!remote_url_filename(url, filename, sizeof filename) || remote_file_format(&file, filename)) return;
+        *decoration = 0;
+        if (!*remote_browser_provider(url)) *decoration = '/';
+        return;
+    }
+}
+
 static bool normalize_url(const char *raw, char *url, size_t cap) {
+    if (strlen(raw) >= cap || !strncmp(raw, "https://1fichier.com?", 21) ||
+        strpbrk(raw, "\\#") || strstr(raw, "/../") ||
+        strstr(raw, "/./")) return false;
+    for (const unsigned char *p = (const void *)raw; *p; p++)
+        if (*p < 32 || *p == 127) return false;
     CURLU *parts = curl_url();
-    char *normalized = NULL;
+    char *normalized = NULL, *port = NULL;
     bool ok = parts && !strpbrk(raw, "\\#\t\r\n") &&
               !curl_url_set(parts, CURLUPART_URL, raw, CURLU_DISALLOW_USER | CURLU_ALLOW_SPACE | CURLU_URLENCODE) &&
+              (curl_url_get(parts, CURLUPART_PORT, &port, 0) == CURLUE_NO_PORT
+#ifdef ORBIT_TEST
+               || !strncmp(raw, "http://127.0.0.1:", 17)
+#endif
+              ) &&
               !curl_url_get(parts, CURLUPART_URL, &normalized, 0) &&
               strlen(normalized) < cap && remote_https_url(normalized);
-    if (ok) copy_text(url, cap, normalized);
+    if (ok) {
+        copy_text(url, cap, normalized);
+        canonical_page(url);
+    }
+    curl_free(port);
     curl_free(normalized);
     curl_url_cleanup(parts);
     return ok;
@@ -358,21 +481,42 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     copy_text(r->remote_catalog_id, sizeof r->remote_catalog_id, source_id);
     copy_text(r->source, sizeof r->source, "remote");
 
-    bool padrino = padrino_release(r);
-    const char *label = json_text(link, "name"), *kind = json_text(link, "format");
+    const char *label = json_text(link, "label"), *provider = json_text(link, "name");
+    const char *kind = json_text(link, "format");
+    if (!*label) label = provider;
+    if (multipart_label(label) || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "multipart")) ||
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "multipart"))) return 2;
+    const char *part_fields[] = {"part", "volume", "partNumber", "volumeNumber"};
+    for (size_t i = 0; i < sizeof part_fields / sizeof *part_fields; i++) {
+        const cJSON *part = cJSON_GetObjectItemCaseSensitive(link, part_fields[i]);
+        if (!part) part = cJSON_GetObjectItemCaseSensitive(entry, part_fields[i]);
+        if ((cJSON_IsNumber(part) && part->valuedouble > 0) ||
+            (cJSON_IsString(part) && *part->valuestring)) return 2;
+    }
     const char *format = json_text(entry, "format"), *category = json_text(entry, "category");
-    if (unsupported_label(label, padrino) || unsupported_label(kind, padrino)) return 1;
-    const char *hint = label_format(kind, padrino);
-    if (!*hint) hint = label_format(label, padrino);
+    if (unsupported_label(label) || unsupported_label(kind) ||
+        unsupported_label(json_text(link, "compression")) || unsupported_label(json_text(link, "assetCompression")) ||
+        unsupported_label(json_text(entry, "compression")) || unsupported_label(json_text(entry, "assetCompression"))) return 1;
+    const char *hint = label_format(kind);
+    if (!*hint) hint = label_format(label);
     if (!*hint) {
-        if (unsupported_label(format, padrino) || unsupported_label(category, padrino)) return 1;
-        hint = label_format(*format ? format : category, padrino);
+        if (unsupported_label(format) || unsupported_label(category)) return 1;
+        hint = label_format(*format ? format : category);
         if (*format && !*hint && strcasecmp(format, "Unknown") && strcasecmp(format, "Unknown file type")) return 1;
     }
     copy_text(r->format, sizeof r->format, hint);
     if (*label && strlen(label) < sizeof r->remote_label && utf8_text(label))
         copy_text(r->remote_label, sizeof r->remote_label, label);
 
+    if (!field(link, "version", r->remote_version, sizeof r->remote_version) ||
+        (!r->remote_version[0] && !field(entry, "version", r->remote_version, sizeof r->remote_version)) ||
+        !field(link, "region", r->remote_region, sizeof r->remote_region) ||
+        (!r->remote_region[0] && !field(entry, "region", r->remote_region, sizeof r->remote_region))) return -1;
+    const char *source_page = json_text(link, "sourcePage");
+    if (!*source_page) source_page = json_text(entry, "downloadSource");
+    if (*source_page && !strchr(source_page, '?') && remote_https_url(source_page) &&
+        strlen(source_page) < sizeof r->remote_source_page)
+        copy_text(r->remote_source_page, sizeof r->remote_source_page, source_page);
     char filename[sizeof r->filename] = "", path_name[sizeof r->filename] = "";
     if (!field(entry, "title", r->title, sizeof r->title) ||
         !field(entry, "titleId", r->title_id, sizeof r->title_id) ||
@@ -390,6 +534,8 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         snprintf(r->title_id, sizeof r->title_id, "P%c%s", pspkg[2], id + 6);
     }
     if (!identifier(r->title_id)) return -1;
+    if (*filename && unsupported_label(filename)) return 1;
+    if (*filename && multipart_label(filename)) return 2;
     const char *platform = json_text(entry, "platform");
     if (!*platform && pspkg) platform = pspkg;
     if ((*platform && strcasecmp(platform, "PS4") && strcasecmp(platform, "PS5")) ||
@@ -402,9 +548,11 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     if (strchr(url, '#')) return 1; /* Browser-only containers need a provider adapter. */
     if (!normalize_url(url, r->url, sizeof r->url)) return -1;
     bool has_path = remote_url_filename(r->url, path_name, sizeof path_name);
-    if (has_path && unsupported_label(path_name, padrino)) return 1;
+    if (has_path && unsupported_label(path_name)) return 1;
+    if (has_path && multipart_label(path_name)) return 2;
     if (!strcmp(r->url, "https://datanodes.to/download")) return 1;
-    bool gated = pspkg && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"));
+    const char *page_provider = remote_browser_provider(r->url);
+    bool gated = pspkg && !strcmp(page_provider, "pspkg");
     if (gated) {
         const char *source = strstr(json_text(entry, "description"), "\nSource: ");
         if (!source) return -1;
@@ -416,23 +564,36 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         game[end - source] = 0;
         if (!pspkg_page_matches(game, r->url)) return -1;
     }
-    bool hosted = gated || (padrino && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"))) ||
-                  remote_metadata_url(r->url) || *remote_browser_provider(r->url) ||
+    bool hosted = gated || remote_metadata_url(r->url) ||
                   !strncmp(r->url, "https://www.mediafire.com/file/", 31);
+    if ((!hosted && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "page"))) ||
+        (!gated && !strcmp(page_provider, "pspkg"))) return -1;
     int result = remote_file_format(r, *filename ? filename : has_path ? path_name : "");
     if (result > 0) return result;
+    if (!hosted && result < 0 && !legacy_opaque_url(r->url)) return -1;
     if (result < 0 || hosted) {
         /* Opaque routes are resolved only after the option is selected. */
         if (strlen(r->url) >= sizeof r->browser_url) return -1;
         copy_text(r->browser_url, sizeof r->browser_url, r->url);
         memset(r->url, 0, sizeof r->url);
+        if (*filename) copy_text(r->remote_filename, sizeof r->remote_filename, filename);
+        r->remote_filename_synthetic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(link, "syntheticFilename"));
         memset(r->filename, 0, sizeof r->filename);
+        const char *archive = json_text(link, "compression");
+        if (!*archive) archive = json_text(entry, "compression");
+        if (!*archive) archive = token(kind, "7z") || token(label, "7z") ? "7z" :
+                                 token(kind, "rar") || token(label, "rar") ? "rar" :
+                                 token(kind, "zip") || token(label, "zip") ? "zip" : "";
+        if (!strcasecmp(archive, "zip") || !strcasecmp(archive, "rar") || !strcasecmp(archive, "7z")) {
+            copy_text(r->compression, sizeof r->compression, archive);
+            for (char *p = r->compression; *p; p++) *p = (char)tolower((unsigned char)*p);
+        }
         r->remote_page = true;
         if (!bytes(link, "sizeBytes", &r->display_size) ||
             (!r->display_size && !bytes(entry, "sizeBytes", &r->display_size))) return -1;
         if (!r->format[0]) copy_text(r->format, sizeof r->format, "Unknown");
     } else {
-        const cJSON *file = *filename ? entry : link;
+        const cJSON *file = *filename && !*json_text(link, "filename") ? entry : link;
         if (!field(file, "checksum", r->sha256, sizeof r->sha256) ||
             (!r->sha256[0] && !field(file, "sha256", r->sha256, sizeof r->sha256)) ||
             !bytes(file, "sizeBytes", &r->size) || !bytes(file, "extractedBytes", &r->extracted_size))
@@ -444,12 +605,75 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         for (char *p = r->sha256; *p; p++)
             if (*p >= 'A' && *p <= 'F') *p += 'a' - 'A';
     }
-    if (padrino && (!bytes(link, "sizeEstimateBytes", &r->display_size) ||
+    if (!bytes(link, "sizeEstimateBytes", &r->display_size) ||
         ((r->remote_page || r->compression[0]) &&
-         !field(link, "archivePassword", r->archive_password, sizeof r->archive_password)))) return -1;
+         !field(link, "archivePassword", r->archive_password, sizeof r->archive_password))) return -1;
     if (!valid(r)) return -1;
     identify(r);
     return 0;
+}
+
+static void diagnostic_url(cJSON *row, const char *field, const char *url) {
+    if (!*url) return;
+    char host[254];
+    if (*remote_browser_provider(url)) cJSON_AddStringToObject(row, field, url);
+    else if (url_host(url, host, sizeof host)) cJSON_AddStringToObject(row, field, host);
+    else cJSON_AddStringToObject(row, field, "[invalid URL]");
+}
+
+cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_id) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+    cJSON_AddStringToObject(root, "source", source_id);
+    cJSON_AddStringToObject(root, "discovery", entry ? "discovered" : "not-in-cached-index");
+    cJSON *rows = cJSON_AddArrayToObject(root, "links");
+    const cJSON *link, *links = cJSON_GetObjectItemCaseSensitive(entry, "downloadLinks");
+    unsigned count = 0;
+    cJSON_ArrayForEach(link, links) {
+        if (count++ == 64) {
+            cJSON_AddTrueToObject(root, "truncated");
+            break;
+        }
+        cJSON *row = cJSON_CreateObject();
+        if (!row) break;
+        const char *url = json_text(link, "url");
+        diagnostic_url(row, "rawUrl", url);
+        char normalized[2048];
+        bool normalized_ok = normalize_url(url, normalized, sizeof normalized);
+        cJSON_AddBoolToObject(row, "normalized", normalized_ok);
+        if (normalized_ok) diagnostic_url(row, "normalizedUrl", normalized);
+        const char *fields[] = {"name", "label", "format", "compression", "assetCompression",
+                                "part", "volume", "multipart", "version", "region", "filename", "sizeEstimateBytes"};
+        for (size_t i = 0; i < sizeof fields / sizeof *fields; i++) {
+            const cJSON *value = cJSON_GetObjectItemCaseSensitive(link, fields[i]);
+            if (cJSON_IsNumber(value) || cJSON_IsBool(value) ||
+                (cJSON_IsString(value) && strlen(value->valuestring) < 256))
+                cJSON_AddItemToObject(row, fields[i], cJSON_Duplicate(value, true));
+        }
+        Release mapped;
+        int result = source_package(entry, source_id) ? map_link(entry, link, source_id, &mapped) : 3;
+        const char *reason = result == 2 ? "multipart" : result == 1 ? "unsupported-format" :
+            result == 3 ? "wrong-platform-or-section" : result ? "invalid-url-or-fields" : "";
+        const Release *installed = result ? NULL : release_find(mapped.id);
+        bool enabled = installed && remote_source_enabled_locked(installed);
+        bool visible = enabled;
+        if (enabled && installed->mirror_key[0]) {
+            Release first;
+            if (remote_next_mirror_locked(installed, "", &first) && strcmp(first.id, installed->id) < 0)
+                visible = false;
+        }
+        cJSON_AddStringToObject(row, "importResult", "in-cache");
+        cJSON_AddStringToObject(row, "filterReason", reason);
+        cJSON_AddStringToObject(row, "mapResult", result ? "rejected" : installed ? "retained" : "not-retained");
+        if (installed) {
+            cJSON_AddStringToObject(row, "releaseId", installed->id);
+            cJSON_AddStringToObject(row, "mirrorGroup", installed->mirror_key);
+        }
+        cJSON_AddBoolToObject(row, "visible", visible);
+        cJSON_AddBoolToObject(row, "metadataEligible", enabled && remote_metadata_option(installed));
+        cJSON_AddItemToArray(rows, row);
+    }
+    return root;
 }
 
 int pegasus_entry_to_release(const cJSON *entry, const char *source_id, Release *r) {
@@ -528,7 +752,6 @@ int padrino_catalog_load(Release **releases, size_t *count, time_t *snapshot_at)
         cJSON_ArrayForEach(link, links)
             if (!map_link(game, link, PADRINO_SOURCE, &rows[used])) used++;
         if (before < used) titles[title_count++] = game;
-        cJSON_DeleteItemFromObjectCaseSensitive(game, "downloadLinks");
     }
     if (!used) goto fail;
     qsort(rows, used, sizeof *rows, compare_releases);
@@ -576,11 +799,30 @@ static const struct {
     {{"1fichier.com"}, {"1fichier com", "1fichier"}},
     {{"archive.org"}, {"archive org", "archive"}},
     {{"mediafire.com"}, {"mediafire com", "mediafire"}},
+    {{"buzzheavier.com"}, {"buzzheavier com", "buzzheavier"}},
+    {{"rapidgator.net"}, {"rapidgator net", "rapidgator"}},
+    {{"datavaults.co"}, {"datavaults co", "datavaults"}},
 };
 
 static int mirror_variant(const Release *r, char *out, size_t cap) {
     char host[254];
     if (!remote_link_host(r, host, sizeof host)) return -1;
+#ifdef ORBIT_TEST
+    /* Fixtures use one loopback server while retaining independent provider
+     * identities for the mirror grouping and queue tests. */
+    const char *url = provider_torbox_url(r);
+    if (!strcmp(host, "127.0.0.1")) {
+        const char *path = strchr(url + 17, '/');
+        if (path && !strncmp(path, "/metadata/", 10)) {
+            path += 10;
+            const size_t length = strcspn(path, "/");
+            if (path[length] == '/' && length < sizeof host) {
+                memcpy(host, path, length);
+                host[length] = 0;
+            }
+        }
+    }
+#endif
     size_t provider = 0;
     for (; provider < sizeof mirror_providers / sizeof *mirror_providers; provider++) {
         const char *const *domains = mirror_providers[provider].domains;
@@ -649,14 +891,14 @@ static void group_package_mirrors(MirrorOption *rows, size_t count) {
         const Release *r = rows[i].release;
         if (i && !strcmp(rows[i - 1].release->id, r->id)) continue;
         unsigned provider = 1u << rows[i].provider;
-        const char *filename = json_text(rows[i].origin.link, "filename");
+        const char *filename = r->remote_filename_synthetic ? "" : r->remote_filename;
         if ((providers & provider) || strcmp(first->format, r->format) ||
+            strcmp(first->remote_version, r->remote_version) || strcmp(first->remote_region, r->remote_region) ||
             (size && r->display_size && size != r->display_size) ||
-            (*compression && r->compression[0] && strcmp(compression, r->compression)) ||
-            (*name && *filename && strcmp(name, filename))) return;
+            (i && (strcmp(compression, r->compression) || strcmp(name, filename)))) return;
         if (r->display_size) size = r->display_size;
-        if (r->compression[0]) compression = r->compression;
-        if (*filename) name = filename;
+        compression = r->compression;
+        name = filename;
         providers |= provider;
         used += (size_t)snprintf(identity + used, sizeof identity - used, "%s/", r->id);
     }
@@ -670,9 +912,10 @@ static void identify_mirrors(Release *releases, const OptionOrigin *origin, size
     for (size_t i = 0; i < count; i++) {
         Release *r = &releases[i];
         if (r->sha256[0]) {
-            char identity[160];
-            snprintf(identity, sizeof identity, "file/%s/%s/%s/%s/%lld",
-                r->title_id, r->format, r->compression, r->sha256, (long long)r->size);
+            char identity[384];
+            snprintf(identity, sizeof identity, "file/%s/%s/%s/%s/%lld/%s/%s/%s",
+                r->title_id, r->format, r->compression, r->sha256, (long long)r->size,
+                r->remote_version, r->remote_region, r->filename);
             mirror_hash(r, identity);
             continue;
         }
@@ -736,7 +979,7 @@ static size_t retain_choices(Release *releases, size_t count) {
     size_t visible = 0, alternate = 0;
     for (size_t i = 0; i < count && visible < REMOTE_PACKAGE_LIMIT; i++)
         if (!selection[i].rank) { selection[i].keep = true; visible++; }
-    for (size_t rank = 1; rank <= 2 && alternate < REMOTE_MIRROR_RESERVE; rank++)
+    for (size_t rank = 1; rank < grouped && alternate < REMOTE_MIRROR_RESERVE; rank++)
         for (size_t i = 0; i < count && alternate < REMOTE_MIRROR_RESERVE; i++)
             if (selection[i].rank == rank && selection[selection[i].first].keep) {
                 selection[i].keep = true;
@@ -771,17 +1014,19 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
         cJSON_Delete(root);
         return -1;
     }
+    size_t visible_limit = pspkg_platform(source_id) ? PSPKG_INDEX_LIMIT : REMOTE_PACKAGE_LIMIT;
+    size_t scan_limit = pspkg_platform(source_id) ? visible_limit : REMOTE_SCAN_LIMIT;
     size_t capacity = 0, package_count = (size_t)cJSON_GetArraySize(packages);
     struct { const cJSON *next, *first; } *remaining =
         calloc(package_count ? package_count : 1, sizeof *remaining);
-    OptionOrigin *origins = calloc(REMOTE_SCAN_LIMIT, sizeof *origins);
+    OptionOrigin *origins = calloc(scan_limit, sizeof *origins);
     if (!remaining || !origins) goto failed;
     size_t i = 0;
     cJSON_ArrayForEach(entry, packages) {
         if (!source_package(entry, source_id)) { i++; continue; }
         const cJSON *links = cJSON_GetObjectItemCaseSensitive(entry, "downloadLinks"), *link;
         bool unsupported = false;
-        if (cJSON_IsArray(links) && *count < REMOTE_PACKAGE_LIMIT) {
+        if (cJSON_IsArray(links) && *count < visible_limit) {
             Release first;
             int best = -1;
             cJSON_ArrayForEach(link, links) {
@@ -807,7 +1052,7 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
     }
     /* Visit the mirrors in rounds, so the largest entries cannot use the
      * source limit before the other titles get a second choice. */
-    while (*count < REMOTE_SCAN_LIMIT) {
+    while (*count < scan_limit) {
         bool more = false;
         i = 0;
         cJSON_ArrayForEach(entry, packages) {
@@ -823,12 +1068,12 @@ int remote_catalog_parse(const char *body, size_t length, const char *source_id,
             }
             remaining[i++].next = link;
             more |= link != NULL;
-            if (*count == REMOTE_SCAN_LIMIT) break;
+            if (*count == scan_limit) break;
         }
         if (!more) break;
     }
     identify_mirrors(*releases, origins, *count);
-    *count = retain_choices(*releases, *count);
+    if (!pspkg_platform(source_id)) *count = retain_choices(*releases, *count);
     free(origins);
     free(remaining);
     cJSON_Delete(root);

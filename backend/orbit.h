@@ -39,9 +39,12 @@ typedef struct {
     char source[16], game_id[64], platform[8];
     char addon_id[64], base_game_id[64], base_title[128], addon_type[24], content_id[64];
     char requirements[2048]; /* JSON snapshot of the selected DLC edition's requirements. */
-    char browser_url[128];
+    char browser_url[256];
     char remote_catalog_id[25]; /* Empty for built-in download providers. */
     char remote_label[128]; /* Download link label from a community catalogue. */
+    char remote_version[32], remote_region[32], remote_filename[160], remote_source_page[256];
+    bool remote_filename_synthetic;
+    char remote_provider_page[256]; /* Public provider selected for a PSPKG job. */
     char mirror_key[65]; /* Shared identity of verified community mirrors, when available. */
     bool remote_page; /* Stable catalogue identity is the selected provider page. */
     char compression[8]; /* "zip", "7z" or "rar"; empty for a plain file. */

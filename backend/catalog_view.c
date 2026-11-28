@@ -124,13 +124,13 @@ static size_t first_mirror(const Release *const *rows, size_t count, const char 
 static bool describe_mirrors(cJSON *entry, const Release *r, const Release *const *group, size_t count) {
     char host[254];
     if (remote_link_host(r, host, sizeof host) && !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
-    bool metadata = remote_page_pending(r) && remote_metadata_url(r->browser_url);
+    bool metadata = remote_metadata_option(r);
     if (count > 1) {
         cJSON *hosts = cJSON_AddArrayToObject(entry, "torboxHosts");
         if (!hosts || !cJSON_AddNumberToObject(entry, "mirrorCount", (double)count)) return false;
         for (size_t i = 0; i < count; i++) {
             const Release *mirror = group[i];
-            metadata |= remote_page_pending(mirror) && remote_metadata_url(mirror->browser_url);
+            metadata |= remote_metadata_option(mirror);
             if (!remote_link_host(mirror, host, sizeof host)) continue;
             bool duplicate = false;
             const cJSON *item;
@@ -180,6 +180,9 @@ static bool append_remote_locked(cJSON *out) {
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteCatalogId");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remoteLabel");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "sourcePage");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "providerPage");
+        cJSON_DeleteItemFromObjectCaseSensitive(entry, "syntheticFilename");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "mirrorKey");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "remotePage");
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "sha256");

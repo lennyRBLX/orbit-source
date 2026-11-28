@@ -22,7 +22,7 @@ static struct {
     atomic_bool cancel;
     char id[33], state[16], message[256], job_id[33], title[128], client_id[65];
     char queued_job_id[sizeof ((Job *)0)->id];
-    char mirror_page[128];
+    char mirror_page[sizeof ((Release *)0)->browser_url];
     char native_failure[256];
     char pspkg_release_id[sizeof ((Release *)0)->id];
     PspkgLink pspkg_links[PSPKG_LINK_LIMIT], pspkg_selected;
@@ -506,7 +506,7 @@ static void download_pspkg(void) {
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
     if (ok) {
         if (*provider) {
-            copy_text(route.browser_url, sizeof route.browser_url, locator.url);
+            copy_text(route.remote_provider_page, sizeof route.remote_provider_page, locator.url);
             route.url[0] = 0;
         } else {
             pthread_mutex_lock(&orbit.mutex);
@@ -534,9 +534,14 @@ static void download_pspkg(void) {
     pthread_mutex_unlock(&orbit.mutex);
     if (ok && *provider && !queued && active()) {
         Release provider_page = route;
-        copy_text(provider_page.source, sizeof provider_page.source, provider);
-        copy_text(provider_page.url, sizeof provider_page.url, route.browser_url);
-        ok = capture(&provider_page, &route, etag, modified, &validated, error, sizeof error);
+        if (provider_browser_source(provider)) {
+            copy_text(provider_page.source, sizeof provider_page.source, provider);
+            copy_text(provider_page.browser_url, sizeof provider_page.browser_url, route.remote_provider_page);
+            copy_text(provider_page.url, sizeof provider_page.url, route.remote_provider_page);
+            ok = capture(&provider_page, &route, etag, modified, &validated, error, sizeof error);
+        } else {
+            validated = ok = !remote_download_resolve(&route, &provider_page, &session.cancel, error, sizeof error);
+        }
         if (ok && !validated) {
             copy_text(error, sizeof error, "The provider file could not be verified.");
             ok = false;

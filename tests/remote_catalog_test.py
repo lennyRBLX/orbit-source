@@ -176,7 +176,9 @@ class RemoteCatalogueTests(unittest.TestCase):
             self.assertEqual(mapped["format"], "PKG")
             self.assertEqual(mapped["platform"], "ps5")
             self.assertEqual(mapped["sizeBytes"], 0)
-            self.assertEqual(service.command("map", entry=unsupported), 1)
+            self.assertEqual(service.command("map", entry=unsupported)["format"], "FFPFSC")
+            excluded = dict(unsupported, format="ZSTD")
+            self.assertEqual(service.command("map", entry=excluded), 1)
 
             ps4 = dict(valid, category="FPKG", titleId="CUSA01010", sizeBytes=128,
                        filename="example.pkg", downloadSource="https://example.org/release")
@@ -190,7 +192,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 with self.subTest(suffix=suffix):
                     folder = dict(valid, filename=f"game.{suffix}", category="Game folder", extractedBytes=41)
                     self.assertEqual(service.command("map", entry=folder)["compression"], suffix)
-            self.assertEqual(service.command("map", entry=dict(valid, filename="game.7z")), 1)
+            self.assertEqual(service.command("map", entry=dict(valid, filename="game.7z"))["compression"], "7z")
             for errors in (
                 {"titleId": "../bad"},
                 {"filename": "..\\unsafe.pkg"},
@@ -229,7 +231,7 @@ class RemoteCatalogueTests(unittest.TestCase):
 
                 for label in ("Folder · LZ4", "FpKg / ZsTd", "FPKG · PFS", "exFAT"):
                     self.assertEqual(service.command("map", entry=entry("/game.zip", label)), 1)
-                for suffix in (".7z", ".rar.001", ".part2.rar", ".exfat"):
+                for suffix in (".rar.001", ".part2.rar"):
                     self.assertEqual(service.command("map", entry=entry("/game" + suffix, "Mirror")), 1)
                 direct = service.command("map", entry=entry("/game.zip", "Mirror"))
                 self.assertEqual((direct["format"], direct["compression"]), ("Game folder", "zip"))
@@ -393,6 +395,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 )
                 self.assertEqual(service.command("metadata", ids=ids), result)
                 self.assertEqual(sum(path.startswith("/metadata/") for path in server.paths), 4)
+                self.assertEqual({row["status"] for row in result["options"]}, {"found", "missing"})
         finally:
             server.shutdown()
             server.server_close()
@@ -442,7 +445,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 for row in rows:
                     self.assertNotIn("mirrorKey", row)
                     by_title.setdefault(row["titleId"], []).append(row)
-                self.assertEqual([len(by_title[f"PPSA{i:05d}"]) for i in range(1, 8)], [2, 3, 2, 2, 2, 2, 2])
+                self.assertEqual([len(by_title.get(f"PPSA{i:05d}", [])) for i in range(1, 8)], [2, 3, 2, 2, 0, 2, 2])
                 base = next(row for row in by_title["PPSA00001"] if row.get("mirrorCount"))
                 self.assertEqual(base["mirrorCount"], 2)
                 self.assertCountEqual(base["torboxHosts"], ["akirabox.to", "vikingfile.com"])
@@ -494,13 +497,20 @@ class RemoteCatalogueTests(unittest.TestCase):
             self.assertEqual(service.command("parse", source="pspkg-ps5",
                                              feed={"packages": [arabic]})["releases"], [])
 
-    def test_pspkg_public_game_links_exclude_update_and_backport_sections(self):
-        html = ("<div>Game PKG <a href=\"https://vikingfile.com/f/game123\">Download</a></div>"
-                "<div>Update PKG <a href=\"https://vikingfile.com/f/update123\">Download</a></div>"
-                "<div>Backport PKG <a href=\"https://example.org/backport.pkg\">Download</a></div>")
+    def test_pspkg_links_keep_prefilter_edition_and_part_diagnostics(self):
+        html = ('<h3>Game PKG PPSA12345 v2.31 EUR 54.25 GB</h3>'
+                '<a href="https://vikingfile.com/f/game123456">VikingFile</a>'
+                '<a href="https://rootz.so/d/mirror">Rootz</a>'
+                '<h3>Game PKG ZSTD</h3><a href="https://datanodes.to/abcd12345678">Download</a>'
+                '<h3>Game PKG</h3><a href="https://filekeeper.net/abcd12345678">Part 1</a>'
+                '<h3>Update PKG</h3><a href="https://rootz.so/d/update">Update</a>')
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
             links = service.command("pspkg-links", html=html)
-            self.assertEqual([link["url"] for link in links], ["https://vikingfile.com/f/game123"])
+            self.assertEqual([row["filterReason"] for row in links],
+                             ["", "", "unsupported-format", "multipart", "unsupported-category"])
+            self.assertEqual(links[0]["titleId"], "PPSA12345")
+            self.assertEqual(links[0]["sizeEstimateBytes"], 54_250_000_000)
+            self.assertIn("ZSTD", links[2]["edition"])
 
     def test_pspkg_handoff_accepts_provider_pages_or_verifiable_file_candidates(self):
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
@@ -513,39 +523,231 @@ class RemoteCatalogueTests(unittest.TestCase):
             ):
                 self.assertEqual(service.command("pspkg-candidate", url=url), expected, url)
 
-    def test_pspkg_scan_fetches_general_ps5_and_ps4_pages(self):
+    def test_pspkg_job_persists_stable_page_and_separate_provider(self):
+        url = "https://pspkg.com/ps5/download-cyberpunk-fixture-123.html"
+        entry = {"id": "pspkg-012345abcdef", "category": "PS5", "title": "Cyberpunk 2077",
+                 "description": "Public PSPKG index.\nSource: https://pspkg.com/ps5/cyberpunk-fixture-123.html\n",
+                 "downloadLinks": [{"url": url, "name": "PSPKG", "page": True}]}
+        provider = "https://buzzheavier.com/fixture12345"
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            saved = service.command("pspkg-job-page", source="pspkg-ps5", entry=entry, url=provider)
+            self.assertTrue(saved["valid"])
+            self.assertEqual((saved["browserUrl"], saved["providerPage"], saved["torboxUrl"]),
+                             (url, provider, provider))
+            self.assertFalse(service.command("pspkg-job-page", source="pspkg-ps5", entry=entry,
+                                             url=provider + "?private=secret")["valid"])
+
+    def test_pspkg_indexes_discover_older_games_and_keep_platforms_separate(self):
         server = FixtureServer()
+        html = {"Content-Type": "text/html"}
         for platform in ("ps5", "ps4"):
-            server.downloads[f"/{platform}/?page=1"] = (200, {"Content-Type": "text/html"},
-                (f'<a href="/{platform}/sample-game-123.html">Sample</a>'
-                 '<a href="/arabic-games/arabic-game-456.html">Arabic</a>').encode())
-            public = (b'<div>Game PKG <a href="https://vikingfile.com/f/game123">Download</a></div>'
-                      if platform == "ps5" else b'<p>Downloads require verification</p>')
-            server.downloads[f"/{platform}/sample-game-123.html"] = (200, {"Content-Type": "text/html"},
-                b'<h1>Sample &amp; Game</h1>' + public)
+            title = "Cyberpunk 2077 Ultimate Edition" if platform == "ps5" else "Cyberpunk 2077"
+            entries = "".join(f'<a href="/{platform}/old-game-{i}.html">{i} Game {i} 2026/01/02</a>'
+                              for i in range(1, 270))
+            entries += (f'<a href="/{platform}/cyberpunk-fixture-999.html">270 {title} 2025/11/22</a>'
+                        '<a href="/arabic-games/arabic-game-456.html">Arabic</a>'
+                        '<a href="/ps3/not-this-game-456.html">Other platform</a>')
+            server.downloads[f"/{platform}/{platform}-games-list"] = (200, html, entries.encode())
+            response = (b'<h2>Game PKG</h2><p>Awaiting verification</p>' if platform == "ps5" else
+                        b'<h2>Game FPKG</h2><p>Links will appear here.</p>')
+            server.downloads[f"/{platform}/download-cyberpunk-fixture-999.html?id=999"] = (200, html, response)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
                 service.command("policy", remote=True, notice=True)
-                for platform in ("ps5", "ps4"):
-                    result = service.command("pspkg-scan", source=f"pspkg-{platform}",
-                                             url=server.url.replace("/catalogue.json", f"/{platform}/"),
-                                             listingLimit=1, gameLimit=3)
-                    self.assertEqual((result["error"], result["discovered"]), ("", 1))
+                for platform, status in (("ps5", "interactive-verification"), ("ps4", "parse-no-size")):
+                    base = server.url.replace("/catalogue.json", f"/{platform}/")
+                    result = service.command("pspkg-scan", source=f"pspkg-{platform}", url=base, gameLimit=400)
+                    self.assertEqual((result["error"], result["discovered"], result["truncated"]), ("", 270, False))
+                    self.assertEqual(server.paths[-1], f"/{platform}/{platform}-games-list")
                     packages = result["feed"]["packages"]
-                    self.assertEqual(len(packages), 1)
-                    self.assertEqual(packages[0]["title"], "Sample & Game")
-                    self.assertEqual(packages[0]["category"], platform.upper())
-                    links = packages[0]["downloadLinks"]
-                    self.assertEqual(len(links), 2 if platform == "ps5" else 1)
-                    self.assertEqual(links[-1], {
-                        "name": "PSPKG",
-                        "url": f"{server.url.replace('/catalogue.json', f'/{platform}/')}download-sample-game-123.html?id=123",
-                        "page": True,
-                    })
-                    if platform == "ps5":
-                        self.assertEqual(links[0]["url"], "https://vikingfile.com/f/game123")
+                    self.assertTrue(all(row["category"] == platform.upper() for row in packages))
+                    game = packages[-1]
+                    self.assertTrue(game["title"].startswith("Cyberpunk 2077"))
+                    self.assertNotIn("2025", game["title"])
+                    url = game["downloadLinks"][0]["url"]
+                    self.assertEqual(url, base + "download-cyberpunk-fixture-999.html?id=999")
+                    self.assertEqual(len(service.command("parse", source=f"pspkg-{platform}",
+                                                      feed={"packages": [game]})["releases"]), 1)
+                    metadata = service.command("metadata-page", url=url)
+                    self.assertEqual(metadata["status"], status)
+                    self.assertEqual(metadata["links"], [])
+                    capped = service.command("pspkg-scan", source=f"pspkg-{platform}", url=base, gameLimit=8)
+                    self.assertTrue(capped["truncated"])
+                    self.assertEqual(capped["discovered"], 8)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_provider_forms_and_consistent_cyberpunk_mapping(self):
+        fixture = json.loads((ROOT / "tests/fixtures/community-provider-pages.json").read_text())
+        with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+            for source_id, indexes in fixture["sources"].items():
+                for index in indexes:
+                    provider, url = fixture["providers"][index]
+                    with self.subTest(source=source_id, provider=provider, url=url):
+                        self.assertTrue(service.command("provider-page", url=url))
+                        if source_id.startswith("pspkg-"):
+                            continue
+                        entry = {"title": "Cyberpunk 2077", "titleId": "PPSA12345",
+                                 "downloadLinks": [{"name": provider, "url": url, "page": True}]}
+                        generic = service.command("map", entry=entry)
+                        padrino = service.command("map", entry=entry, padrino=True)
+                        self.assertEqual(generic["browserUrl"], padrino["browserUrl"])
+                        self.assertTrue(generic["remotePage"])
+            for url in (
+                'https://buzzheavier.com.evil.test/abc12345', 'https://user@buzzheavier.com/abc12345',
+                'https://buzzheavier.com:443/abc12345', 'https://buzzheavier.com/abc12345#',
+                'https://filekeeper.net/../abc12345', 'https://datanodes.to/abc12345\\danger',
+                'https://datanodes.to/abc12345\n', 'https://akirabox.com/short/file',
+                'https://rapidgator.net/file/0123456789abcdef0123456789abcdef/%2Funsafe.html',
+                'https://buzzheavier.com/' + 'a' * 2048,
+            ):
+                self.assertEqual(service.command("provider-page", url=url), "", url)
+            url = fixture["providers"][9][1]
+            for fields, reason in (
+                ({"label": "Game part 1"}, "multipart"), ({"volume": 1}, "multipart"),
+                ({"label": "Game - LZ4"}, "unsupported-format"), ({"compression": "ZSTD"}, "unsupported-format"),
+            ):
+                entry = {"title": "Cyberpunk 2077", "titleId": "PPSA12345",
+                         "downloadLinks": [{"url": url, **fields}]}
+                for source_id in ("dlps", "padrino", "pippo-exfat", "pfs"):
+                    row = service.command("replay", source=source_id, entry=entry)["links"][0]
+                    self.assertEqual((row["rawUrl"], row["filterReason"]), (url, reason))
+            entry = {"title": "Cyberpunk 2077", "titleId": "PPSA12345",
+                     "downloadLinks": [{"url": url, "label": "exFAT", "version": "2.31", "region": "EUR"}]}
+            for padrino in (True, False):
+                mapped = service.command("map", entry=entry, padrino=padrino)
+                self.assertEqual((mapped["format"], mapped["version"], mapped["region"]), ("exFAT", "2.31", "EUR"))
+
+    def test_html_size_fixtures_cover_provider_markup_units_and_failures(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        html = {"Content-Type": "text/html"}
+        cases = {
+            "buzz": ('<div class="size">1.48 GB</div>', 1_480_000_000),
+            "akira": ('<h1>Game.pkg</h1><span>1,25 GiB</span><aside class="premium-plan"><span class="size">2 TB</span></aside>', 1_342_177_280),
+            "fichier": ('<span class="tier-feat">100 MB</span>', 100_000_000),
+            "rootz": ('<main>23.5 gb</main>', 23_500_000_000),
+            "rapid": ('<p>File size: <b>1.5 TiB</b></p><p>Storage quota: 1 TB</p>', 1_649_267_441_664),
+            "data": ('<p>1.5 tb</p>', 1_500_000_000_000),
+            "filekeeper": ('<span>5 MiB</span>', 5_242_880),
+            "datavaults": ('<p>8.5 mB</p>', 8_500_000),
+        }
+        for name, (body, _) in cases.items():
+            server.downloads[f"/metadata/{name}"] = (200, html, body.encode())
+        server.downloads.update({
+            "/metadata/ambiguous": (200, html, b"<p>20 GB</p><p>40 GB</p>"),
+            "/metadata/exact": (200, html, b'<span data-size-bytes="54321">54.2 MB</span>'),
+            "/metadata/challenge": (403, {**html, "cf-mitigated": "challenge"}, b"File not found"),
+            "/metadata/missing": (404, html, b"Not here"),
+            "/metadata/redirect": (302, {"Location": "http://127.0.0.1:1/private"}, b""),
+            "/metadata/too-large": (200, html, b"<body>" + b"x" * (1024 * 1024)),
+        })
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name, (_, expected) in cases.items():
+                    result = service.command("metadata-page", url=f"{base}/metadata/{name}")
+                    self.assertEqual(result, {"status": "found", "exact": False, "sizeBytes": expected}, name)
+                self.assertEqual(service.command("metadata-page", url=f"{base}/metadata/exact"),
+                                 {"status": "found", "exact": True, "sizeBytes": 54321})
+                for name, status in (("ambiguous", "ambiguous-size"), ("challenge", "challenge"),
+                                     ("missing", "missing"), ("redirect", "redirected-to-invalid-host"), ("too-large", "page-too-large")):
+                    self.assertEqual(service.command("metadata-page", url=f"{base}/metadata/{name}")["status"], status)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_metadata_batches_cover_all_releases_on_selected_title(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        links = []
+        for i in range(42):
+            path = f"/metadata/option-{i}"
+            links.append({"name": f"Option {i}", "url": base + path})
+            server.downloads[path] = (200, {"Content-Type": "text/html"}, b"<p>File size: 1 GB</p>")
+        server.feed = {"packages": [{"title": "Cyberpunk 2077", "titleId": "PPSA12345", "downloadLinks": links}]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name in DEFAULTS:
+                    service.command("PATCH", id=name, enabled=False)
+                service.command("POST", url=server.url)
+                self.assertEqual(service.command("start"), 0)
+                service.command("policy", remote=True, notice=True)
+                service.idle()
+                rows = service.command("view")["remote"]
+                self.assertEqual(len(rows), 42)
+                self.assertFalse(any(path.startswith("/metadata/") for path in server.paths))
+                for start in range(0, len(rows), 32):
+                    batch = rows[start:start + 32]
+                    ids = ",".join(row["id"] for row in batch)
+                    deadline = time.monotonic() + 8
+                    while True:
+                        result = service.command("metadata", ids=ids)
+                        if not result["pending"] or time.monotonic() >= deadline:
+                            break
+                        time.sleep(.02)
+                    self.assertFalse(result["pending"])
+                    self.assertEqual(len(result["files"]), len(batch))
+                    self.assertEqual({row["status"] for row in result["options"]}, {"found"})
+                self.assertCountEqual([path for path in server.paths if path.startswith("/metadata/")],
+                                      [f"/metadata/option-{i}" for i in range(42)])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_metadata_checks_all_mirrors_and_repeated_urls_across_catalogues(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        first = "/metadata/akirabox.com/game"
+        second = "/metadata/vikingfile.com/game"
+        third = "/metadata/buzzheavier.com/game"
+        links = [{"url": base + path, "name": label} for path, label in
+                 ((first, "Game - AkiraBox"), (second, "Game - VikingFile"), (third, "Game - BuzzHeavier"))]
+        game = {"title": "Cyberpunk 2077", "titleId": "PPSA12345"}
+        server.feed = {"packages": [dict(game, downloadLinks=links)]}
+        server.feeds["/second.json"] = {"packages": [dict(game, downloadLinks=links[:1])]}
+        html = {"Content-Type": "text/html"}
+        server.downloads.update({
+            first: (403, {**html, "cf-mitigated": "challenge"}, b"Verify"),
+            second: (200, html, b"<p>File size: 1 GB</p>"),
+            third: (200, html, b'<p data-size-bytes="930000000">0.93 GB</p>'),
+        })
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for name in DEFAULTS:
+                    service.command("PATCH", id=name, enabled=False)
+                service.command("POST", url=server.url)
+                service.command("POST", url=base + "/second.json")
+                self.assertEqual(service.command("start"), 0)
+                service.command("policy", remote=True, notice=True)
+                service.idle()
+                rows = service.command("view")["remote"]
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(max(row.get("mirrorCount", 0) for row in rows), 3)
+                ids = ",".join(row["id"] for row in rows)
+                deadline = time.monotonic() + 8
+                while True:
+                    result = service.command("metadata", ids=ids)
+                    if not result["pending"] or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.02)
+                self.assertFalse(result["pending"])
+                self.assertEqual(len(result["options"]), 4)
+                self.assertEqual([row["status"] for row in result["options"]].count("challenge"), 2)
+                self.assertEqual([(row["sizeBytes"], row["exact"]) for row in result["files"]],
+                                 [(930_000_000, True)])
+                self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, first, second, third])
         finally:
             server.shutdown()
             server.server_close()
@@ -655,6 +857,7 @@ class RemoteCatalogueTests(unittest.TestCase):
         for name in DEFAULTS:
             self.assertEqual(service.command("PATCH", id=name, enabled=False)["status"], 200)
         good, unsupported = copy.deepcopy(FIXTURE["packages"])
+        unsupported["format"] = "ZSTD"
         attached = dict(good, titleId=service.first_game["titleId"], filename="game.zip",
                         category="Game folder", sizeBytes=37, extractedBytes=41,
                         downloadLinks=[{"url": "https://example.org/game.zip"}])

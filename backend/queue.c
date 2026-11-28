@@ -580,7 +580,9 @@ int job_create_pspkg_torbox_locked(const Release *r, const Storage *s,
     if (!r || !s || strcmp(r->source, "remote") || !remote_page_pending(r) ||
         (strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) &&
          strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE)) ||
-        !*remote_browser_provider(r->browser_url) || !debrid_link_covered_locked(r)) {
+        strcmp(remote_browser_provider(r->browser_url), "pspkg") ||
+        !r->remote_provider_page[0] || !*remote_browser_provider(r->remote_provider_page) ||
+        !strcmp(remote_browser_provider(r->remote_provider_page), "pspkg") || !debrid_link_covered_locked(r)) {
         copy_text(err, cap, "TorBox does not support this PSPKG provider.");
         return 409;
     }

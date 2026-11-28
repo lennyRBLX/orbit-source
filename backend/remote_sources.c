@@ -27,8 +27,8 @@
 #define REFRESH_COOLDOWN_MS 60000
 #define URL_LIMIT 2048
 #define REMOTE_RELEASE_LIMIT 12288
-#define METADATA_LIMIT 128
-#define METADATA_REQUEST_LIMIT 32
+#define METADATA_LIMIT 512
+
 
 /* Mirrors the Pegasus default-sources manifest, with a revision stored alongside
  * the user's choices. Future defaults are merged by id, never by enabled state. */
@@ -59,7 +59,8 @@ typedef struct {
     const char *error;
     bool enabled, built_in;
     time_t fetched;
-    size_t entries, skipped;
+    size_t entries, skipped, discovered;
+    bool truncated;
     unsigned long epoch;
 } RemoteSource;
 
@@ -82,6 +83,7 @@ typedef struct {
     enum MetadataState state;
     time_t expires;
     RemoteFileMetadata file;
+    cJSON *public_links;
 } MetadataRequest;
 
 static struct {
@@ -270,6 +272,9 @@ static cJSON *sources_json(bool disk) {
             cJSON_AddStringToObject(r, "lastError", s->error ? s->error : "") &&
             cJSON_AddNumberToObject(r, "entryCount", s->entries) &&
             cJSON_AddNumberToObject(r, "skippedEntries", s->skipped);
+        if (ok && (!strcmp(s->id, PSPKG_PS4_SOURCE) || !strcmp(s->id, PSPKG_PS5_SOURCE)))
+            ok = cJSON_AddNumberToObject(r, "discovered", s->discovered) &&
+                 cJSON_AddBoolToObject(r, "truncated", s->truncated);
         if (disk) ok = ok && cJSON_AddStringToObject(r, "cacheHash", s->cache_hash);
         else if (s->built_in) {
             if (!strcmp(s->id, PADRINO_SOURCE)) ok = ok && cJSON_AddTrueToObject(r, "bundled");
@@ -335,6 +340,34 @@ static char *read_file(int dir, const char *name, size_t limit, size_t *length) 
     return body;
 }
 
+cJSON *remote_source_package_diagnostics_locked(const char *source, const char *package) {
+    const RemoteSource *s = find(source ? source : "");
+    if (!s || !package || !*package || strlen(package) >= 128) return NULL;
+    cJSON *feed = NULL;
+    const cJSON *entry = NULL;
+    if (!strcmp(s->id, PADRINO_SOURCE)) entry = padrino_game(package);
+    else {
+        char filename[32];
+        snprintf(filename, sizeof filename, "%s.json", s->id);
+        size_t length = 0;
+        char *body = read_file(remote.cache_fd, filename, BODY_LIMIT, &length);
+        if (body) feed = cJSON_ParseWithLength(body, length);
+        free(body);
+        const cJSON *candidate;
+        cJSON_ArrayForEach(candidate, cJSON_GetObjectItemCaseSensitive(feed, "packages")) {
+            if (strcmp(json_text(candidate, "id"), package) && strcmp(json_text(candidate, "titleId"), package) &&
+                strcasecmp(json_text(candidate, "title"), package)) continue;
+            entry = candidate;
+            break;
+        }
+    }
+    cJSON *result = remote_catalog_diagnostics_locked(entry, s->id);
+    cJSON_AddBoolToObject(result, "indexTruncated", s->truncated);
+    cJSON_AddStringToObject(result, "sourceError", s->error ? s->error : "");
+    cJSON_Delete(feed);
+    return result;
+}
+
 static bool read_row(const cJSON *row, RemoteSource *s) {
     const char *id = json_text(row, "id"), *url = json_text(row, "url"), *name = json_text(row, "name");
     const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(row, "enabled"),
@@ -355,6 +388,9 @@ static bool read_row(const cJSON *row, RemoteSource *s) {
         copy_text(s->cache_hash, sizeof s->cache_hash, hash);
     int64_t fetched = json_int(row, "lastFetchedAt");
     if (fetched > 0 && fetched <= INT32_MAX * 4LL) s->fetched = (time_t)fetched;
+    int64_t discovered = json_int(row, "discovered");
+    if (discovered > 0 && discovered <= PSPKG_INDEX_LIMIT) s->discovered = (size_t)discovered;
+    s->truncated = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "truncated"));
     for (size_t i = 0; i < sizeof errors / sizeof *errors; i++)
         if (!strcmp(json_text(row, "lastError"), errors[i])) s->error = errors[i];
     return true;
@@ -401,7 +437,13 @@ static bool merge_manifest(void) {
 static int reserve_locked(const RemoteSource *source, size_t count) {
     size_t total = orbit.remote_release_count - source->entries + count;
     const RemoteSource *padrino = find(PADRINO_SOURCE);
-    if (total > REMOTE_RELEASE_LIMIT + (padrino ? padrino->entries : 0)) return -1;
+    size_t index_entries = 0;
+    for (size_t i = 0; i < remote.count; i++) {
+        const RemoteSource *candidate = &remote.sources[i];
+        if (!strcmp(candidate->id, PSPKG_PS4_SOURCE) || !strcmp(candidate->id, PSPKG_PS5_SOURCE))
+            index_entries += candidate == source ? count : candidate->entries;
+    }
+    if (total < index_entries || total - index_entries > REMOTE_RELEASE_LIMIT + (padrino ? padrino->entries : 0)) return -1;
     if (total <= orbit.remote_release_count) return 0;
     Release *next = realloc(orbit.remote_releases, total * sizeof *next);
     if (!next) return -1;
@@ -620,18 +662,8 @@ static const char *fetch(const RemoteSource *s, Response *response, long *status
     return "";
 }
 
-#define PSPKG_LISTING_PAGES 8
-#define PSPKG_GAME_PAGES 180
-
 static bool pspkg_source(const char *id) {
     return !strcmp(id, PSPKG_PS5_SOURCE) || !strcmp(id, PSPKG_PS4_SOURCE);
-}
-
-static bool pspkg_word(const char *start, size_t length, const char *word) {
-    size_t size = strlen(word);
-    for (size_t i = 0; i + size <= length; i++)
-        if (!strncasecmp(start + i, word, size)) return true;
-    return false;
 }
 
 static bool pspkg_text(const char *start, size_t length, char *out, size_t cap) {
@@ -708,197 +740,123 @@ static bool pspkg_game_url(const char *href, const char *platform, const char *b
     return size > 0 && (size_t)size < cap;
 }
 
-static const char *pspkg_page(const RemoteSource *snapshot, const char *url, Response *page) {
+/* PSPKG's games-list pages contain the complete platform index in one
+ * response. Save translated rows through the existing durable source cache.
+ * The stable download page is inspected only when the title is selected. */
+static const char *pspkg_scan(const RemoteSource *snapshot, Response *response, long *status,
+                              size_t limit, size_t *discovered, bool *truncated) {
+    const char *platform = !strcmp(snapshot->id, PSPKG_PS5_SOURCE) ? "ps5" : "ps4";
     RemoteSource request = *snapshot;
-    copy_text(request.url, sizeof request.url, url);
-    request.etag[0] = request.cache_hash[0] = 0;
-    long status = 0;
-    const char *error = fetch(&request, page, &status);
-    if (*error) return error;
-    if (strncmp(page->effective_url, "https://pspkg.com/", 18) &&
-        strncmp(page->effective_url, "https://www.pspkg.com/", 22)
-#ifdef ORBIT_TEST
-        && strncmp(page->effective_url, "http://127.0.0.1:", 17)
-#endif
-        ) return "http";
-    return page->data ? "" : "invalid-catalogue";
-}
-
-static bool pspkg_download(const char *href) {
-    if (strncmp(href, "https://", 8) || !remote_https_url(href)) return false;
-    const char *host = href + 8, *path = strchr(host, '/');
-    size_t host_length = path ? (size_t)(path - host) : strlen(host);
-    if (!host_length || host_length >= 128 || memchr(host, '@', host_length)) return false;
-    const char *hosts[] = {"vikingfile.com", "vik1ngfile.site", "datanodes.to", "datanodes.co",
-        "1fichier.com", "pixeldrain.com", "gofile.io", "mediafire.com", "mega.nz"};
-    for (size_t i = 0; i < sizeof hosts / sizeof *hosts; i++) {
-        size_t n = strlen(hosts[i]);
-        if (host_length >= n && !strncasecmp(host + host_length - n, hosts[i], n) &&
-            (host_length == n || host[host_length - n - 1] == '.')) return true;
-    }
-    size_t length = path ? strcspn(path, "?#") : 0;
-    return length >= 4 && !strncasecmp(path + length - 4, ".pkg", 4);
-}
-
-static void pspkg_links(const char *html, cJSON *links) {
-    for (const char *tag = html; (tag = strstr(tag, "<a")); tag += 2) {
+    snprintf(request.url, sizeof request.url, "%.*s%s-games-list",
+             (int)strnlen(snapshot->url, sizeof request.url - 20), snapshot->url, platform);
+    const char *error = fetch(&request, response, status);
+    if (*error || *status == 304) return error;
+    if (!response->data || strcmp(response->effective_url, request.url)) return "invalid-catalogue";
+    cJSON *root = cJSON_CreateObject();
+    cJSON *packages = cJSON_AddArrayToObject(root, "packages");
+    if (!packages) { cJSON_Delete(root); return "limit"; }
+    for (const char *tag = response->data; (tag = strstr(tag, "<a")); tag += 2) {
         if (!isspace((unsigned char)tag[2])) continue;
         const char *end = strchr(tag, '>');
+        const char *close = end ? strstr(end, "</a>") : NULL;
         if (!end) break;
-        char href[URL_LIMIT + 1];
-        if (!pspkg_attribute(tag, end, "href", href, sizeof href) || !pspkg_download(href)) continue;
-        const char *close = strstr(end + 1, "</a>");
-        if (!close || close - end > 600) continue;
-        const char *near = tag - html > 250 ? tag - 250 : html;
-        char label[512];
-        if (!pspkg_text(near, (size_t)(close - near), label, sizeof label) ||
-            (!pspkg_word(label, strlen(label), "game") && !pspkg_word(label, strlen(label), "pkg")) ||
-            pspkg_word(label, strlen(label), "dlc") || pspkg_word(label, strlen(label), "backport") ||
-            pspkg_word(label, strlen(label), "patch") || pspkg_word(label, strlen(label), "update")) continue;
-        bool duplicate = false;
-        const cJSON *link;
-        cJSON_ArrayForEach(link, links)
-            if (!strcmp(json_text(link, "url"), href)) { duplicate = true; break; }
-        if (duplicate) continue;
-        cJSON *item = cJSON_CreateObject();
-        if (!item || !cJSON_AddStringToObject(item, "name", "Game PKG") ||
-            !cJSON_AddStringToObject(item, "url", href) || !cJSON_AddItemToArray(links, item)) {
-            cJSON_Delete(item);
-            return;
+        if (!close || close - end > 4096) continue;
+        char href[256], game[256], download[256], title[256];
+        if (!pspkg_attribute(tag, end, "href", href, sizeof href) ||
+            !pspkg_game_url(href, platform, snapshot->url, game, sizeof game) ||
+            !pspkg_download_page(game, download, sizeof download) ||
+            !pspkg_text(end + 1, (size_t)(close - end - 1), title, sizeof title)) continue;
+        char *name = title;
+        size_t n = strspn(name, "0123456789");
+        size_t len = strlen(name);
+        /* Rows include a sequence number and publication date outside the title. */
+        if (n && name[n] == ' ' && len > n + 12 && name[len - 11] == ' ' &&
+            name[len - 6] == '/' && name[len - 3] == '/') {
+            name[len - 11] = 0;
+            name += n + 1;
         }
-    }
-}
-
-static const char *pspkg_scan(const RemoteSource *snapshot, char **body, size_t *length,
-                              unsigned listing_limit, size_t game_limit, size_t *discovered) {
-    const char *platform = !strcmp(snapshot->id, PSPKG_PS5_SOURCE) ? "ps5" : "ps4";
-    char (*games)[URL_LIMIT + 1] = calloc(game_limit, URL_LIMIT + 1);
-    cJSON *root = cJSON_CreateObject();
-    cJSON *packages = root ? cJSON_AddArrayToObject(root, "packages") : NULL;
-    if (!games || !packages) { free(games); cJSON_Delete(root); return "limit"; }
-    size_t game_count = 0;
-    const char *error = "";
-    for (unsigned page_number = 1; page_number <= listing_limit && game_count < game_limit && !stopping(); page_number++) {
-        char url[URL_LIMIT + 1];
-        snprintf(url, sizeof url, "%s?page=%u", snapshot->url, page_number);
-        Response page = {0};
-        error = pspkg_page(snapshot, url, &page);
-        if (*error) { free(page.data); if (page_number == 1) goto done; break; }
-        size_t before = game_count;
-        for (const char *tag = page.data; (tag = strstr(tag, "<a")) && game_count < game_limit; tag += 2) {
-            if (!isspace((unsigned char)tag[2])) continue;
-            const char *end = strchr(tag, '>');
-            if (!end) break;
-            char href[URL_LIMIT + 1], game[URL_LIMIT + 1];
-            if (!pspkg_attribute(tag, end, "href", href, sizeof href) ||
-                !pspkg_game_url(href, platform, snapshot->url, game, sizeof game)) continue;
-            bool duplicate = false;
-            for (size_t i = 0; i < game_count; i++)
-                if (!strcmp(games[i], game)) { duplicate = true; break; }
-            if (!duplicate) copy_text(games[game_count++], URL_LIMIT + 1, game);
+        len = strlen(name);
+        if (len >= sizeof ((Release *)0)->title) {
+            len = sizeof ((Release *)0)->title - 1;
+            while (len && ((unsigned char)name[len] & 0xc0) == 0x80) len--;
+            name[len] = 0;
         }
-        free(page.data);
-        if (before == game_count) break;
-#ifndef ORBIT_TEST
-        struct timespec delay = {.tv_sec = 0, .tv_nsec = 900000000};
-        nanosleep(&delay, NULL);
+        if (!*name || !utf8_text(name)) continue;
+        if (*discovered >= limit) { *truncated = true; break; }
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256((const unsigned char *)game, strlen(game), digest);
+        char id[32], description[350];
+        snprintf(id, sizeof id, "pspkg-%02x%02x%02x%02x%02x%02x",
+                 digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]);
+        /* Keep the canonical PSPKG origin in the source metadata in host fixtures too. */
+        const char *path = strchr(strstr(game, "://") + 3, '/');
+        snprintf(description, sizeof description, "Public PSPKG index.\nSource: https://pspkg.com%s\n", path);
+#ifdef ORBIT_TEST
+        if (!strncmp(game, "http://127.0.0.1:", 17))
+            snprintf(description, sizeof description, "Public PSPKG index.\nSource: %s\n", game);
 #endif
-    }
-    if (!game_count) { error = "invalid-catalogue"; goto done; }
-    if (discovered) *discovered = game_count;
-    error = "";
-    for (size_t i = 0; i < game_count && !stopping(); i++) {
-        Response page = {0};
-        const char *failed = pspkg_page(snapshot, games[i], &page);
-        if (*failed) { free(page.data); continue; }
-        const char *heading = strstr(page.data, "<h1");
-        const char *begin = heading ? strchr(heading, '>') : NULL;
-        const char *end = begin ? strstr(begin + 1, "</h1>") : NULL;
-        char title[128];
-        cJSON *links = cJSON_CreateArray();
-        bool named = begin && end && end - begin < 512 &&
-                     pspkg_text(begin + 1, (size_t)(end - begin - 1), title, sizeof title);
-        if (links) pspkg_links(page.data, links);
-        char download_page[URL_LIMIT + 1];
-        bool gated = pspkg_download_page(games[i], download_page, sizeof download_page);
-        if (named && links && gated) {
-            cJSON *choice = cJSON_CreateObject();
-            if (!choice || !cJSON_AddStringToObject(choice, "name", "PSPKG") ||
-                !cJSON_AddStringToObject(choice, "url", download_page) ||
-                !cJSON_AddTrueToObject(choice, "page") || !cJSON_AddItemToArray(links, choice)) {
-                cJSON_Delete(choice);
-                cJSON_Delete(links);
-                free(page.data);
-                error = "limit";
-                goto done;
-            }
-            unsigned char digest[SHA256_DIGEST_LENGTH];
-            SHA256((const unsigned char *)games[i], strlen(games[i]), digest);
-            char id[32], description[URL_LIMIT + 100];
-            snprintf(id, sizeof id, "pspkg-%02x%02x%02x%02x%02x%02x",
-                     digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]);
-            snprintf(description, sizeof description, "Public PSPKG listing.\nSource: %s\nFirmware compatibility not verified.", games[i]);
-            cJSON *entry = cJSON_CreateObject();
-            bool ok = entry && cJSON_AddStringToObject(entry, "id", id) &&
-                      cJSON_AddStringToObject(entry, "title", title) &&
-                      cJSON_AddStringToObject(entry, "category", !strcmp(platform, "ps5") ? "PS5" : "PS4") &&
-                      cJSON_AddStringToObject(entry, "description", description);
-            if (ok && cJSON_AddItemToObject(entry, "downloadLinks", links)) {
-                links = NULL;
-                ok = cJSON_AddItemToArray(packages, entry);
-            } else ok = false;
-            if (!ok) { cJSON_Delete(entry); error = "limit"; }
+        cJSON *entry = cJSON_CreateObject();
+        cJSON *links = cJSON_AddArrayToObject(entry, "downloadLinks");
+        cJSON *choice = cJSON_CreateObject();
+        bool ok = links && choice && cJSON_AddStringToObject(entry, "id", id) &&
+            cJSON_AddStringToObject(entry, "title", name) &&
+            cJSON_AddStringToObject(entry, "category", !strcmp(platform, "ps5") ? "PS5" : "PS4") &&
+            cJSON_AddStringToObject(entry, "description", description) &&
+            cJSON_AddStringToObject(choice, "name", "PSPKG") &&
+            cJSON_AddStringToObject(choice, "url", download) &&
+            cJSON_AddTrueToObject(choice, "page");
+        if (ok && cJSON_AddItemToArray(links, choice)) choice = NULL;
+        else ok = false;
+        if (!ok || !cJSON_AddItemToArray(packages, entry)) {
+            cJSON_Delete(choice);
+            cJSON_Delete(entry);
+            cJSON_Delete(root);
+            return "limit";
         }
-        cJSON_Delete(links);
-        free(page.data);
-        if (*error) goto done;
-#ifndef ORBIT_TEST
-        struct timespec delay = {.tv_sec = 0, .tv_nsec = 500000000};
-        nanosleep(&delay, NULL);
-#endif
+        (*discovered)++;
     }
-    *body = cJSON_PrintUnformatted(root);
-    if (!*body) error = "limit";
-    else *length = strlen(*body);
-done:
-    free(games);
+    if (!*discovered) { cJSON_Delete(root); return "invalid-catalogue"; }
+    cJSON_AddBoolToObject(root, "truncated", *truncated);
+    cJSON_AddNumberToObject(root, "discovered", *discovered);
+    char *body = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    return error;
+    if (!body) return "limit";
+    free(response->data);
+    response->data = body;
+    response->size = strlen(body);
+    return "";
 }
 
 #ifdef ORBIT_TEST
-cJSON *remote_pspkg_preview(const char *source_id, const char *url,
-                            unsigned listing_limit, size_t game_limit) {
+cJSON *remote_pspkg_preview(const char *source_id, const char *url, size_t game_limit) {
     cJSON *result = cJSON_CreateObject();
     const RemoteSource *source = find(source_id);
     RemoteSource snapshot;
     if (source) snapshot = *source;
     if (source && url && *url) copy_text(snapshot.url, sizeof snapshot.url, url);
-    char *body = NULL;
-    size_t length = 0, discovered = 0;
-    const char *error = !source || !pspkg_source(source_id) || !listing_limit ||
-        !game_limit || game_limit > PSPKG_GAME_PAGES ? "invalid-catalogue" :
-        pspkg_scan(&snapshot, &body, &length, listing_limit, game_limit, &discovered);
+    Response response = {0};
+    size_t discovered = 0;
+    bool truncated = false;
+    long status = 0;
+    const char *error = !source || !pspkg_source(source_id) || !game_limit || game_limit > PSPKG_INDEX_LIMIT
+        ? "invalid-catalogue" : pspkg_scan(&snapshot, &response, &status, game_limit, &discovered, &truncated);
     cJSON_AddStringToObject(result, "error", error);
     cJSON_AddNumberToObject(result, "discovered", discovered);
-    cJSON *feed = body ? cJSON_ParseWithLength(body, length) : NULL;
+    cJSON_AddBoolToObject(result, "truncated", truncated);
+    cJSON *feed = !*error && response.data ? cJSON_ParseWithLength(response.data, response.size) : NULL;
     if (feed) cJSON_AddItemToObject(result, "feed", feed);
-    free(body);
+    free(response.data);
     return result;
-}
-
-cJSON *remote_pspkg_links_test(const char *html) {
-    cJSON *links = cJSON_CreateArray();
-    if (links) pspkg_links(html, links);
-    return links;
 }
 #endif
 
 static void refresh_one(const RemoteSource *snapshot) {
     Response response = {0};
     long status = 200;
+    size_t discovered = 0;
+    bool truncated = false;
     const char *error = pspkg_source(snapshot->id)
-        ? pspkg_scan(snapshot, &response.data, &response.size, PSPKG_LISTING_PAGES, PSPKG_GAME_PAGES, NULL)
+        ? pspkg_scan(snapshot, &response, &status, PSPKG_INDEX_LIMIT, &discovered, &truncated)
         : fetch(snapshot, &response, &status);
     Release *releases = NULL;
     size_t count = 0, skipped = 0;
@@ -922,6 +880,8 @@ static void refresh_one(const RemoteSource *snapshot) {
                 hash_text(response.data, response.size, live->cache_hash);
                 copy_text(live->etag, sizeof live->etag, response.etag);
                 live->skipped = skipped;
+                live->discovered = discovered;
+                live->truncated = truncated;
                 live->fetched = time(NULL);
             }
             if (!count && skipped) live->skipped = skipped;
@@ -946,35 +906,60 @@ static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
             entry = request;
             break;
         }
-        if (request->state == META_EMPTY ||
-            (request->state == META_DONE && (!entry || request->expires < entry->expires)))
-            entry = request;
+        if (request->state == META_EMPTY || (request->state == META_DONE &&
+            (!entry || (entry->state != META_EMPTY && request->expires < entry->expires)))) entry = request;
     }
     if (!entry) return NULL;
+    cJSON_Delete(entry->public_links);
     *entry = (MetadataRequest){.state = META_QUEUED};
     copy_text(entry->id, sizeof entry->id, id);
     pthread_cond_signal(&metadata.changed);
     return entry;
 }
 
-static bool metadata_provider(const Release *r) {
-    return remote_page_pending(r) && remote_metadata_url(r->browser_url);
+static int file_rank(const RemoteFileMetadata *file) {
+    if (file->size) return 2 + file->confidence;
+    return file->filename[0] ? 1 : 0;
 }
 
-static bool next_metadata_mirror_locked(const Release *r, const char *after, Release *mirror) {
-    char cursor[sizeof mirror->id];
-    copy_text(cursor, sizeof cursor, after);
-    while (remote_next_mirror_locked(r, cursor, mirror)) {
-        if (metadata_provider(mirror)) return true;
-        copy_text(cursor, sizeof cursor, mirror->id);
+static void metadata_snapshot(cJSON *views, cJSON *record, const Release *r, const MetadataRequest *request,
+                              const char *group, bool visible) {
+    cJSON *row = cJSON_CreateObject();
+    if (!row) return;
+    const RemoteFileMetadata *file = &request->file;
+    bool done = request->state == META_DONE;
+    const char *status = done ? remote_metadata_status(file->status) :
+        request->state == META_LOADING ? "fetching" : "queued";
+    cJSON_AddStringToObject(row, "id", r->id);
+    cJSON_AddStringToObject(row, "source", r->remote_catalog_id);
+    cJSON_AddStringToObject(row, "titleId", r->title_id);
+    cJSON_AddStringToObject(row, "label", r->remote_label);
+    cJSON_AddStringToObject(row, "mirrorGroup", group);
+    cJSON_AddBoolToObject(row, "visible", visible);
+    cJSON_AddBoolToObject(row, "metadataEligible", true);
+    cJSON_AddStringToObject(row, "status", status);
+    cJSON_AddBoolToObject(row, "getAttempted", file->attempted || request->state == META_LOADING);
+    if (done) {
+        cJSON_AddNumberToObject(row, "httpStatus", file->http_status);
+        cJSON_AddStringToObject(row, "effectiveHost", file->effective_host);
+        cJSON_AddNumberToObject(row, "sizeBytes", (double)file->size);
+        cJSON_AddBoolToObject(row, "exact", file->exact);
+        cJSON_AddNumberToObject(row, "sizeConfidence", file->confidence);
+        cJSON *sizes = cJSON_AddArrayToObject(row, "sizeCandidates");
+        for (unsigned i = 0; sizes && i < file->candidate_count; i++)
+            cJSON_AddItemToArray(sizes, cJSON_CreateNumber((double)file->candidates[i]));
+        if (request->public_links)
+            cJSON_AddItemToObject(row, "links", cJSON_Duplicate(request->public_links, true));
     }
-    return false;
+    cJSON_AddItemToArray(views, row);
+    if (visible) cJSON_AddStringToObject(record, "status", status);
 }
 
 cJSON *remote_metadata_json_locked(const char *ids) {
     cJSON *root = cJSON_CreateObject();
-    cJSON *rows = cJSON_AddArrayToObject(root, "files");
-    if (!rows) { cJSON_Delete(root); return NULL; }
+    cJSON *files = cJSON_AddArrayToObject(root, "files");
+    cJSON *views = cJSON_AddArrayToObject(root, "options");
+    if (!files || !views) { cJSON_Delete(root); return NULL; }
     bool pending = false;
     time_t now = time(NULL);
     for (unsigned i = 0; metadata.count && ids && *ids && i < METADATA_REQUEST_LIMIT; i++) {
@@ -985,25 +970,52 @@ cJSON *remote_metadata_json_locked(const char *ids) {
         id[length] = 0;
         ids += length + (ids[length] == ',');
         const Release *release = release_find(id);
-        Release mirror;
-        if (!release || strcmp(release->source, "remote") || !remote_source_enabled_locked(release) ||
-            (!metadata_provider(release) && !next_metadata_mirror_locked(release, "", &mirror))) continue;
-        const MetadataRequest *request = metadata_request_locked(id, now);
-        if (!request || request->state != META_DONE) {
-            pending = true;
-            continue;
-        }
-        if (!request->file.size && !request->file.filename[0]) continue;
+        if (!release || strcmp(release->source, "remote") || !remote_source_enabled_locked(release)) continue;
+        const Release *candidate = release;
+        Release alternate;
+        char after[sizeof alternate.id] = "";
+        RemoteFileMetadata best = {0};
         cJSON *row = cJSON_CreateObject();
-        if (!cJSON_AddStringToObject(row, "id", id) ||
-            !cJSON_AddNumberToObject(row, "sizeBytes", (double)request->file.size) ||
-            !cJSON_AddBoolToObject(row, "exact", request->file.exact) ||
-            (request->file.filename[0] && !cJSON_AddStringToObject(row, "filename", request->file.filename)) ||
-            (request->file.format[0] && !cJSON_AddStringToObject(row, "format", request->file.format)) ||
-            (request->file.compression[0] && !cJSON_AddStringToObject(row, "compression", request->file.compression)) ||
-            !cJSON_AddItemToArray(rows, row)) cJSON_Delete(row);
+        if (!row) continue;
+        cJSON_AddStringToObject(row, "id", id);
+        unsigned mirrors = 0;
+        bool conflicting_size = false, group_pending = false;
+        do {
+            mirrors++;
+            if (!remote_metadata_option(candidate)) continue;
+            const MetadataRequest *request = metadata_request_locked(candidate->id, now);
+            if (!request || request->state != META_DONE) group_pending = true;
+            if (!request) continue;
+            metadata_snapshot(views, row, candidate, request, release->mirror_key, candidate == release);
+            if (request->state == META_DONE) {
+                int rank = file_rank(&request->file);
+                if (rank > file_rank(&best)) {
+                    best = request->file;
+                    conflicting_size = false;
+                } else if (rank == file_rank(&best) && request->file.size != best.size) {
+                    conflicting_size = true;
+                }
+            }
+        } while (remote_next_mirror_locked(release, after, &alternate) &&
+                 (copy_text(after, sizeof after, alternate.id), candidate = &alternate, true));
+        pending |= group_pending;
+        if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", mirrors);
+        if (conflicting_size) {
+            best.size = 0;
+            best.exact = false;
+            cJSON_AddBoolToObject(row, "mirrorSizeConflict", true);
+        }
+        if (!group_pending && file_rank(&best)) {
+            cJSON_AddNumberToObject(row, "sizeBytes", (double)best.size);
+            cJSON_AddBoolToObject(row, "exact", best.exact);
+            if (best.filename[0]) cJSON_AddStringToObject(row, "filename", best.filename);
+            if (best.format[0]) cJSON_AddStringToObject(row, "format", best.format);
+            if (best.compression[0]) cJSON_AddStringToObject(row, "compression", best.compression);
+            cJSON_AddItemToArray(files, row);
+        } else cJSON_Delete(row);
     }
     cJSON_AddBoolToObject(root, "pending", pending);
+    cJSON_AddBoolToObject(root, "truncated", ids && *ids);
     return root;
 }
 
@@ -1023,26 +1035,16 @@ static void *metadata_worker(void *unused) {
         }
         request->state = META_LOADING;
         RemoteFileMetadata file = {0};
+        cJSON *links = NULL;
         const Release *release = release_find(request->id);
         if (release && remote_source_enabled_locked(release)) {
-            Release selected = *release, candidate = selected;
-            bool found = metadata_provider(&candidate) || next_metadata_mirror_locked(&selected, "", &candidate);
-            while (found && !orbit.stop && remote_source_enabled_locked(&selected)) {
-                pthread_mutex_unlock(&orbit.mutex);
-                RemoteFileMetadata current;
-                remote_download_metadata(&candidate, &current, NULL);
-                pthread_mutex_lock(&orbit.mutex);
-                if (!strcmp(candidate.id, selected.id)) file = current;
-                if (current.size) {
-                    file.size = current.size;
-                    file.exact = current.exact;
-                    break;
-                }
-                found = next_metadata_mirror_locked(&selected, strcmp(candidate.id, selected.id) ? candidate.id : "",
-                                                    &candidate);
-            }
+            Release candidate = *release;
+            pthread_mutex_unlock(&orbit.mutex);
+            remote_download_metadata(&candidate, &file, &links);
+            pthread_mutex_lock(&orbit.mutex);
         }
         request->file = file;
+        request->public_links = links;
         request->expires = time(NULL) + (file.size || file.filename[0] ? 1800 : 300);
         request->state = META_DONE;
     }
@@ -1113,6 +1115,8 @@ void remote_sources_stop(void) {
     pthread_mutex_unlock(&orbit.mutex);
     if (remote.started) pthread_join(remote.thread, NULL);
     for (size_t i = 0; i < metadata.count; i++) pthread_join(metadata.threads[i], NULL);
+    for (size_t i = 0; i < METADATA_LIMIT; i++) cJSON_Delete(metadata.requests[i].public_links);
+    memset(metadata.requests, 0, sizeof metadata.requests);
     if (remote.cache_fd >= 0) close(remote.cache_fd);
     pthread_mutex_lock(&orbit.mutex);
     free(orbit.remote_releases);

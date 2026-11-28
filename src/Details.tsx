@@ -172,23 +172,31 @@ export function Details({
     Partial<Pick<Release, "filename" | "format" | "compression">>;
   const [providerFiles, setProviderFiles] = useState<Record<string, ProviderFile>>({});
   const metadataIds = game.releases
-    .filter((r) => r.providerMetadata && (!r.sizeBytes || !r.filename || r.format === "Unknown"))
+    .filter((r) => r.providerMetadata)
     .map((r) => r.id)
-    .slice(0, 32)
     .join(",");
   useEffect(() => {
+    setProviderFiles({});
     if (!system?.paired || !metadataIds) return;
+    const ids = metadataIds.split(",");
     let cancelled = false, timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = Date.now() + 60_000;
+    let offset = 0;
     async function poll() {
+      const batch = ids.slice(offset, offset + 32).join(",");
       try {
         const info = await api<{ pending: boolean; files: ProviderFile[] }>(
-          `/community-metadata?ids=${encodeURIComponent(metadataIds)}`,
+          `/community-metadata?ids=${encodeURIComponent(batch)}`,
         );
         if (cancelled) return;
-        setProviderFiles(Object.fromEntries(info.files.map((file) => [file.id, file])));
-        if (info.pending && Date.now() < deadline) timer = setTimeout(poll, 1200);
-      } catch { /* Keep the catalogue estimate if a provider cannot be reached. */ }
+        setProviderFiles((current) => ({
+          ...current,
+          ...Object.fromEntries(info.files.map((file) => [file.id, file])),
+        }));
+        if (!info.pending) offset += 32;
+      } catch {
+        // Retry the current batch while this title remains open.
+      }
+      if (!cancelled && offset < ids.length) timer = setTimeout(poll, 1200);
     }
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
@@ -201,8 +209,8 @@ export function Details({
       filename: file.filename || r.filename,
       format: file.format || r.format,
       compression: file.format ? file.compression : r.compression,
-      sizeEstimateBytes: file.sizeBytes || r.sizeEstimateBytes,
-      sizeEstimateExact: file.sizeBytes ? file.exact : r.sizeEstimateExact,
+      sizeEstimateBytes: r.sizeEstimateExact && !file.exact ? r.sizeEstimateBytes : file.sizeBytes || r.sizeEstimateBytes,
+      sizeEstimateExact: r.sizeEstimateExact || (file.sizeBytes ? file.exact : undefined),
     };
   });
   // A source can be switched off by another paired device while this page is open.
