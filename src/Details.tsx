@@ -37,7 +37,7 @@ import { Glyph } from "./interfaces/Glyph";
 import { PnGroup, PnTile } from "./interfaces/PanoramaParts";
 import { menuKeys } from "./interfaces/menuKeys";
 import type { BrowseFilters } from "./browse";
-import { preferredRelease, rememberChoice } from "./downloadChoice";
+import { preferredRelease, rememberChoice, sortDownloadLinks } from "./downloadChoice";
 import {
   CinemaEverything,
   CrossbarEverything,
@@ -268,12 +268,13 @@ export function Details({
       metadataSizeOnly: file.sizeOnly,
     };
   });
-  const releases = options.filter((r) => !r.providerMissing ||
+  const availableReleases = options.filter((r) => !r.providerMissing ||
     (r.torboxCached && torboxAvailable(debrid.status, r)));
+  const releases = sortDownloadLinks(availableReleases, (option) => torboxAvailable(debrid.status, option));
   const cacheLabel = (option: Release, prefix = "") =>
     option.torboxCached && torboxAvailable(debrid.status, option) ? prefix + t("Cached") : "";
   // Preserve the game and its library actions when every download option is missing.
-  const release = releases.find((r) => r.id === releaseId) || releases[0] ||
+  const release = availableReleases.find((r) => r.id === releaseId) || availableReleases[0] ||
     options.find((r) => r.id === releaseId) || options[0];
   const isPspkg = release.sourceId === "remote" && release.provider === "PSPKG";
   const version = releaseVersion(release);
@@ -281,7 +282,10 @@ export function Details({
   const listings = community?.pspkg.length ? community.pspkg : isPspkg ? [{ id: release.id, title: release.title, titleIdMatch: false }] : [];
   const listingId = pspkgListing || pspkgHere?.pspkgReleaseId ||
     listings.find((listing) => listing.titleIdMatch)?.id || listings[0]?.id;
-  const pspkgLinks = pspkgHere?.pspkgReleaseId === listingId ? pspkgHere?.pspkgLinks || [] : [];
+  const pspkgLinks = sortDownloadLinks(
+    pspkgHere?.pspkgReleaseId === listingId ? pspkgHere?.pspkgLinks ?? [] : [],
+    (link) => link.torboxAvailable,
+  );
   const canTorbox = torboxAvailable(debrid.status, release) && (!release.providerMissing || !!release.torboxCached);
   const delivery = canTorbox && (release.providerMissing || deliveryChoice !== "direct") ? "torbox" : "direct";
   const torbox = !isPspkg && delivery === "torbox";

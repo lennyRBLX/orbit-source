@@ -11,7 +11,7 @@ const { outputFiles } = await build({
       export { releaseMatches } from "./src/browse";
       export { releaseState } from "./src/collection";
       export { formatLabel, releaseSize, releaseVersion } from "./src/types";
-      export { preferredRelease } from "./src/downloadChoice";
+      export { preferredRelease, sortDownloadLinks } from "./src/downloadChoice";
     `,
     resolveDir: fileURLToPath(new URL("..", import.meta.url)),
   },
@@ -20,7 +20,7 @@ const { outputFiles } = await build({
   format: "esm",
   platform: "node",
 });
-const { groupGames, releaseMatches, releaseState, formatLabel, releaseSize, releaseVersion, preferredRelease } = await import(
+const { groupGames, releaseMatches, releaseState, formatLabel, releaseSize, releaseVersion, preferredRelease, sortDownloadLinks } = await import(
   `data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString("base64")}`
 );
 
@@ -95,4 +95,37 @@ test("TorBox coverage wins the default and its size follows the selected deliver
   assert.equal(preferredRelease([undersized, torbox], undefined, last, hosts), torbox);
   assert.equal(releaseSize(undersized, true), "≈109.7 GB");
   assert.equal(releaseSize({ ...cached, torboxSizeBytes: 500_000_000 }, true), "500.0 MB");
+});
+
+test("catalogue download links sort by numeric version, TorBox status and format", () => {
+  const option = (id, fields = {}) => ({ ...curated, id, version: "2.10", ...fields });
+  const links = [
+    option("folder", { torboxCached: true }),
+    option("older", { version: "2.9", format: "PKG", torboxCached: true }),
+    option("available", { format: "PKG" }),
+    option("unavailable", { format: "PKG", torboxCached: true }),
+    option("lz4", { contentFormat: "LZ4", torboxCached: true }),
+    option("ffpkg", { format: "FFPKG", torboxCached: true }),
+    option("zstd", { assetCompression: "ZSTD", torboxCached: true }),
+    option("pkg", { version: "v02.10.0", format: "PKG", torboxCached: true }),
+    option("newer", { version: null, resolvedVersion: "v2.11" }),
+    option("unknown", { version: null, format: "PKG", torboxCached: true }),
+  ];
+  const sorted = sortDownloadLinks(links, (link) => link.id !== "unavailable");
+  assert.deepEqual(sorted.map(({ id }) => id), [
+    "newer", "ffpkg", "pkg", "zstd", "lz4", "folder", "available", "unavailable", "older", "unknown",
+  ]);
+  assert.equal(links[0].id, "folder");
+});
+
+test("PSPKG download links use their own TorBox status and preserve link IDs", () => {
+  const links = [
+    { id: "1", version: "2.0", format: "PKG", torboxAvailable: false },
+    { id: "2", version: "2.0", format: "ZSTD", torboxAvailable: true },
+    { id: "3", version: "1.0", format: "PKG", torboxAvailable: true, torboxCached: true },
+    { id: "4", version: "2.0", format: "Game folder", torboxAvailable: true, torboxCached: true },
+    { id: "5", version: "2.0", format: "FFPKG", torboxAvailable: true },
+  ];
+  assert.deepEqual(sortDownloadLinks(links, (link) => link.torboxAvailable).map(({ id }) => id),
+    ["4", "5", "2", "1", "3"]);
 });

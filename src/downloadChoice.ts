@@ -1,6 +1,4 @@
-// Which download option a game page starts on: one matching the Browse filters the game was
-// found with, then prefer TorBox, the last source and format, and direct downloads in that order.
-import { torboxSizeAllowed, type Release } from "./types";
+import { formatVersion, releaseVersion, torboxSizeAllowed, type PspkgChoice, type Release } from "./types";
 import { filtersOptions, releaseFormat, releaseHasTorboxHost, releaseMatches, type BrowseFilters } from "./browse";
 
 const KEY = "orbit.download-choice.v1";
@@ -21,6 +19,8 @@ export function rememberChoice(r: Release) {
     // A private window or blocked storage only loses the preference.
   }
 }
+// Start on an option matching the Browse filters, then prefer TorBox, the last
+// source and format, and direct downloads in that order.
 // torbox: the sources TorBox can download now.
 export function preferredRelease(releases: Release[], filters?: BrowseFilters, last = lastChoice(), torbox?: ReadonlySet<string>): Release {
   const filtered = !!filters && filtersOptions(filters);
@@ -38,4 +38,36 @@ export function preferredRelease(releases: Release[], filters?: BrowseFilters, l
     .map((r, i) => ({ r, i, k: rank(r) }))
     .sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2] ||
       a.k[3] - b.k[3] || a.i - b.i)[0].r;
+}
+
+const versionOrder = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+const versionKey = (version: string) => version.replace(/^(v\d+(?:\.\d+)*?)(?:\.0+)+$/, "$1");
+const torboxRank = (available?: boolean, cached?: boolean) => available ? (cached ? 0 : 1) : 2;
+
+function formatRank(format: string) {
+  switch (format.toUpperCase()) {
+    case "PKG":
+    case "FPKG":
+    case "FFPKG": return 0;
+    case "ZSTD": return 1;
+    case "LZ4": return 2;
+    case "GAME FOLDER": return 3;
+    default: return 4;
+  }
+}
+
+export function sortDownloadLinks<T extends Release | PspkgChoice>(
+  links: readonly T[],
+  torboxAvailable: (link: T) => boolean | undefined,
+): T[] {
+  return links.map((link) => {
+    const catalogue = "sourceId" in link;
+    return {
+      link,
+      version: versionKey(catalogue ? releaseVersion(link) : formatVersion(link.version)),
+      torbox: torboxRank(torboxAvailable(link), link.torboxCached),
+      format: formatRank(catalogue ? releaseFormat(link) : link.format),
+    };
+  }).sort((a, b) => versionOrder.compare(b.version, a.version) ||
+    a.torbox - b.torbox || a.format - b.format).map(({ link }) => link);
 }
