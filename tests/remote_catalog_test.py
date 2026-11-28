@@ -552,6 +552,41 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_rootz_metadata_from_nextjs_page_and_wrapped_api_response(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        token = "rootz-fixture-token"
+        size = 127_126_157_134
+        cases = {
+            "active": (True, {"status": "found", "sizeBytes": size, "exact": True}),
+            "deleted": (True, {"status": "missing", "sizeBytes": 0, "exact": False}),
+            "failed": (False, {"status": "parse-no-size", "sizeBytes": 0, "exact": False}),
+        }
+        for short_id, (success, _) in cases.items():
+            props = {"shortId": short_id, "pageToken": token}
+            flight = '5:' + json.dumps(["$", "$L1a", None, props]) + '\n'
+            page = f'<script>self.__next_f.push({json.dumps([1, flight])})</script>'
+            server.downloads[f"/metadata/rootz/{short_id}"] = (200, {"Content-Type": "text/html"}, page.encode())
+            data = {"url": None, "fileName": "Fixture.rar", "size": size, "mimeType": "application/vnd.rar",
+                    "status": "deleted" if short_id == "deleted" else "active", "downloadAllowed": short_id != "deleted"}
+            server.downloads[f"/api/files/download-by-short?shortId={short_id}"] = (
+                200, {"Content-Type": "application/json"}, json.dumps({"success": success, "data": data}).encode())
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                for short_id, (_, expected) in cases.items():
+                    with self.subTest(short_id=short_id):
+                        self.assertEqual(service.command("metadata-page", url=f"{base}/metadata/rootz/{short_id}"),
+                                         expected)
+                self.assertCountEqual(server.page_tokens, [
+                    (f"/api/files/download-by-short?shortId={short_id}", token) for short_id in cases
+                ])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_direct_metadata_range_preserves_exact_length(self):
         server = FixtureServer()
         base = server.url.removesuffix("/catalogue.json")

@@ -1041,6 +1041,30 @@ static bool rootz_page(const char *url) {
     return !strncasecmp(url, "https://rootz.so/", 17) || !strncasecmp(url, "https://www.rootz.so/", 21);
 }
 
+static bool rootz_page_token(const char *html, char *token, size_t cap) {
+    if (page_value(html, "pageToken", token, cap) ||
+        page_value(html, "page-token", token, cap) ||
+        page_value(html, "page_token", token, cap) ||
+        page_value(html, "__page_token__", token, cap) ||
+        page_value(html, "X-Page-Token", token, cap)) return true;
+
+    /* Next.js sends the page props inside a JSON-encoded Flight string. */
+    const char *marker = "self.__next_f.push(";
+    for (const char *p = html; (p = strstr(p, marker)); ) {
+        p += strlen(marker);
+        const char *end;
+        cJSON *push = cJSON_ParseWithOpts(p, &end, false);
+        const cJSON *type = cJSON_GetArrayItem(push, 0);
+        const cJSON *flight = cJSON_GetArrayItem(push, 1);
+        bool found = push && *end == ')' && cJSON_IsArray(push) &&
+            cJSON_IsNumber(type) && type->valuedouble == 1 && cJSON_IsString(flight) &&
+            page_value(flight->valuestring, "pageToken", token, cap);
+        cJSON_Delete(push);
+        if (found) return true;
+    }
+    return false;
+}
+
 static void rootz_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {
     char id[128], token[512], path[192], url[2048], header[sizeof token + 16];
     if (!rootz_page(page->url) || !page->body ||
@@ -1048,11 +1072,7 @@ static void rootz_metadata(const Response *page, const Release *r, RemoteFileMet
          !page_value(page->body, "short-id", id, sizeof id) &&
          !page_value(page->body, "short_id", id, sizeof id) &&
          !remote_url_filename(page->url, id, sizeof id)) ||
-        (!page_value(page->body, "pageToken", token, sizeof token) &&
-         !page_value(page->body, "page-token", token, sizeof token) &&
-         !page_value(page->body, "page_token", token, sizeof token) &&
-         !page_value(page->body, "__page_token__", token, sizeof token) &&
-         !page_value(page->body, "X-Page-Token", token, sizeof token))) return;
+        !rootz_page_token(page->body, token, sizeof token)) return;
     if (strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != strlen(id) ||
         strspn(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.+/=") != strlen(token)) return;
     snprintf(path, sizeof path, "/api/files/download-by-short?shortId=%s", id);
@@ -1062,21 +1082,24 @@ static void rootz_metadata(const Response *page, const Release *r, RemoteFileMet
     bool ok = fetch(url, &api);
     cJSON *json = api.body && !api.truncated && !response_challenge(&api) &&
         (ok || api.status == 404 || api.status == 410) ? cJSON_Parse(api.body) : NULL;
-    const char *status = json_text(json, "status");
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
+    if (!data) data = json;
+    else if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "success"))) data = NULL;
+    const char *status = json_text(data, "status");
     if (missing_text(status) || !strcasecmp(status, "removed") || !strcasecmp(status, "not_found") ||
         !strcasecmp(status, "file_not_found") ||
         response_missing(&api)) {
         metadata->status = REMOTE_METADATA_MISSING;
         metadata->size = 0;
         metadata->filename[0] = 0;
-    } else if (ok && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "downloadAllowed"))) {
+    } else if (ok && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(data, "downloadAllowed"))) {
         RemoteFileMetadata exact = {0};
-        const char *name = json_text(json, "fileName");
-        const char *mime = json_text(json, "mimeType");
+        const char *name = json_text(data, "fileName");
+        const char *mime = json_text(data, "mimeType");
         Release file = *r;
         if (strlen(name) < sizeof file.filename && safe_page_name(name) &&
             !remote_file_detected_format(&file, name, mime_suffix(mime))) file_metadata(&file, &exact);
-        const cJSON *size = cJSON_GetObjectItemCaseSensitive(json, "size");
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(data, "size");
         if (cJSON_IsNumber(size) && size->valuedouble > 0 && size->valuedouble <= 9007199254740991.0 &&
             floor(size->valuedouble) == size->valuedouble) {
             exact.size = (int64_t)size->valuedouble;
@@ -1094,8 +1117,6 @@ static void rootz_metadata(const Response *page, const Release *r, RemoteFileMet
             exact.status = exact.size ? REMOTE_METADATA_FOUND : REMOTE_METADATA_NO_SIZE;
             *metadata = exact;
         }
-
-
     }
     cJSON_Delete(json);
     free(api.body);
