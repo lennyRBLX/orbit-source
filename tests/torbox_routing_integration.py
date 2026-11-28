@@ -92,9 +92,13 @@ class Fixture(BaseHTTPRequestHandler):
             if self.headers.get("Authorization") != "Bearer orbit-test-fixture-key":
                 self.api(None, 401)
             else:
-                self.api({digest: {"hash": digest, "name": "provider.pkg", "size": len(FILE),
-                                   "files": [{"short_name": "provider.pkg", "size": len(FILE)}]}}
-                         if digest in params.get("hash", []) else {})
+                data = {digest: {"hash": digest, "name": "provider.pkg", "size": len(FILE),
+                                 "files": [{"short_name": "provider.pkg", "size": len(FILE)}]}}
+                if digest not in params.get("hash", []):
+                    data = {}
+                # TorBox includes Retry-After even on successful cache lookups.
+                self.reply(json.dumps({"success": True, "data": data}).encode(),
+                           headers={"Content-Type": "application/json", "Retry-After": "61"})
         elif path == "/webdl/mylist":
             if "bypass_cache" not in parse_qs(urlsplit(self.path).query):
                 self.server.calls.append("metadata-list")

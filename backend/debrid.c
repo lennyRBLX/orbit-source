@@ -253,10 +253,10 @@ static cJSON *call(const char *key, const char *path, const char *link, bool bea
     curl_slist_free_all(h); OPENSSL_cleanse(url, sizeof url);
     cJSON *json = rc == CURLE_OK && reply.body ? cJSON_Parse(reply.body) : NULL;
     if (reply.body) { OPENSSL_cleanse(reply.body, reply.length); free(reply.body); }
-    if (reply.status == 429 && reply.retry_at < time(NULL) + 60) reply.retry_at = time(NULL) + 60;
-    if (reply.retry_at > *retry) *retry = reply.retry_at;
     bool success_status = reply.status >= 200 && reply.status < 300;
     if (rc != CURLE_OK || !success_status || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "success"))) {
+        if (reply.status == 429 && reply.retry_at < time(NULL) + 60) reply.retry_at = time(NULL) + 60;
+        if (reply.retry_at > *retry) *retry = reply.retry_at;
         /* A complete rejection can be retried. A lost response or server failure
            may have created a remote item, so the queue must reconcile first. */
         const char *code = json_text(json, "error");
