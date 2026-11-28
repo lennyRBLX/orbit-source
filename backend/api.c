@@ -1026,6 +1026,11 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         if (post && !strcmp(url, "/api/v1/archive-account")) {
             char e[256] = {0};
             int code = archive_account_action(input, e, sizeof e);
+            if (code == 200) {
+                pthread_mutex_lock(&orbit.mutex);
+                remote_archive_account_changed_locked();
+                pthread_mutex_unlock(&orbit.mutex);
+            }
             const char *secrets[] = {"email", "password"};
             for (size_t i = 0; i < 2; i++) {
                 cJSON *v = cJSON_GetObjectItemCaseSensitive(input, secrets[i]);

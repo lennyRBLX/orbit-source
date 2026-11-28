@@ -476,7 +476,8 @@ static CURL *request(Transfer *t) {
         curl_easy_setopt(c, CURLOPT_REFERER, "https://akirabox.to/");
     /* Login-only Archive.org files need its session. The cookies are scoped to
      * archive.org over HTTPS, so no redirect elsewhere can carry them. */
-    if (!torbox(t) && !strcmp(t->release->source, "archive"))
+    if (!torbox(t) && (!strcmp(t->release->source, "archive") ||
+        (remote_transfer(t) && remote_archive_url(t->release->url))))
         archive_account_apply(c);
     if (!torbox(t) && !strcmp(t->release->source, "vikingfile")) {
         curl_easy_setopt(c, CURLOPT_USERAGENT, "Mozilla/5.0 OrbitStore/" ORBIT_VERSION);

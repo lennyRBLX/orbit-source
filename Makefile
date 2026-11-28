@@ -281,7 +281,7 @@ test-browser-capture: build/orbit-test build/orbit-browser-capture-test
 test-concurrency: build/orbit-test
 	python3 tests/concurrency_integration.py
 
-REMOTE_TEST_SOURCES := backend/catalog.c backend/catalog_crypto.c backend/catalog_view.c backend/download_policy.c backend/favorites.c backend/providers.c backend/provider_network.c backend/pspkg.c backend/remote_catalog.c backend/remote_download.c backend/remote_sources.c backend/saved_filters.c backend/sources.c backend/state.c backend/state_file.c .deps/cjson/cJSON.c tests/remote_catalog_driver.c
+REMOTE_TEST_SOURCES := backend/archive_account.c backend/catalog.c backend/catalog_crypto.c backend/catalog_view.c backend/download_policy.c backend/favorites.c backend/providers.c backend/provider_network.c backend/pspkg.c backend/remote_catalog.c backend/remote_download.c backend/remote_sources.c backend/saved_filters.c backend/sources.c backend/state.c backend/state_file.c .deps/cjson/cJSON.c tests/remote_catalog_driver.c
 build/orbit-pspkg-test: backend/pspkg.c backend/pspkg.h tests/pspkg_driver.c
 	$(HOST_CC) $(CPPFLAGS) $(CFLAGS) backend/pspkg.c tests/pspkg_driver.c -o $@
 .PHONY: test-pspkg

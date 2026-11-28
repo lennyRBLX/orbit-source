@@ -249,6 +249,19 @@ static bool url_host(const char *url, char *host, size_t cap) {
     return ok;
 }
 
+bool remote_archive_url(const char *url) {
+#ifdef ORBIT_TEST
+    if (!strncmp(url, "http://127.0.0.1:", 17)) {
+        const char *path = strchr(url + 17, '/');
+        return path && !strncmp(path, "/pspkg-provider/archive.org/", sizeof "/pspkg-provider/archive.org/" - 1);
+    }
+#endif
+    char host[254];
+    if (strncmp(url, "https://", 8) || !url_host(url, host, sizeof host)) return false;
+    size_t length = strlen(host), suffix = sizeof ".archive.org" - 1;
+    return !strcmp(host, "archive.org") || (length > suffix && !strcmp(host + length - suffix, ".archive.org"));
+}
+
 bool remote_link_host(const Release *r, char *host, size_t cap) {
     const char *url = provider_torbox_url(r);
 #ifdef ORBIT_TEST

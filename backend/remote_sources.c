@@ -1291,6 +1291,21 @@ static void refresh_one(const RemoteSource *snapshot) {
     free(response.data);
 }
 
+void remote_archive_account_changed_locked(void) {
+    bool mirror_sizes = false;
+    for (size_t i = 0; i < METADATA_LIMIT; i++) {
+        MetadataRequest *request = &metadata.requests[i];
+        if (request->state == META_EMPTY) continue;
+        const Release *r = release_find(request->id);
+        if (!r || remote_page_pending(r) || !remote_archive_url(provider_torbox_url(r))) continue;
+        mirror_sizes |= request->mirror_size > 0;
+        cJSON_Delete(request->public_links);
+        *request = (MetadataRequest){0};
+    }
+    if (mirror_sizes) rebuild_mirrors_locked();
+    invalidate_locked();
+}
+
 static MetadataRequest *cached_metadata_locked(const char *id, time_t now) {
     for (size_t i = 0; i < METADATA_LIMIT; i++) {
         MetadataRequest *request = &metadata.requests[i];

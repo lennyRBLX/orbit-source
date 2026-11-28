@@ -1,4 +1,5 @@
 #include "remote_sources.h"
+#include "archive_account.h"
 #include "provider_network.h"
 #include "ca.h"
 #include "pspkg.h"
@@ -17,7 +18,7 @@ typedef struct {
     char *body;
     size_t used;
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
-    bool metadata_only, redirect_status, range, plain_text, html_only;
+    bool metadata_only, redirect_status, range, plain_text, html_only, archive_session, use_http1;
     const char *page_token;
     const char *initial_url;
     CURLcode code;
@@ -192,9 +193,10 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Orbit-Store/" ORBIT_VERSION);
-    /* BuzzHeavier can challenge HTTP/2 requests for its public landing pages. */
-    if (r->collect_page && !r->range && !strcmp(remote_browser_provider(url), "buzzheavier"))
+    /* BuzzHeavier can challenge HTTP/2 requests, including after a PSPKG redirect. */
+    if (r->use_http1 || (r->collect_page && !r->range && !strcmp(remote_browser_provider(url), "buzzheavier")))
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
+    if (r->archive_session) archive_account_apply(curl);
     if (r->collect_page && !r->range) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (!r->collect_page || r->range) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body);
@@ -307,8 +309,10 @@ static bool response_missing(const Response *response);
 static bool safe_page_name(const char *name);
 
 int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, char *error, size_t cap) {
-    Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE),
-                         .collect_page = !strcmp(r->source, "remote"), .range = true};
+    bool direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE);
+    bool archive = !direct && remote_archive_url(url);
+    Response response = {.cancel = cancel, .direct = direct, .range = true, .archive_session = archive,
+                         .collect_page = archive || !strcmp(r->source, "remote") || !strcmp(r->source, "pspkg")};
     bool ok = fetch(url, &response);
     int code = response_missing(&response) ? REMOTE_DOWNLOAD_MISSING :
                ok ? file_from_response(r, &response, url, NULL) : -1;
@@ -575,13 +579,21 @@ static bool page_message_missing(const char *body, size_t length, bool json_body
 static bool response_missing(const Response *response) {
     if (cancelled(response) || response_challenge(response)) return false;
     if (response->status == 404 || response->status == 410) return true;
-    if (response->status != 200 || !response->body || !response->used || response->truncated ||
+    if (!response->body || !response->used || response->truncated ||
         response->code != CURLE_OK) return false;
     bool buzzheavier = !strcasecmp(response->effective_host, "buzzheavier.com");
 #ifdef ORBIT_TEST
     buzzheavier = buzzheavier || !strcmp(remote_browser_provider(response->url), "buzzheavier");
 #endif
-    return page_message_missing(response->body, response->used, response->json, buzzheavier);
+    if (response->status == 200 || (buzzheavier && response->status == 403))
+        return page_message_missing(response->body, response->used, response->json, buzzheavier);
+    if ((response->status != 401 && response->status != 403) || !remote_archive_url(response->url)) return false;
+    char *text = malloc(response->used + 1);
+    if (!text) return false;
+    visible_text(response->body, response->body + response->used, text, response->used + 1);
+    bool missing = status_phrase(text, "the item is not available due to issues with the item's content");
+    free(text);
+    return missing;
 }
 
 bool remote_download_html_missing(long status, const char *html, bool challenge) {
@@ -591,7 +603,9 @@ bool remote_download_html_missing(long status, const char *html, bool challenge)
 }
 
 bool remote_download_confirm_missing(const char *url, atomic_bool *cancel) {
-    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true};
+    bool archive = remote_archive_url(url);
+    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = !archive,
+                     .range = archive, .archive_session = archive};
     fetch(url, &page);
     bool missing = response_missing(&page);
     free(page.body);
@@ -1364,8 +1378,10 @@ bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, Remote
     const char *provider = remote_browser_provider(url);
     if (!*provider || !strcmp(provider, "pspkg")) return false;
     Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true, .html_only = true};
-    bool ok = fetch(url, &page) && page.page && !page.json && !page.plain_text &&
-        page.body && !page.truncated && !response_challenge(&page) && !response_missing(&page) &&
+    bool received = fetch(url, &page);
+    if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
+    bool ok = received && page.page && !page.json && !page.plain_text &&
+        page.body && !page.truncated && !response_challenge(&page) && metadata->status != REMOTE_METADATA_MISSING &&
         !strcmp(provider, remote_browser_provider(page.url));
     if (ok) {
         Release file = {.remote_page = true};
@@ -1381,17 +1397,21 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
                                char *out, size_t cap, RemoteFileMetadata *metadata) {
     if (!remote_https_url(url)) return "unsafe-url";
     bool file_candidate = !intermediate && !*remote_browser_provider(url);
-    Response response = {.cancel = cancel, .collect_page = true, .range = file_candidate};
+    Response response = {.cancel = cancel, .collect_page = true, .range = file_candidate,
+                         .archive_session = remote_archive_url(url), .use_http1 = intermediate};
     bool ok = fetch(url, &response);
     const char *status = "";
     if (response.redirect_rejected || response.code == CURLE_TOO_MANY_REDIRECTS ||
         response.code == CURLE_UNSUPPORTED_PROTOCOL || response.code == CURLE_URL_MALFORMAT ||
         (response.status >= 300 && response.status < 400 && !ok)) status = "unsafe-url";
-    else if (response.status == 404 || response.status == 410 || response_missing(&response)) status = "missing-page";
+    else if (response_missing(&response)) status = "missing-page";
     else if (*remote_browser_provider(response.url) && strcmp(remote_browser_provider(response.url), "pspkg") &&
              (ok || response_challenge(&response) || response_interactive(&response))) {
         if (strlen(response.url) >= cap) status = "unsafe-url";
-        else copy_text(out, cap, response.url);
+        else {
+            copy_text(out, cap, response.url);
+            if (response_challenge(&response)) status = "verify-required";
+        }
     } else if (response_challenge(&response) || response_interactive(&response) ||
                (intermediate && (response.status == 401 || response.status == 403 ||
                 strstr(response.url, "/download.php?")))) status = "verify-required";
@@ -1403,6 +1423,7 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
         if (response.page && response.body && !response.truncated) {
             download_page_metadata(&response, &file, metadata);
             if (rootz_page(response.url)) rootz_metadata(&response, &file, metadata);
+            if (metadata->status == REMOTE_METADATA_MISSING) status = "missing-page";
         } else if (!response.page && !file_from_response(&file, &response, url, NULL)) {
             file_metadata(&file, metadata);
             metadata->size = file.size;
@@ -1457,6 +1478,7 @@ static struct {
 } metadata_gets = {.mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER};
 
 static bool metadata_get(const char *url, Response *response) {
+    if (response->archive_session) return fetch(url, response);
     const size_t count = sizeof metadata_gets.entries / sizeof *metadata_gets.entries;
     if (strlen(url) >= sizeof metadata_gets.entries[0].url) return false;
     pthread_mutex_lock(&metadata_gets.mutex);
@@ -1513,7 +1535,8 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     if (!remote_metadata_option(r)) return false;
     bool direct = !remote_page_pending(r);
     const char *url = provider_torbox_url(r);
-    Response page = {.collect_page = true, .metadata_only = !direct, .range = direct};
+    Response page = {.collect_page = true, .metadata_only = !direct, .range = direct,
+                     .archive_session = direct && remote_archive_url(url)};
     bool ok = metadata_get(url, &page);
     bool interactive = response_interactive(&page);
     metadata->http_status = page.status;

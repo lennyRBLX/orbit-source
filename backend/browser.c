@@ -754,13 +754,12 @@ static void download_pspkg(void) {
         pthread_mutex_lock(&orbit.mutex);
         state_locked("validating", "Checking the PSPKG file before adding it to Downloads…");
         pthread_mutex_unlock(&orbit.mutex);
-        ok = !remote_download_verify(&route, locator.url, &session.cancel, error, sizeof error);
+        int result = remote_download_verify(&route, locator.url, &session.cancel, error, sizeof error);
+        missing = result == REMOTE_DOWNLOAD_MISSING;
+        ok = result == 0;
         validated = ok;
     }
     pthread_mutex_lock(&orbit.mutex);
-    if (missing && selected_index < session.pspkg_count)
-        copy_text(session.pspkg_links[selected_index].reason,
-                  sizeof session.pspkg_links[selected_index].reason, "missing-page");
     if (ok && *provider && !session.stop && !atomic_load(&session.cancel) && selected_locked() &&
         session.pspkg_torbox && debrid_link_covered_locked(&route)) {
         Job *job = NULL;
@@ -779,6 +778,7 @@ static void download_pspkg(void) {
     if (ok && *provider && !queued && active()) {
         Release provider_page = route;
         int result = remote_download_resolve(&route, &provider_page, &session.cancel, error, sizeof error);
+        missing = result == REMOTE_DOWNLOAD_MISSING;
         validated = ok = result == 0;
         if (result == 1 && active())
             ok = capture(&provider_page, &route, etag, modified, &validated, error, sizeof error);
@@ -790,6 +790,7 @@ static void download_pspkg(void) {
     }
     pthread_mutex_lock(&orbit.mutex);
     if (!queued) {
+        if (missing) route_status = "missing-page";
         if (*route_status && selected_index < session.pspkg_count)
             copy_text(session.pspkg_links[selected_index].reason,
                       sizeof session.pspkg_links[selected_index].reason, route_status);
@@ -858,13 +859,15 @@ static void read_pspkg_pages_locked(void) {
         pthread_mutex_unlock(&orbit.mutex);
         RemoteFileMetadata metadata = {0};
         bool read = remote_pspkg_provider_metadata(page.url, &session.cancel, &metadata);
-        if (read && active()) {
+        bool missing = metadata.status == REMOTE_METADATA_MISSING;
+        if (missing) copy_text(link.reason, sizeof link.reason, "missing-page");
+        else if (read && active()) {
             update_pspkg_metadata(&link, &metadata);
             update_pspkg_provider(&link, page.url);
             link.reason[0] = 0;
         }
         pthread_mutex_lock(&orbit.mutex);
-        if (read && page.index < session.pspkg_count && !session.stop &&
+        if ((read || missing) && page.index < session.pspkg_count && !session.stop &&
             !atomic_load(&session.cancel) && selected_locked() && time(NULL) < session.pspkg_expires)
             session.pspkg_links[page.index] = link;
     }
@@ -976,8 +979,8 @@ static void *worker(void *unused) {
                 RemoteFileMetadata metadata = {0};
                 const char *reason = remote_pspkg_route(link->url, link->intermediate, &session.cancel,
                                                        resolved, sizeof resolved, &metadata);
-                if (*reason) copy_text(link->reason, sizeof link->reason, reason);
-                else {
+                copy_text(link->reason, sizeof link->reason, reason);
+                if (resolved[0] && (!*reason || !strcmp(reason, "verify-required"))) {
                     update_pspkg_metadata(link, &metadata);
                     const char *provider = remote_browser_provider(resolved);
                     if (*provider && strlen(resolved) < sizeof link->provider)
@@ -1317,6 +1320,7 @@ cJSON *browser_status(void) {
         cJSON *choices = cJSON_AddArrayToObject(o, "pspkgLinks");
         for (size_t i = 0; !expired && choices && i < session.pspkg_count; i++) {
             const PspkgLink *link = &session.pspkg_links[i];
+            if (!strcmp(link->reason, "missing-page") || !strcmp(link->reason, "provider-unavailable")) continue;
             cJSON *choice = cJSON_CreateObject();
             if (!choice) break;
             char id[24];

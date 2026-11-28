@@ -243,7 +243,8 @@ export function Details({
     if (!file) return r;
     return {
       ...r,
-      providerMissing: file.status === "missing" || file.status === "unsupported-format",
+      providerMissing: file.status === "missing" || file.status === "unsupported-format" ||
+        (!!r.providerMissing && file.status === "fetching"),
       provider: file.provider || r.provider,
       browserAvailable: file.browserAvailable ?? r.browserAvailable,
       directAvailable: file.directAvailable ?? r.directAvailable,
@@ -262,8 +263,8 @@ export function Details({
       metadataSizeOnly: file.sizeOnly,
     };
   });
-  const releases = options.filter((r) => !r.providerMissing || r.torboxPending ||
-    ((r.torboxCached || !providerFiles[r.id]) && torboxAvailable(debrid.status, r)));
+  const releases = options.filter((r) => !r.providerMissing ||
+    (r.torboxCached && torboxAvailable(debrid.status, r)));
   const cacheLabel = (option: Release, prefix = "") =>
     option.torboxCached && torboxAvailable(debrid.status, option) ? prefix + t("Cached") : "";
   // Preserve the game and its library actions when every download option is missing.

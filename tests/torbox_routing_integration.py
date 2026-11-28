@@ -21,7 +21,12 @@ BINARY = os.environ.get("ORBIT_TEST_BINARY", ROOT / "build/orbit-test")
 FILE = b"\x7fFIH" + b"test" * 1023
 VIKING_PAGE = "/pspkg-provider/vikingfile.com/metadata"
 SECOND_PAGE = "/pspkg-provider/buzzheavier.com/metadata"
+BUZZ_CHALLENGE = "/pspkg-provider/buzzheavier.com/challenge"
 FILE_REDIRECT = "/pspkg-provider/vikingfile.com/file-redirect"
+ARCHIVE_FILE = "/pspkg-provider/archive.org/fixture.pkg"
+ARCHIVE_UNAVAILABLE = (b"<title>Item not available</title><h1>Item not available</h1>"
+                       b"<p>The item is not available due to issues with the item's content.</p>")
+BUZZ_REMOVED = b"<p>Try <strong>recovering this file</strong>.</p><button>Download file</button>"
 GTA_SLUG = "grand-theft-auto-vi-14552"
 GTA_HANDOFFS = ("86105", "86106", "86107")
 
@@ -45,6 +50,12 @@ class Fixture(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path == "/services/xauthn/?op=login":
+            result = {"success": True, "values": {"screenname": "Fixture", "cookies": {
+                "logged-in-user": "fixture-user", "logged-in-sig": "fixture-signature",
+            }}}
+            self.reply(json.dumps(result).encode(), headers={"Content-Type": "application/json"})
+            return
         if self.path != "/webdl/createwebdownload":
             self.reply(b"", 404)
             return
@@ -102,7 +113,7 @@ class Fixture(BaseHTTPRequestHandler):
         elif path == "/webdl/requestdl":
             self.api(self.server.base + "/torbox-file")
         elif path == "/ps5/ps5-games-list":
-            if self.server.pspkg_mode == "pages":
+            if self.server.pspkg_mode in ("pages", "pages-missing"):
                 self.reply(f'<a href="/ps5/{GTA_SLUG}.html">Grand Theft Auto VI (GTA 6)</a>'.encode())
             else:
                 self.reply(b'<a href="/ps5/cyberpunk-2077-ultimate-edition-13811.html">Cyberpunk 2077 Ultimate Edition</a>')
@@ -116,6 +127,8 @@ class Fixture(BaseHTTPRequestHandler):
             else:
                 headings = ["PPSA04029 v02.120 EUR PKG", "PPSA04029 v02.120 EUR PKG",
                             "PPSA04029 v02.120 EUR PKG", "PPSA04027 ZSTD", "PPSA04029 PKG"]
+                if self.server.pspkg_mode == "unavailable":
+                    headings.append("PPSA04029 PKG")
                 gates = "".join(f'<h3 class="dpx-edition-title">{heading}</h3>'
                                 f'<div class="dpx-gate" data-field-id="{i}">Awaiting verification</div>'
                                 for i, heading in enumerate(headings, 1))
@@ -128,7 +141,11 @@ class Fixture(BaseHTTPRequestHandler):
                 "2": "http://127.0.0.2/file.pkg",
                 "3": "/pspkg-provider/buzzheavier.com/file.pkg",
             }
-            if self.server.pspkg_mode == "pages":
+            if self.server.pspkg_mode == "unavailable":
+                routes["2"] = ARCHIVE_FILE
+                routes["3"] = SECOND_PAGE
+                routes["6"] = BUZZ_CHALLENGE
+            if self.server.pspkg_mode in ("pages", "pages-missing"):
                 self.reply(b'<button>Continue to Download</button>', headers={"Content-Type": "text/html"})
             elif self.path.endswith("route=expired"):
                 self.reply(b"<p>Verification required</p>", 403, {"Content-Type": "text/html"})
@@ -137,6 +154,8 @@ class Fixture(BaseHTTPRequestHandler):
         elif path == "/catalogue.json":
             packages = [{"title": "Provider page fixture", "titleId": "PPSA98765", "category": "game",
                          "downloadLinks": [{"name": "Provider", "url": self.server.base + "/provider"}]}]
+            if self.server.archive_availability:
+                packages[0]["downloadLinks"] = [{"name": "Archive.org", "url": self.server.base + ARCHIVE_FILE}]
             if self.server.mirrors:
                 packages[0].update(filename="provider.pkg", sizeBytes=len(FILE), checksum=hashlib.sha256(FILE).hexdigest(),
                                    downloadLinks=[{"name": f"Mirror {i}", "url": f"{self.server.base}/mirror-{i}.pkg"}
@@ -153,19 +172,28 @@ class Fixture(BaseHTTPRequestHandler):
             if self.headers.get("Range"):
                 self.reply(b"", 416)
                 return
-            name = "CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode == "pages" else "fixture-release.7z"
+            name = ("CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode in ("pages", "pages-missing")
+                    else "fixture-release.7z")
             self.reply(f'<div id="file-information"><h2 id="filename">{name}</h2>'
                        '<p id="size">199.55 GB</p></div>'.encode(),
                        headers={"Content-Type": "text/html"})
         elif path == SECOND_PAGE:
             self.server.calls.append(path)
-            self.reply(b'<h1 id="filename">backup-fixture.7z</h1><p id="size">1 GB</p>',
-                       headers={"Content-Type": "text/html"})
+            if self.server.pspkg_mode in ("unavailable", "pages-missing"):
+                self.reply(BUZZ_REMOVED, 403, {"Content-Type": "text/html"})
+            else:
+                self.reply(b'<h1 id="filename">backup-fixture.7z</h1><p id="size">1 GB</p>',
+                           headers={"Content-Type": "text/html"})
+        elif path == BUZZ_CHALLENGE:
+            self.reply(BUZZ_REMOVED, 403, {"Content-Type": "text/html", "cf-mitigated": "challenge"})
         elif path == FILE_REDIRECT:
             self.server.calls.append(path)
             self.reply(b"", 302, {"Location": "/original"})
         elif path in ("/original", "/torbox-file", "/mirror-1.pkg", "/mirror-2.pkg") or path.startswith("/pspkg-provider/"):
             self.server.calls.append(path)
+            if path == ARCHIVE_FILE and "logged-in-sig=fixture-signature" not in self.headers.get("Cookie", ""):
+                self.reply(ARCHIVE_UNAVAILABLE, 403, {"Content-Type": "text/html"})
+                return
             if (path == "/original" and self.server.original_fails) or path == self.server.dead_mirror:
                 self.reply(b"<h1>File not found</h1>", 404, {"Content-Type": "text/html"})
                 return
@@ -207,7 +235,7 @@ def wait_for(check, timeout=15):
 class TorBoxRouting(unittest.TestCase):
     def run_download(self, hosters, *, cached=False, truncate=False, original_fails=False, explicit=None,
                      browser=False, processing=None, rejection=None, key="valid", interrupt=None,
-                     transient=False, mirrors=False, pspkg=None, check_cache=False):
+                     transient=False, mirrors=False, pspkg=None, check_cache=False, archive_availability=False):
         with tempfile.TemporaryDirectory() as temp, ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as fixture:
             fixture.base = f"http://127.0.0.1:{fixture.server_port}"
             fixture.calls = []
@@ -219,7 +247,8 @@ class TorBoxRouting(unittest.TestCase):
             fixture.downloads = []
             fixture.original_fails = original_fails
             fixture.truncate = truncate
-            fixture.browser = browser or mirrors
+            fixture.browser = browser or mirrors or archive_availability
+            fixture.archive_availability = archive_availability
             fixture.mirrors = mirrors
             fixture.dead_mirror = None
             fixture.processing = processing
@@ -244,6 +273,8 @@ class TorBoxRouting(unittest.TestCase):
                            ORBIT_TEST_SOURCE="archive", ORBIT_TEST_TORBOX_URL=fixture.base)
                 if fixture.browser:
                     env["ORBIT_TEST_CATALOGUE_URL"] = fixture.base + "/catalogue.json"
+                if archive_availability:
+                    env["ORBIT_TEST_ARCHIVE_URL"] = fixture.base
                 if pspkg:
                     anchor = lambda value: f'<a href="download.php?route={value}">Download</a>'
                     reveal = {"success": True, "fields": {
@@ -259,7 +290,9 @@ class TorBoxRouting(unittest.TestCase):
                     reveal["fields"]["999"] = '<a href="download.php?route=not-this-listing">Unrelated</a>'
                     if pspkg == "metadata":
                         reveal["fields"]["1"] = f'<a href="{fixture.base}{VIKING_PAGE}">Viki</a>'
-                    if pspkg == "pages":
+                    if pspkg == "unavailable":
+                        reveal["fields"]["6"] = anchor("6")
+                    if pspkg in ("pages", "pages-missing"):
                         reveal["fields"] = {"29356": "".join(
                             f'<a href="download.php?game_id=14552&amp;edition_id=29356&amp;link_id={link_id}">Provider</a>'
                             for link_id in GTA_HANDOFFS)}
@@ -301,7 +334,8 @@ class TorBoxRouting(unittest.TestCase):
             if token:
                 headers["Authorization"] = "Bearer " + token
             data = None if body is None else json.dumps(body).encode()
-            with urlopen(Request(f"http://127.0.0.1:{port}/api/v1{path}", data, headers), timeout=3) as reply:
+            with urlopen(Request(f"http://127.0.0.1:{port}/api/v1{path}", data, headers),
+                         timeout=15 if path == "/catalog" else 3) as reply:
                 return json.load(reply)
 
         def connect():
@@ -322,7 +356,7 @@ class TorBoxRouting(unittest.TestCase):
             call("/browser", {"action": "cancel", "id": status["id"]})
         status = wait_for(lambda: result if not (result := call("/browser"))["active"] else None)
         self.assertEqual(status["pspkgGameId"], release["gameId"])
-        if mode == "pages":
+        if mode in ("pages", "pages-missing"):
             self.assertIn("Grand Theft Auto VI", release["title"])
             self.assertEqual(status["pspkgStatus"], "verify-required")
             self.assertEqual([link["handoffId"] for link in status["pspkgLinks"]], list(GTA_HANDOFFS))
@@ -340,10 +374,15 @@ class TorBoxRouting(unittest.TestCase):
             call(endpoint, request)
             result = wait_for(lambda: value if not (value := call("/browser"))["active"] else None)
             self.assertEqual(result["pspkgStatus"], "partial", result)
-            first, second, redirect = result["pspkgLinks"]
+            choices = {link["handoffId"]: link for link in result["pspkgLinks"]}
+            first, redirect = choices[GTA_HANDOFFS[0]], choices[GTA_HANDOFFS[2]]
             self.assertEqual((first["filename"], first["sizeBytes"], first["sizeExact"], first["torboxAvailable"]),
                              ("CODENAME-VICE-Compressed.7z", 199_550_000_000, False, True))
-            self.assertEqual((second["filename"], second["sizeBytes"]), ("backup-fixture.7z", 1_000_000_000))
+            if mode == "pages-missing":
+                self.assertNotIn(GTA_HANDOFFS[1], choices)
+            else:
+                second = choices[GTA_HANDOFFS[1]]
+                self.assertEqual((second["filename"], second["sizeBytes"]), ("backup-fixture.7z", 1_000_000_000))
             self.assertEqual(redirect["reason"], "verify-required")
             self.assertNotIn("providerHost", redirect)
             self.assertEqual(call("/downloads"), [])
@@ -362,6 +401,12 @@ class TorBoxRouting(unittest.TestCase):
             return
         self.assertEqual(status["pspkgStatus"], "partial")
         choices = status["pspkgLinks"]
+        if mode == "unavailable":
+            self.assertEqual([link["number"] for link in choices], [1, 4, 5, 6])
+            self.assertEqual([link["number"] for link in choices if not link["reason"]], [1])
+            self.assertEqual(choices[-1]["reason"], "verify-required")
+            self.assertEqual(call("/downloads"), [])
+            return
         self.assertIn("unsafe-url", [link["reason"] for link in choices])
         gated = next(link for link in choices if link["reason"] == "verify-required")
         self.assertNotIn("sizeBytes", gated)
@@ -426,6 +471,15 @@ class TorBoxRouting(unittest.TestCase):
         self.assertNotIn("/original", calls)
         self.assertNotIn("create", calls)
 
+    def test_pspkg_omits_unavailable_files_from_initial_and_reported_links(self):
+        calls = self.run_download([], pspkg="unavailable")
+        self.assertIn(ARCHIVE_FILE, calls)
+        self.assertIn(SECOND_PAGE, calls)
+        self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="pages-missing")
+
+    def test_archive_file_availability_is_checked_again_after_sign_in(self):
+        self.run_download([], archive_availability=True)
+
     def check_download(self, port, fixture, original_url, cached, explicit, drive, interrupt):
         token = ""
 
@@ -459,6 +513,22 @@ class TorBoxRouting(unittest.TestCase):
                     rejected.exception.close()
         title = "Provider page fixture" if fixture.browser else "Orbit local test file"
         release = wait_for(lambda: next((r for r in call("/catalog") if r["title"] == title), None))
+        if fixture.archive_availability:
+            metadata_url = "/community-metadata?ids=" + release["id"]
+
+            def checked_metadata():
+                result = call(metadata_url)
+                return result["files"][0] if not result["pending"] else None
+
+            self.assertEqual(wait_for(checked_metadata)["status"], "missing")
+            self.assertTrue(all(r["id"] != release["id"] for r in call("/catalog")))
+            account = call("/archive-account", {"action": "sign-in", "email": "fixture@example.com", "password": "fixture"})
+            self.assertTrue(account["signedIn"])
+            self.assertEqual(wait_for(checked_metadata)["status"], "found")
+            self.assertTrue(any(r["id"] == release["id"] for r in call("/catalog")))
+            self.assertFalse(call("/archive-account", {"action": "sign-out"})["signedIn"])
+            self.assertEqual(wait_for(checked_metadata)["status"], "missing")
+            return
         if fixture.browser:
             self.assertGreater(call("/system")["remoteGeneration"], 1)
         if fixture.mirrors:
