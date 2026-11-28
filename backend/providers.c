@@ -504,8 +504,10 @@ bool provider_capture_url(const Release *release, const char *candidate) {
             char filename[160];
             bool named = provider_disposition_name(candidate, filename, sizeof filename) ||
                          remote_url_filename(candidate, filename, sizeof filename);
-            return named && (pspkg_file_candidate(candidate) || provider_transfer_url_allowed(candidate)) &&
-                   strlen(release->title_id) == 9 && strcasestr(filename, release->title_id);
+            const char *match = named && strlen(release->title_id) == 9
+                ? find_nocase(filename, release->title_id) : NULL;
+            return match && !isdigit((unsigned char)match[9]) &&
+                   (pspkg_file_candidate(candidate) || provider_transfer_url_allowed(candidate));
         }
         const char *provider = remote_browser_provider(candidate);
         if (!*provider) return pspkg_file_candidate(candidate);
