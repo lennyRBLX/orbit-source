@@ -97,6 +97,20 @@ test("TorBox coverage wins the default and its size follows the selected deliver
   assert.equal(releaseSize({ ...cached, torboxSizeBytes: 500_000_000 }, true), "500.0 MB");
 });
 
+test("download links with a title ID sort before links without one", () => {
+  const links = [
+    { id: "missing", version: "4.0", format: "PKG", filename: "game.pkg" },
+    { id: "empty", titleId: "", version: "3.0", format: "PKG" },
+    { id: "older", titleId: "PPSA11111", version: "1.0", format: "Game folder" },
+    { id: "blank", titleId: " ", version: "2.0", format: "PKG" },
+    { id: "newer", titleId: "PPSA11111", version: "1.1", format: "Game folder" },
+  ];
+  const expected = ["newer", "older", "missing", "empty", "blank"];
+  assert.deepEqual(sortDownloadLinks(links, () => true).map(({ id }) => id), expected);
+  const catalogue = links.map((link) => ({ ...link, sourceId: "remote" }));
+  assert.deepEqual(sortDownloadLinks(catalogue, () => true).map(({ id }) => id), expected);
+});
+
 test("catalogue download links sort by numeric version, TorBox status and format", () => {
   const option = (id, fields = {}) => ({ ...curated, id, version: "2.10", ...fields });
   const links = [

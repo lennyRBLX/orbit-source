@@ -68,6 +68,7 @@ export function sortDownloadLinks<T extends Release | PspkgChoice>(
       torbox: torboxRank(torboxAvailable(link), link.torboxCached),
       format: formatRank(catalogue ? releaseFormat(link) : link.format),
     };
-  }).sort((a, b) => versionOrder.compare(b.version, a.version) ||
+  }).sort((a, b) => Number(!a.link.titleId?.trim()) - Number(!b.link.titleId?.trim()) ||
+    versionOrder.compare(b.version, a.version) ||
     a.torbox - b.torbox || a.format - b.format).map(({ link }) => link);
 }
