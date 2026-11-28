@@ -77,6 +77,7 @@ typedef struct {
     enum MetadataState torbox_state;
     unsigned torbox_revision;
     bool torbox_cached;
+    int64_t torbox_size;
 } MetadataRequest;
 
 static struct {
@@ -1528,6 +1529,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
                 if (request->torbox_revision != revision) {
                     request->torbox_revision = revision;
                     request->torbox_cached = false;
+                    request->torbox_size = 0;
                     request->torbox_state = META_QUEUED;
                     pthread_cond_signal(&metadata.changed);
                 }
@@ -1558,6 +1560,14 @@ cJSON *remote_metadata_json_locked(const char *ids) {
             !available ? (unsupported ? "unsupported-format" : "missing") : remote_metadata_status(file.status));
         if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", available);
         if (torbox_cached) cJSON_AddTrueToObject(row, "torboxCached");
+        if (torbox_cached) {
+            Release torbox_route;
+            if (remote_torbox_route_locked(release, &torbox_route)) {
+                const MetadataRequest *selected = cached_metadata_locked(torbox_route.id, now);
+                if (selected && selected->torbox_size)
+                    cJSON_AddNumberToObject(row, "torboxSizeBytes", (double)selected->torbox_size);
+            }
+        }
         if (torbox_pending) cJSON_AddTrueToObject(row, "torboxPending");
         if (conflicting_size) cJSON_AddBoolToObject(row, "mirrorSizeConflict", true);
         if (route.id[0]) {
@@ -1569,8 +1579,9 @@ cJSON *remote_metadata_json_locked(const char *ids) {
         }
         cJSON_AddNumberToObject(row, "sizeBytes", (double)(conflicting_size ? 0 : file.size));
         cJSON_AddBoolToObject(row, "exact", !conflicting_size && file.exact);
-        if (file.filename[0]) cJSON_AddStringToObject(row, "filename", file.filename);
-        else if (route.filename[0]) cJSON_AddStringToObject(row, "filename", route.filename);
+        const char *filename = file.filename[0] ? file.filename : route.filename;
+        if (*filename) cJSON_AddStringToObject(row, "filename", filename);
+        if (route.id[0]) catalog_add_resolved_version(row, &route, filename);
         if (file.format[0]) cJSON_AddStringToObject(row, "format", file.format);
         else if (route.format[0] && strcmp(route.format, "Unknown")) cJSON_AddStringToObject(row, "format", route.format);
         if (file.compression[0]) cJSON_AddStringToObject(row, "compression", file.compression);
@@ -1601,15 +1612,18 @@ static void *metadata_worker(void *unused) {
             unsigned sequence = cache->sequence, revision = cache->torbox_revision;
             const Release *release = release_find(cache->id);
             bool cached = false;
+            int64_t size = 0;
             if (cache->expires > time(NULL) && source_enabled_locked(release)) {
                 Release candidate = *release;
+                bool check_account_list = !candidate.size && !cache->file.exact;
                 pthread_mutex_unlock(&orbit.mutex);
-                cached = debrid_check_cached(&candidate, revision);
+                cached = debrid_web_metadata(&candidate, revision, check_account_list, &size);
                 pthread_mutex_lock(&orbit.mutex);
             }
             if (cache->sequence == sequence && cache->torbox_revision == revision) {
                 cache->torbox_state = META_DONE;
                 cache->torbox_cached = cached;
+                cache->torbox_size = size;
             }
             continue;
         }

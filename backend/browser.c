@@ -738,16 +738,15 @@ static void download_pspkg(void) {
     if (choice.size && !choice.size_exact) route.display_size = choice.size;
     remote_pspkg_identify_choice(&route, choice.url, selected_index);
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
-    bool cached = false;
+    bool prefer_torbox = false;
     if (*provider) {
         copy_text(route.remote_provider_page, sizeof route.remote_provider_page, locator.url);
         route.url[0] = 0;
         pthread_mutex_lock(&orbit.mutex);
-        cached = session.pspkg_torbox && choice.torbox_cached_revision &&
-                 choice.torbox_cached_revision == debrid_cache_revision_locked(&route);
+        prefer_torbox = session.pspkg_torbox && debrid_link_covered_locked(&route);
         pthread_mutex_unlock(&orbit.mutex);
     }
-    bool missing = *provider && !cached && remote_download_confirm_missing(locator.url, &session.cancel);
+    bool missing = *provider && !prefer_torbox && remote_download_confirm_missing(locator.url, &session.cancel);
     if (missing) {
         copy_text(error, sizeof error, REMOTE_DOWNLOAD_REMOVED);
         ok = false;
@@ -838,7 +837,9 @@ static void update_pspkg_provider(PspkgLink *link, const char *url) {
     pthread_mutex_lock(&orbit.mutex);
     unsigned revision = link->archive_requires_login ? 0 : debrid_cache_revision_locked(&route);
     pthread_mutex_unlock(&orbit.mutex);
-    link->torbox_cached_revision = revision && debrid_check_cached(&route, revision) ? revision : 0;
+    link->torbox_size = 0;
+    link->torbox_cached_revision = revision &&
+        debrid_web_metadata(&route, revision, !link->size_exact, &link->torbox_size) ? revision : 0;
 }
 
 static void pspkg_choices_ready_locked(void) {
@@ -1362,8 +1363,10 @@ cJSON *browser_status(void) {
                 cJSON_AddBoolToObject(choice, "torboxAvailable",
                                       !link->archive_requires_login && debrid_link_covered_locked(&route));
                 if (link->torbox_cached_revision &&
-                    link->torbox_cached_revision == debrid_cache_revision_locked(&route))
+                    link->torbox_cached_revision == debrid_cache_revision_locked(&route)) {
                     cJSON_AddTrueToObject(choice, "torboxCached");
+                    if (link->torbox_size) cJSON_AddNumberToObject(choice, "torboxSizeBytes", (double)link->torbox_size);
+                }
             }
             cJSON_AddItemToArray(choices, choice);
         }

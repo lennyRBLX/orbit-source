@@ -12,7 +12,8 @@ int debrid_prepare_locked(const Release *release, Job *job, char *error, size_t 
 bool debrid_default_locked(const Release *release);
 bool debrid_link_covered_locked(const Release *release);
 unsigned debrid_cache_revision_locked(const Release *release);
-bool debrid_check_cached(const Release *release, unsigned revision);
+/* Read-only. Returns a cache hit, including a ready account record when requested. */
+bool debrid_web_metadata(const Release *release, unsigned revision, bool check_account_list, int64_t *size);
 bool debrid_job_account_locked(const Job *job);
 /* Runs on the download worker. */
 DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at,

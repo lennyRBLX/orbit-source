@@ -458,7 +458,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                                  b'<h1>Fixture.7z</h1><span>109.65 GB</span>'
                                  + b' ' * 300 +
                                  b'<div><span>your-big-file.zip</span><span>12.00 GB</span></div>'),
-            "1fichier": (200, b'<div><span id="file-title" class="heading tier-name">Fixture.fpkg</span>'
+            "1fichier": (200, b'<div><span id="file-title" class="heading tier-name">Cyberpunk 2077 02.120 PPSA04029.rar</span>'
                               b'<span class="tier-feat"><strong>127.13 GB</strong></span></div>'),
             "rapidgator": (200, b'<title>Download Fixture.rar - Rapidgator</title>'
                                 b'<p>Maximum file size: <strong>900 TB</strong></p>'
@@ -542,7 +542,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 for key, filename, fmt, compression, size, exact in (
                     ("akira", "Fixture.rar", "Game folder", "rar", 118400000000, False),
                     ("akira-image", "Fixture.7z", "Game folder", "7z", 109650000000, False),
-                    ("1fichier", "Fixture.fpkg", "FPKG", None, 127130000000, False),
+                    ("1fichier", "Cyberpunk 2077 02.120 PPSA04029.rar", "Game folder", "rar", 127130000000, False),
                     ("rapidgator", "Fixture.rar", "Game folder", "rar", 118400000000, False),
                     ("buzz", "Fixture.zip", "Game folder", "zip", int(3.75 * 1024 ** 3), False),
                     ("buzz-sibling", "Fixture.zip", "Game folder", "zip", 42 * 1024 ** 2, False),
@@ -559,6 +559,8 @@ class RemoteCatalogueTests(unittest.TestCase):
                         self.assertEqual(row["status"], "found" if size else "parse-no-size")
                         self.assertEqual((row["filename"], row["format"], row.get("compression"),
                                           row["sizeBytes"], row["exact"]), (filename, fmt, compression, size, exact))
+                self.assertEqual(results[rows["1fichier"]]["resolvedVersion"], "02.120")
+                self.assertNotIn("resolvedVersion", results[rows["datavaults"]])
                 for key in ("viking", "no-type", "not-found", "deleted", "removed", "rootz/dead",
                             "challenge", "challenge-ok", "provider-error", "fake-name", "unsupported-title", "data-passive-cf", "archive-404"):
                     with self.subTest(page=key):

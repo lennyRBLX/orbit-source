@@ -7,6 +7,7 @@
 #include "orbit.h"
 #include "catalog_view.h"
 #include "firmware.h"
+#include "pspkg.h"
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -147,6 +148,17 @@ static bool describe_mirrors(cJSON *entry, const Release *r, const Release *cons
            (!metadata || cJSON_AddTrueToObject(entry, "providerMetadata"));
 }
 
+bool catalog_add_resolved_version(cJSON *entry, const Release *r, const char *filename) {
+    const char *version = r->remote_version;
+    char inferred[sizeof r->remote_version];
+    if (!*version) {
+        if (!*filename && !r->remote_filename_synthetic) filename = r->remote_filename;
+        pspkg_display_version("", filename, inferred, sizeof inferred);
+        version = inferred;
+    }
+    return !*version || cJSON_AddStringToObject(entry, "resolvedVersion", version);
+}
+
 cJSON *catalog_remote_choice_locked(const Release *r, const Release *const *group, size_t count) {
     cJSON *entry = release_json(r);
     if (!entry) return NULL;
@@ -167,6 +179,7 @@ cJSON *catalog_remote_choice_locked(const Release *r, const Release *const *grou
          cJSON_AddBoolToObject(entry, "browserAvailable", remote_page_pending(r)) &&
          cJSON_AddBoolToObject(entry, "directAvailable", !remote_page_pending(r));
     if (ok) ok = describe_mirrors(entry, r, group, count);
+    if (ok && !r->remote_version[0]) ok = catalog_add_resolved_version(entry, r, r->filename);
     firmware_describe(entry, orbit.firmware);
     if (!ok) { cJSON_Delete(entry); return NULL; }
     return entry;

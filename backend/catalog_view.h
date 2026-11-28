@@ -27,5 +27,6 @@ void catalog_body_release(void *body);
 /* Frees the cached bodies at shutdown. Responses being sent keep theirs. */
 void catalog_view_clear(void);
 cJSON *catalog_remote_choice_locked(const Release *r, const Release *const *group, size_t count);
+bool catalog_add_resolved_version(cJSON *entry, const Release *r, const char *filename);
 
 #endif

@@ -33,6 +33,7 @@ export interface Release extends AddonIdentity {
   torboxHost?: string;
   torboxHosts?: string[];
   torboxCached?: boolean;
+  torboxSizeBytes?: number;
   torboxPending?: boolean;
   mirrorCount?: number;
   providerMetadata?: boolean;
@@ -48,6 +49,7 @@ export interface Release extends AddonIdentity {
   notes?: string;
   region?: "EUR" | "USA" | "JPN" | "ASIA" | null;
   version: string | null;
+  resolvedVersion?: string;
   filename: string;
   cover: string;
   hero: string;
@@ -118,12 +120,17 @@ export const releaseProvider = (release: Release) => {
     ? name + " · " + t("{count} mirrors", { count: release.mirrorCount })
     : name;
 };
-export const releaseSize = (release: Release) =>
-  release.sizeBytes || release.sourceId !== "remote"
-    ? bytes(release.sizeBytes)
-    : release.sizeEstimateBytes
-      ? `${release.sizeEstimateExact ? "" : "≈"}${bytes(release.sizeEstimateBytes)}`
-      : t("Unknown size");
+export const formatVersion = (version?: string | null) =>
+  (version || "").trim().replace(/^(?:v+\s*)?(?=\d)/i, "v");
+export const releaseVersion = (release: Release) =>
+  formatVersion(release.version) || formatVersion(release.resolvedVersion);
+export function releaseSize(release: Release, useTorbox = false) {
+  if (useTorbox && release.torboxSizeBytes) return bytes(release.torboxSizeBytes);
+  if (release.sizeBytes || release.sourceId !== "remote") return bytes(release.sizeBytes);
+  return release.sizeEstimateBytes
+    ? `${release.sizeEstimateExact ? "" : "≈"}${bytes(release.sizeEstimateBytes)}`
+    : t("Unknown size");
+}
 export interface Storage {
   id: string;
   label: string;
@@ -418,6 +425,7 @@ export interface PspkgChoice {
   providerHost?: string;
   torboxAvailable?: boolean;
   torboxCached?: boolean;
+  torboxSizeBytes?: number;
 }
 
 export interface BrowserSession {

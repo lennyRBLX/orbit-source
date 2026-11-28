@@ -10,7 +10,8 @@ const { outputFiles } = await build({
       export { groupGames } from "./src/catalog";
       export { releaseMatches } from "./src/browse";
       export { releaseState } from "./src/collection";
-      export { formatLabel } from "./src/types";
+      export { formatLabel, releaseSize, releaseVersion } from "./src/types";
+      export { preferredRelease } from "./src/downloadChoice";
     `,
     resolveDir: fileURLToPath(new URL("..", import.meta.url)),
   },
@@ -19,7 +20,7 @@ const { outputFiles } = await build({
   format: "esm",
   platform: "node",
 });
-const { groupGames, releaseMatches, releaseState, formatLabel } = await import(
+const { groupGames, releaseMatches, releaseState, formatLabel, releaseSize, releaseVersion, preferredRelease } = await import(
   `data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString("base64")}`
 );
 
@@ -69,4 +70,23 @@ test("provider options have a usable label while the file type is pending", () =
   assert.equal(formatLabel({ format: "Unknown" }), "Download");
   assert.equal(formatLabel({ format: "Unknown", compression: "zip" }), "ZIP");
   assert.equal(formatLabel({ format: "PKG", compression: "rar" }), "RAR · PKG");
+});
+
+test("version labels prefer source metadata and use one prefix without dropping digits", () => {
+  assert.equal(releaseVersion({ version: "02.120" }), "v02.120");
+  assert.equal(releaseVersion({ version: "v02.120" }), "v02.120");
+  assert.equal(releaseVersion({ version: "VV02.120" }), "v02.120");
+  assert.equal(releaseVersion({ resolvedVersion: "02.120" }), "v02.120");
+  assert.equal(releaseVersion({ version: "01.00", resolvedVersion: "02.120" }), "v01.00");
+  assert.equal(releaseVersion({}), "");
+});
+
+test("TorBox coverage wins the default and its size follows the selected delivery", () => {
+  const torbox = { ...mirror, torboxHost: "buzzheavier.com", sizeBytes: 0, torboxSizeBytes: 118400000000 };
+  const hosts = new Set(["buzzheavier.com"]);
+  const last = { source: curated.sourceId, format: curated.format };
+  assert.equal(preferredRelease([curated, torbox], undefined, last, hosts), torbox);
+  assert.equal(preferredRelease([curated, torbox], { ...filters, source: ["archive"] }, last, hosts), curated);
+  assert.equal(releaseSize(torbox, true), "118.4 GB");
+  assert.equal(releaseSize(torbox), "Unknown size");
 });

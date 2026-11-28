@@ -21,6 +21,7 @@
 #define HOST_TTL 600
 #define HOST_COUNT 5
 #define CACHE_PATH "/webdl/checkcached?"
+#define WEB_LIST_PATH "/webdl/mylist?limit=1000"
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
@@ -53,6 +54,12 @@ static struct {
     DebridHost *community_hosts;
     size_t community_host_count;
 } debrid;
+static struct {
+    pthread_mutex_t mutex;
+    cJSON *reply;
+    unsigned revision;
+    time_t expires;
+} web_metadata = {.mutex = PTHREAD_MUTEX_INITIALIZER};
 typedef struct {
     char *body;
     size_t length;
@@ -484,6 +491,11 @@ void debrid_stop(void) {
     debrid.community_host_count = 0;
     OPENSSL_cleanse(debrid.key, sizeof debrid.key); OPENSSL_cleanse(debrid.pending_key, sizeof debrid.pending_key);
     pthread_mutex_unlock(&orbit.mutex);
+    pthread_mutex_lock(&web_metadata.mutex);
+    cJSON_Delete(web_metadata.reply);
+    web_metadata.reply = NULL;
+    web_metadata.expires = 0;
+    pthread_mutex_unlock(&web_metadata.mutex);
 }
 cJSON *debrid_status(void) {
     pthread_mutex_lock(&orbit.mutex);
@@ -571,7 +583,58 @@ unsigned debrid_cache_revision_locked(const Release *r) {
     return !debrid.busy && debrid_link_covered_locked(r) ? debrid.revision : 0;
 }
 
-bool debrid_check_cached(const Release *r, unsigned revision) {
+static bool item_ready(const cJSON *item);
+
+static const char *web_filename(const cJSON *file) {
+    const char *name = json_text(file, "short_name");
+    return *name ? name : json_text(file, "name");
+}
+
+static const cJSON *single_web_file(const cJSON *item) {
+    const cJSON *files = cJSON_GetObjectItemCaseSensitive(item, "files");
+    const cJSON *file = cJSON_GetArrayItem(files, 0);
+    return cJSON_IsArray(files) && cJSON_GetArraySize(files) == 1 &&
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "infected")) &&
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "zipped")) ? file : NULL;
+}
+
+static int64_t web_file_size(const Release *r, const cJSON *file, const char *name) {
+    int64_t size;
+    if (!identifier(file, "size", &size) || !size || (r->size > 0 && r->size != size))
+        return 0;
+    if (r->filename[0] && !release_filename_matches(r, name)) return 0;
+    Release candidate = *r;
+    return remote_provider_file_format(&candidate, name, NULL) ? 0 : size;
+}
+
+static int64_t account_web_size(const Release *r, const char *key, unsigned revision, time_t *retry) {
+    pthread_mutex_lock(&web_metadata.mutex);
+    if (halted(NULL)) {
+        pthread_mutex_unlock(&web_metadata.mutex);
+        return 0;
+    }
+    time_t now = time(NULL);
+    if (web_metadata.revision != revision || now >= web_metadata.expires) {
+        char error[256] = "";
+        cJSON_Delete(web_metadata.reply);
+        web_metadata.reply = call(key, WEB_LIST_PATH, NULL, true, NULL, retry, error, sizeof error, NULL);
+        web_metadata.revision = revision;
+        web_metadata.expires = time(NULL) + 60;
+    }
+    const cJSON *items = cJSON_GetObjectItemCaseSensitive(web_metadata.reply, "data"), *item;
+    const char *url = provider_torbox_url(r);
+    int64_t size = 0;
+    cJSON_ArrayForEach(item, (cJSON_IsArray(items) ? items : NULL)) {
+        if (strcmp(json_text(item, "original_url"), url) || !item_ready(item)) continue;
+        const cJSON *file = single_web_file(item);
+        if ((size = web_file_size(r, file, web_filename(file)))) break;
+    }
+    pthread_mutex_unlock(&web_metadata.mutex);
+    return size;
+}
+
+bool debrid_web_metadata(const Release *r, unsigned revision, bool check_account_list, int64_t *size) {
+    *size = 0;
     const char *url = provider_torbox_url(r);
     unsigned char digest[16];
     unsigned length = 0;
@@ -589,19 +652,35 @@ bool debrid_check_cached(const Release *r, unsigned revision) {
 
     char err[256] = "";
     char path[96];
-    snprintf(path, sizeof path, CACHE_PATH "format=object&list_files=false&hash=%s", link_hash);
+    snprintf(path, sizeof path, CACHE_PATH "format=object&list_files=true&hash=%s", link_hash);
     time_t retry = 0;
     cJSON *reply = call(key, path, NULL, true, NULL, &retry, err, sizeof err, NULL);
-    OPENSSL_cleanse(key, sizeof key);
     const cJSON *data = cJSON_GetObjectItemCaseSensitive(reply, "data");
     const cJSON *entry = cJSON_GetObjectItemCaseSensitive(data, link_hash);
     bool cached = cJSON_IsObject(entry) && !strcasecmp(json_text(entry, "hash"), link_hash) &&
                   !cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(entry, "cached"));
+    int64_t bytes = 0;
+    if (cached) {
+        const cJSON *files = cJSON_GetObjectItemCaseSensitive(entry, "files");
+        if (cJSON_IsArray(files) && cJSON_GetArraySize(files) != 1) cached = false;
+        if (cached && files) {
+            const cJSON *file = single_web_file(entry);
+            bytes = web_file_size(r, file, web_filename(file));
+        } else if (cached) {
+            bytes = web_file_size(r, entry, json_text(entry, "name"));
+        }
+    }
     cJSON_Delete(reply);
+    if (!bytes && check_account_list && retry <= time(NULL)) {
+        bytes = account_web_size(r, key, revision, &retry);
+        cached |= bytes > 0;
+    }
+    OPENSSL_cleanse(key, sizeof key);
     pthread_mutex_lock(&orbit.mutex);
     current = revision == debrid_cache_revision_locked(r);
     if (current && retry > debrid.cache_retry_at) debrid.cache_retry_at = retry;
     pthread_mutex_unlock(&orbit.mutex);
+    if (current) *size = bytes;
     return current && cached;
 }
 bool debrid_job_account_locked(const Job *job) {
@@ -776,16 +855,12 @@ DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, t
         if (stuck) { copy_text(err, cap, TORBOX_STALLED); goto end; }
         *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end;
     }
-    const cJSON *files = cJSON_GetObjectItemCaseSensitive(item, "files");
-    const cJSON *file = cJSON_GetArrayItem(files, 0); int64_t file_id = -1, size = 0;
-    const char *name = json_text(file, "short_name");
-    if (!*name) name = json_text(file, "name");
+    const cJSON *file = single_web_file(item);
+    int64_t file_id = -1, size = 0;
+    const char *name = web_filename(file);
     bool needs_metadata = !strcmp(resolved->source, "remote") && (!resolved->filename[0] || !resolved->size);
     Release selected = *resolved;
-    bool match = cJSON_IsArray(files) && cJSON_GetArraySize(files) == 1 &&
-        identifier(file, "id", &file_id) && identifier(file, "size", &size) && size > 0 &&
-        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "infected")) &&
-        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "zipped")) &&
+    bool match = identifier(file, "id", &file_id) && identifier(file, "size", &size) && size > 0 &&
         (job->debrid_file < 0 || job->debrid_file == file_id);
     if (match && using_mirror) {
         Release file_from_mirror = *route;

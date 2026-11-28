@@ -1,10 +1,11 @@
-import { releaseProvider } from "./types";
 // Get everything: the game and its DLC in one checklist, added to Downloads in
 // order with Download all (POST /api/v1/bundles), then each row's progress. One
 // model; each look draws it its own way.
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import {
   bytes,
+  releaseProvider,
+  releaseVersion,
   type Bundle,
   type BundleItem,
   type Game,
@@ -274,6 +275,7 @@ export function StoreEverything({ m, close }: { m: Everything; close: () => void
           <div className="everything-rows" role="group" aria-label={t("Get everything")}>
             {m.rows.map((row, i) => {
               const on = m.ticked.has(row.key) && !row.installed;
+              const version = row.kind === "game" ? releaseVersion(row.release) : "";
               return (
                 <button
                   key={row.key}
@@ -287,8 +289,8 @@ export function StoreEverything({ m, close }: { m: Everything; close: () => void
                   <span>
                     <strong><bdi>{rowTitle(row)}</bdi></strong>
                     <small>
-                      {row.kind === "game" && row.release.version
-                        ? `${releaseProvider(row.release)} · ${t("version {version}", { version: row.release.version })}`
+                      {version
+                        ? `${releaseProvider(row.release)} · ${t("version {version}", { version })}`
                         : rowSource(row)}
                     </small>
                   </span>

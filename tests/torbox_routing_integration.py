@@ -92,9 +92,14 @@ class Fixture(BaseHTTPRequestHandler):
             if self.headers.get("Authorization") != "Bearer orbit-test-fixture-key":
                 self.api(None, 401)
             else:
-                self.api({digest: {"hash": digest, "name": "provider.pkg", "size": len(FILE)}}
+                self.api({digest: {"hash": digest, "name": "provider.pkg", "size": len(FILE),
+                                   "files": [{"short_name": "provider.pkg", "size": len(FILE)}]}}
                          if digest in params.get("hash", []) else {})
         elif path == "/webdl/mylist":
+            if "bypass_cache" not in parse_qs(urlsplit(self.path).query):
+                self.server.calls.append("metadata-list")
+                self.api(self.server.downloads)
+                return
             self.server.calls.append("list")
             self.server.polls += 1
             if self.server.transient and self.server.polls == 1:
@@ -238,14 +243,16 @@ def wait_for(check, timeout=15):
 class TorBoxRouting(unittest.TestCase):
     def run_download(self, hosters, *, cached=False, truncate=False, original_fails=False, explicit=None,
                      browser=False, processing=None, rejection=None, key="valid", interrupt=None,
-                     transient=False, mirrors=False, pspkg=None, check_cache=False, archive_availability=False):
+                     transient=False, mirrors=False, pspkg=None, check_cache=False, archive_availability=False,
+                     account_only=False):
         with tempfile.TemporaryDirectory() as temp, ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as fixture:
             fixture.base = f"http://127.0.0.1:{fixture.server_port}"
             fixture.calls = []
             fixture.check_cache = check_cache
             fixture.cache_queries = []
             cache_url = "/pspkg-provider/buzzheavier.com/file.pkg" if pspkg else "/provider"
-            fixture.cache_hash = hashlib.md5((fixture.base + cache_url).encode()).hexdigest() if cached or pspkg == "supported" else ""
+            fixture.cache_hash = (hashlib.md5((fixture.base + cache_url).encode()).hexdigest()
+                                  if (cached and not account_only) or pspkg == "supported" else "")
             fixture.hosters = hosters
             fixture.downloads = []
             fixture.original_fails = original_fails
@@ -571,10 +578,13 @@ class TorBoxRouting(unittest.TestCase):
 
             row = wait_for(metadata_done)
             self.assertEqual(bool(row.get("torboxCached")), cached)
+            self.assertEqual(row.get("torboxSizeBytes"), len(FILE) if cached else None)
+            self.assertNotIn("create", fixture.calls)
+            self.assertNotIn("/torbox-file", fixture.calls)
             if any(h["status"] for h in fixture.hosters):
                 digest = hashlib.md5(original_url.encode()).hexdigest()
                 self.assertEqual(fixture.cache_queries,
-                                 [{"format": ["object"], "list_files": ["false"], "hash": [digest]}])
+                                 [{"format": ["object"], "list_files": ["true"], "hash": [digest]}])
             else:
                 self.assertEqual(fixture.cache_queries, [])
             if fixture.original_fails:
@@ -628,6 +638,12 @@ class TorBoxRouting(unittest.TestCase):
             with self.subTest(up=up, cached=cached, missing=missing):
                 self.run_download([{"domains": ["127.0.0.1"], "status": up}], browser=True,
                                   cached=cached, original_fails=missing, check_cache=True)
+
+    def test_ready_account_item_supplies_size_after_cache_miss(self):
+        calls = self.run_download([{"domains": ["127.0.0.1"], "status": True}], browser=True,
+                                  cached=True, original_fails=True, check_cache=True, account_only=True)
+        self.assertEqual(calls.count("metadata-list"), 1)
+        self.assertIn("/torbox-file", calls)
 
     def test_processing_is_polled_before_using_the_cached_file(self):
         calls = self.run_download([{"domains": ["127.0.0.1"], "status": True}],

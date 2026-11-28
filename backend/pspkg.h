@@ -14,7 +14,7 @@ typedef struct {
     char label[128], edition[128], title_id[16], version[32], region[32], format[24], compression[16];
     char group[128], filename[160], archive_password[129];
     char reason[32];
-    int64_t size;
+    int64_t size, torbox_size;
     unsigned torbox_cached_revision;
     bool intermediate, size_exact, archive_requires_login;
 } PspkgLink;

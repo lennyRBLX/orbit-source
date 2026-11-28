@@ -10,9 +10,11 @@ import { useDebrid, torboxAvailable } from "./Debrid";
 import {
   bytes,
   formatLabel,
+  formatVersion,
   type Release,
   releaseProvider,
   releaseSize,
+  releaseVersion,
   type Game,
   type BrowserSession,
   type Job,
@@ -172,7 +174,7 @@ export function Details({
   type CommunityTitle = { releases: Release[]; pspkg: PspkgListing[]; pspkgIndexed: boolean; pspkgPending: boolean };
   const [community, setCommunity] = useState<CommunityTitle>();
   const [pspkgListing, setPspkgListing] = useState("");
-  const [pspkgDelivery, setPspkgDelivery] = useState<"torbox" | "direct">("direct");
+  const [pspkgDelivery, setPspkgDelivery] = useState<"torbox" | "direct">("torbox");
   const anchorId = game.releases[0]?.id;
   useEffect(() => {
     if (!system?.paired || !anchorId || game.addonId) return;
@@ -204,8 +206,8 @@ export function Details({
     exact: boolean;
     mirrorCount?: number;
   } &
-    Partial<Pick<Release, "filename" | "filenameHint" | "format" | "compression" | "provider" |
-      "torboxHosts" | "torboxCached" | "torboxPending" | "browserAvailable" | "directAvailable" | "sizeEstimateBytes">>;
+    Partial<Pick<Release, "filename" | "filenameHint" | "resolvedVersion" | "format" | "compression" | "provider" |
+      "torboxHosts" | "torboxCached" | "torboxSizeBytes" | "torboxPending" | "browserAvailable" | "directAvailable" | "sizeEstimateBytes">>;
   const [providerFiles, setProviderFiles] = useState<Record<string, ProviderFile>>({});
   const torboxRevision = debrid.status?.connected && !debrid.status.busy ? debrid.status.revision : undefined;
   const metadataIds = communityOptions
@@ -252,10 +254,12 @@ export function Details({
       torboxHost: file.torboxHosts ? undefined : r.torboxHost,
       torboxHosts: file.torboxHosts ?? r.torboxHosts,
       torboxCached: file.torboxCached,
+      torboxSizeBytes: file.torboxSizeBytes,
       torboxPending: file.torboxPending,
       mirrorCount: file.mirrorCount ?? r.mirrorCount,
       filename: file.provider ? file.filename || "" : file.filename || r.filename,
       filenameHint: file.provider ? file.filenameHint : r.filenameHint,
+      resolvedVersion: file.provider || file.filename ? file.resolvedVersion : r.resolvedVersion,
       format: file.format || r.format,
       compression: file.provider ? file.compression : r.compression,
       sizeEstimateBytes: file.sizeBytes || (file.provider ? file.sizeEstimateBytes : r.sizeEstimateBytes),
@@ -269,29 +273,31 @@ export function Details({
   const cacheLabel = (option: Release, prefix = "") =>
     option.torboxCached && torboxAvailable(debrid.status, option) ? prefix + t("Cached") : "";
   // Preserve the game and its library actions when every download option is missing.
-  const release =
-      releases.find((r) => r.id === releaseId) || releases[0] ||
-      options.find((r) => r.id === releaseId) || options[0],
-    drive = destination
-      ? drives.find((d) => d.id === destination)
-      : defaultDrive(drives, system?.preferredStorage, release, jobs),
-    // Jobs are per option and drive. A finished one can be downloaded again once its file is gone.
-    existing = jobs.find(
-      (job) => job.releaseId === release.id && job.storageId === drive?.id,
-    ),
-    space = drive ? downloadSpacePlan(release, drive, jobs) : null,
-    planned = space?.planned,
-    afterDownload = space?.after ?? 0,
-    enough = space?.enough;
+  const release = releases.find((r) => r.id === releaseId) || releases[0] ||
+    options.find((r) => r.id === releaseId) || options[0];
   const isPspkg = release.sourceId === "remote" && release.provider === "PSPKG";
+  const version = releaseVersion(release);
   const pspkgHere = browser?.pspkgGameId === game.id || browser?.pspkgReleaseId === release.id ? browser : null;
   const listings = community?.pspkg.length ? community.pspkg : isPspkg ? [{ id: release.id, title: release.title, titleIdMatch: false }] : [];
   const listingId = pspkgListing || pspkgHere?.pspkgReleaseId ||
     listings.find((listing) => listing.titleIdMatch)?.id || listings[0]?.id;
   const pspkgLinks = pspkgHere?.pspkgReleaseId === listingId ? pspkgHere?.pspkgLinks || [] : [];
   const canTorbox = torboxAvailable(debrid.status, release) && (!release.providerMissing || !!release.torboxCached);
-  const delivery = release.providerMissing && canTorbox ? "torbox" : deliveryChoice ?? undefined;
+  const delivery = release.providerMissing && canTorbox ? "torbox" : deliveryChoice ?? (canTorbox ? "torbox" : undefined);
   const torbox = !isPspkg && canTorbox && delivery !== "direct";
+  const displaySize = (option: Release) => releaseSize(option,
+    option.id === release.id ? torbox : torboxAvailable(debrid.status, option));
+  const transferRelease = torbox && release.torboxSizeBytes
+    ? { ...release, sizeBytes: release.torboxSizeBytes } : release;
+  const drive = destination
+    ? drives.find((d) => d.id === destination)
+    : defaultDrive(drives, system?.preferredStorage, transferRelease, jobs);
+  // Jobs are per option and drive. A finished one can be downloaded again once its file is gone.
+  const existing = jobs.find((job) => job.releaseId === release.id && job.storageId === drive?.id);
+  const space = drive ? downloadSpacePlan(transferRelease, drive, jobs) : null;
+  const planned = space?.planned;
+  const afterDownload = space?.after ?? 0;
+  const enough = space?.enough;
   const useBrowser = isPspkg || (!!release.browserAvailable && !release.providerMissing && !torbox);
   const resolveCommunityOption = useBrowser && release.sourceId === "remote";
   // Get everything: this option with its DLC, on the drive Download uses.
@@ -348,9 +354,9 @@ export function Details({
     if (!drive) return;
     openFreeSpace({
       storageId: drive.id,
-      need: { sizeBytes: release.sizeBytes, bytes: (planned ? 0 : release.sizeBytes) + 16 * 1024 ** 2 },
+      need: { sizeBytes: transferRelease.sizeBytes, bytes: (planned ? 0 : transferRelease.sizeBytes) + 16 * 1024 ** 2 },
       then: { kind: "download", run: () => run() },
-      others: drives.filter((d) => d.id !== drive.id && downloadSpacePlan(release, d, jobs).enough),
+      others: drives.filter((d) => d.id !== drive.id && downloadSpacePlan(transferRelease, d, jobs).enough),
       useDrive: (id) => { setDestination(id); run(id); },
     });
   }
@@ -412,8 +418,7 @@ export function Details({
     setPending(true);
     setError("");
     try {
-      const link = pspkgLinks.find((choice) => choice.id === linkId);
-      await downloadPspkgLink(listingId, linkId, drive.id, link?.torboxAvailable ? pspkgDelivery : "direct");
+      await downloadPspkgLink(listingId, linkId, drive.id, pspkgDelivery);
       setSheet(null);
     } catch (e) {
       setError((e as Error).message);
@@ -545,20 +550,24 @@ export function Details({
           )}
           {pspkgLinks.length > 0 && (
             <div className="pspkg-link-list">
-              {pspkgLinks.map((link) => (
-                <button key={link.id} type="button"
-                  disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
-                  onClick={() => void selectPspkgLink(link.id)}>
-                  <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
-                  <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
-                    link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
-                  {(link.version || link.filename || link.sizeBytes || link.hasArchivePassword) ? (
-                    <small>{[link.version && `v${link.version.replace(/^v/i, "")}`,
-                      link.filename, link.sizeBytes && `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}`,
-                      link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
-                  ) : null}
-                </button>
-              ))}
+              {pspkgLinks.map((link) => {
+                const size = pspkgDelivery === "torbox" && link.torboxAvailable && link.torboxSizeBytes
+                  ? bytes(link.torboxSizeBytes)
+                  : link.sizeBytes ? `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}` : "";
+                return (
+                  <button key={link.id} type="button"
+                    disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
+                    onClick={() => void selectPspkgLink(link.id)}>
+                    <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
+                    <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
+                      link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
+                    {(link.version || link.filename || size || link.hasArchivePassword) ? (
+                      <small>{[formatVersion(link.version), link.filename, size,
+                        link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
+                    ) : null}
+                  </button>
+                );
+              })}
             </div>
           )}
         </>
@@ -655,9 +664,8 @@ export function Details({
             {releaseProvider(release)} · {formatLabel(release)}
           </strong>
           <small>
-            {release.version &&
-              `${t("version {version}", { version: release.version })} · `}
-            {releaseSize(release)}
+            {version && `${t("version {version}", { version })} · `}
+            {displaySize(release)}
           </small>
         </span>
         <Icon name="chevron" />
@@ -769,18 +777,19 @@ export function Details({
           <dt>{t("Source")}</dt>
           <dd>{releaseProvider(release)}</dd>
         </div>
-        {release.version && (
+        {version && (
           <div>
             <dt>{t("Version")}</dt>
-            <dd>{release.version}</dd>
+            <dd>{version}</dd>
           </div>
         )}
         <div>
           <dt>{release.compression ? t("Compressed size") : t("Download size")}</dt>
-          <dd>{releaseSize(release)}
-            {release.metadataStatus === "ambiguous-size" && <small> · {t("Conflicting reported sizes")}</small>}
+          <dd>{displaySize(release)}
+            {release.metadataStatus === "ambiguous-size" && !(torbox && release.torboxSizeBytes) &&
+              <small> · {t("Conflicting reported sizes")}</small>}
             {release.metadataSizeOnly && <small> · {t("Filename unverified")}</small>}
-            {!release.sizeBytes && !release.sizeEstimateBytes && release.metadataStatus &&
+            {!release.sizeBytes && !release.sizeEstimateBytes && !(torbox && release.torboxSizeBytes) && release.metadataStatus &&
               release.metadataStatus !== "ambiguous-size" && <small> · {metadataReason(release.metadataStatus)}</small>}
           </dd>
         </div>
@@ -832,8 +841,8 @@ export function Details({
   // What the main button does, under its label: size and drive, or the handoff.
   const primaryDetail =
     showDownload && drive
-      ? t("{size} · to {drive}", { size: releaseSize(release), drive: placeName(drive.label) })
-      : releaseSize(release);
+      ? t("{size} · to {drive}", { size: displaySize(release), drive: placeName(drive.label) })
+      : displaySize(release);
   if (iface === "crossbar") {
     const notes = (
       <>
@@ -968,9 +977,9 @@ export function Details({
             on: release.id === option.id,
             title: `${releaseProvider(option)} · ${formatLabel(option)}`,
             sub: [
-              releaseSize(option),
+              displaySize(option),
               cacheLabel(option),
-              option.version && t("version {version}", { version: option.version }),
+              releaseVersion(option) && t("version {version}", { version: releaseVersion(option) }),
               option.region,
               releaseState(option, jobs, library)?.label && t(releaseState(option, jobs, library)!.label),
               firmwareLabel(option),
@@ -1265,8 +1274,8 @@ export function Details({
                   size="wide"
                   tone="dark"
                   kicker={releaseProvider(option)}
-                  title={`${formatLabel(option)} · ${releaseSize(option)}`}
-                  sub={[cacheLabel(option), option.version && t("version {version}", { version: option.version }), option.region, presence && t(presence.label), firmwareLabel(option)]
+                  title={`${formatLabel(option)} · ${displaySize(option)}`}
+                  sub={[cacheLabel(option), releaseVersion(option) && t("version {version}", { version: releaseVersion(option) }), option.region, presence && t(presence.label), firmwareLabel(option)]
                     .filter(Boolean)
                     .join(" · ")}
                   check={release.id === option.id}
@@ -1304,8 +1313,8 @@ export function Details({
     const firstAction = !system?.paired
       ? t("Pair with your PS5")
       : showDownload
-        ? release.sizeBytes || release.sizeEstimateBytes
-          ? `${t("Download")} · ${releaseSize(release)}`
+        ? transferRelease.sizeBytes || release.sizeEstimateBytes
+          ? `${t("Download")} · ${displaySize(release)}`
           : t("Download")
         : actionLabel;
     return (
@@ -1476,9 +1485,9 @@ export function Details({
                           <small>{releaseProvider(option)}</small>
                           <strong>{formatLabel(option)}</strong>
                           <small>
-                            {releaseSize(option)}
+                            {displaySize(option)}
                             {cacheLabel(option, " · ")}
-                            {option.version && ` · ${t("version {version}", { version: option.version })}`}
+                            {releaseVersion(option) && ` · ${t("version {version}", { version: releaseVersion(option) })}`}
                             {option.region && ` · ${option.region}`}
                           </small>
                           {presence && <small className="cn-choice-note">{t(presence.label)}</small>}
@@ -1614,7 +1623,7 @@ export function Details({
             <span>·</span>
             {formatLabel(release)}
             <span>·</span>
-            {releaseSize(release)}
+            {displaySize(release)}
             <span>·</span>
             <span>{gamePlatformLabel(release)}</span>
             {game.genre && (
@@ -1774,11 +1783,11 @@ export function Details({
                         </strong>
                         <small>
                           {option.titleId}
-                          {option.version &&
-                            ` · ${t("version {version}", { version: option.version })}`}
+                          {releaseVersion(option) &&
+                            ` · ${t("version {version}", { version: releaseVersion(option) })}`}
                         </small>
                         <small>
-                          {releaseSize(option)}
+                          {displaySize(option)}
                           {cacheLabel(option, " · ")}
                           {presence && ` · ${t(presence.label)}`}
                         </small>
