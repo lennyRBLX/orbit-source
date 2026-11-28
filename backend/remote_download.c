@@ -1282,14 +1282,20 @@ const char *remote_metadata_status(RemoteMetadataStatus status) {
 
 static bool response_interactive(const Response *page) {
     if (page->status == 401) return true;
-    if (!page->body) return false;
+    if (!page->body || !page->used) return false;
+    char *text = malloc(page->used + 1);
+    if (!text) return false;
+    visible_text(page->body, page->body + page->used, text, page->used + 1);
     const char *phrases[] = {"Awaiting verification", "verify you are human", "complete the captcha",
         "verification required", "login required", "sign in to download", "log in to download",
-        "countdown", "please wait before downloading"};
-    for (size_t i = 0; i < sizeof phrases / sizeof *phrases; i++)
-        if (find_text(page->body, phrases[i])) return true;
-    const char *password = find_text(page->body, "type=\"password\"");
-    return password && (find_text(page->body, "log in") || find_text(page->body, "sign in"));
+        "please wait before downloading"};
+    bool interactive = false;
+    for (size_t i = 0; i < sizeof phrases / sizeof *phrases && !interactive; i++)
+        interactive = find_text(text, phrases[i]) != NULL;
+    if (!interactive && find_text(page->body, "type=\"password\""))
+        interactive = find_text(text, "log in") || find_text(text, "sign in");
+    free(text);
+    return interactive;
 }
 
 /* Share only the public transport response. Each row still interprets it
@@ -1364,6 +1370,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     const char *url = provider_torbox_url(r);
     Response page = {.collect_page = true, .metadata_only = !direct, .range = direct};
     bool ok = metadata_get(url, &page);
+    bool interactive = response_interactive(&page);
     metadata->http_status = page.status;
     metadata->attempted = true;
     copy_text(metadata->effective_host, sizeof metadata->effective_host, page.effective_host);
@@ -1372,7 +1379,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         metadata->status = REMOTE_METADATA_REDIRECT;
     else if (response_challenge(&page)) metadata->status = REMOTE_METADATA_CHALLENGE;
     else if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
-    else if (response_interactive(&page)) metadata->status = REMOTE_METADATA_INTERACTIVE;
+    else if (interactive && !ok) metadata->status = REMOTE_METADATA_INTERACTIVE;
     else if (page.code == CURLE_OPERATION_TIMEDOUT) metadata->status = REMOTE_METADATA_TIMEOUT;
     else if (page.error_page || (page.status && !ok && page.code == CURLE_OK))
         metadata->status = REMOTE_METADATA_HTTP;
@@ -1389,7 +1396,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         } else if (direct && page.size <= 0 && download_file_magic(r, page.sample, page.used)) {
             metadata->status = REMOTE_METADATA_NO_SIZE;
         } else metadata->status = REMOTE_METADATA_UNSUPPORTED;
-    } else if (direct) metadata->status = REMOTE_METADATA_NO_SIZE;
+    } else if (direct) metadata->status = interactive ? REMOTE_METADATA_INTERACTIVE : REMOTE_METADATA_NO_SIZE;
     else if (page.body) {
         Release file = *r;
         char name[sizeof file.filename] = "";
@@ -1421,6 +1428,8 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
                 metadata->exact = false;
             } else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
         }
+        if (interactive && !metadata->filename[0] && metadata->status == REMOTE_METADATA_NO_SIZE)
+            metadata->status = REMOTE_METADATA_INTERACTIVE;
     } else metadata->status = REMOTE_METADATA_NO_SIZE;
     if (ok && page.page && rootz_page(page.url)) rootz_metadata(&page, r, metadata);
     if (ok && (metadata->status == REMOTE_METADATA_FOUND || metadata->status == REMOTE_METADATA_NO_SIZE ||
