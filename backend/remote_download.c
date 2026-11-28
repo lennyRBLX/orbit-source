@@ -535,7 +535,7 @@ static bool page_message_missing(const char *body, size_t length, bool json_body
             if (!tag_is(tag + 1, "h1") && !tag_is(tag + 1, "title")) continue;
             const char *end = strchr(tag, '>');
             char heading[128];
-            if (end && element_text(tag, end, heading, sizeof heading) && missing_text(heading)) {
+            if (end && element_text(tag, end, heading, sizeof heading) && !strcasecmp(heading, "deleted")) {
                 free(text);
                 return !page_has_download(body);
             }
