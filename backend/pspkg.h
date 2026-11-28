@@ -16,7 +16,7 @@ typedef struct {
     char reason[32];
     int64_t size;
     unsigned torbox_cached_revision;
-    bool intermediate, size_exact;
+    bool intermediate, size_exact, archive_requires_login;
 } PspkgLink;
 
 /* Only the general PS4/PS5 game paths are accepted. No Arabic paths. */

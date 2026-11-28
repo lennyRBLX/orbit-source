@@ -194,7 +194,8 @@ class Fixture(BaseHTTPRequestHandler):
         elif path in ("/original", "/torbox-file", "/mirror-1.pkg", "/mirror-2.pkg") or path.startswith("/pspkg-provider/"):
             self.server.calls.append(path)
             if path == ARCHIVE_FILE and "logged-in-sig=fixture-signature" not in self.headers.get("Cookie", ""):
-                self.reply(ARCHIVE_UNAVAILABLE, 403, {"Content-Type": "text/html"})
+                status = self.server.archive_availability or 403
+                self.reply(ARCHIVE_UNAVAILABLE, status, {"Content-Type": "text/html"})
                 return
             if (path == "/original" and self.server.original_fails) or path == self.server.dead_mirror:
                 self.reply(b"<h1>File not found</h1>", 404, {"Content-Type": "text/html"})
@@ -206,7 +207,7 @@ class Fixture(BaseHTTPRequestHandler):
                 headers["Content-Disposition"] = 'attachment; filename="provider.pkg"'
             if requested:
                 first, last = requested.removeprefix("bytes=").split("-")
-                start, end = int(first), int(last) if last else end
+                start, end = int(first), min(end, int(last)) if last else end
                 headers["Content-Range"] = f"bytes {start}-{end}/{len(FILE)}"
             payload = FILE[start:end + 1]
             if path == "/torbox-file" and self.server.truncate and len(payload) > 1:
@@ -481,7 +482,9 @@ class TorBoxRouting(unittest.TestCase):
         self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="pages-missing")
 
     def test_archive_file_availability_is_checked_again_after_sign_in(self):
-        self.run_download([], archive_availability=True)
+        for status in (401, 403):
+            with self.subTest(status=status):
+                self.run_download([{"domains": ["archive.org"], "status": True}], archive_availability=status)
 
     def check_download(self, port, fixture, original_url, cached, explicit, drive, interrupt):
         token = ""
@@ -518,19 +521,25 @@ class TorBoxRouting(unittest.TestCase):
         release = wait_for(lambda: next((r for r in call("/catalog") if r["title"] == title), None))
         if fixture.archive_availability:
             metadata_url = "/community-metadata?ids=" + release["id"]
+            call("/debrid", {"action": "connect", "apiKey": "orbit-test-fixture-key"})
+            wait_for(lambda: call("/debrid")["connected"])
 
             def checked_metadata():
                 result = call(metadata_url)
                 return result["files"][0] if not result["pending"] else None
 
-            self.assertEqual(wait_for(checked_metadata)["status"], "missing")
+            self.assertEqual(wait_for(checked_metadata)["status"], "archive-login-required")
             self.assertTrue(all(r["id"] != release["id"] for r in call("/catalog")))
             account = call("/archive-account", {"action": "sign-in", "email": "fixture@example.com", "password": "fixture"})
             self.assertTrue(account["signedIn"])
-            self.assertEqual(wait_for(checked_metadata)["status"], "found")
+            metadata = wait_for(checked_metadata)
+            self.assertEqual(metadata["status"], "found")
+            self.assertEqual(metadata["torboxHosts"], [])
             self.assertTrue(any(r["id"] == release["id"] for r in call("/catalog")))
             self.assertFalse(call("/archive-account", {"action": "sign-out"})["signedIn"])
-            self.assertEqual(wait_for(checked_metadata)["status"], "missing")
+            self.assertTrue(all(r["id"] != release["id"] for r in call("/catalog")))
+            self.assertEqual(wait_for(checked_metadata)["status"], "archive-login-required")
+            self.assertEqual(fixture.cache_queries, [])
             return
         if fixture.browser:
             self.assertGreater(call("/system")["remoteGeneration"], 1)

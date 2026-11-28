@@ -117,7 +117,10 @@ static size_t first_mirror(const Release *const *rows, size_t count, const char 
 
 static bool describe_mirrors(cJSON *entry, const Release *r, const Release *const *group, size_t count) {
     char host[254];
-    if (remote_link_listed_locked(r) && remote_link_host(r, host, sizeof host) && !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
+    bool restricted = remote_link_archive_requires_login_locked(r);
+    if (restricted && count < 2 && !cJSON_AddArrayToObject(entry, "torboxHosts")) return false;
+    if (!restricted && remote_link_listed_locked(r) && remote_link_host(r, host, sizeof host) &&
+        !cJSON_AddStringToObject(entry, "torboxHost", host)) return false;
     bool metadata = remote_metadata_option(r);
     size_t available = remote_link_missing_locked(r) ? 0 : 1;
     if (count > 1) {
@@ -129,7 +132,7 @@ static bool describe_mirrors(cJSON *entry, const Release *r, const Release *cons
             metadata |= remote_metadata_option(mirror);
             if (!remote_link_listed_locked(mirror)) continue;
             if (!remote_link_missing_locked(mirror)) available++;
-            if (!remote_link_host(mirror, host, sizeof host)) continue;
+            if (remote_link_archive_requires_login_locked(mirror) || !remote_link_host(mirror, host, sizeof host)) continue;
             bool duplicate = false;
             const cJSON *item;
             cJSON_ArrayForEach(item, hosts)
@@ -275,7 +278,8 @@ static cJSON *snapshot_locked(bool addons) {
         if (remote_metadata_option(r)) cJSON_AddTrueToObject(entry, "providerMetadata");
         char host[254];
         if (remote_link_missing_locked(r)) cJSON_AddTrueToObject(entry, "providerMissing");
-        if (remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
+        if (remote_link_archive_requires_login_locked(r)) cJSON_AddArrayToObject(entry, "torboxHosts");
+        else if (remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
         firmware_describe(entry, orbit.firmware);
         cJSON_AddItemToArray(a, entry);
     }

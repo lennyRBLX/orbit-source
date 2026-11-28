@@ -183,6 +183,12 @@ void archive_account_clear(void) {
     OPENSSL_cleanse(&account, sizeof account);
     pthread_mutex_unlock(&lock);
 }
+bool archive_account_signed_in(void) {
+    pthread_mutex_lock(&lock);
+    bool signed_in = account.user[0] && account.sig[0];
+    pthread_mutex_unlock(&lock);
+    return signed_in;
+}
 cJSON *archive_account_status(void) {
     cJSON *o = cJSON_CreateObject();
     pthread_mutex_lock(&lock);

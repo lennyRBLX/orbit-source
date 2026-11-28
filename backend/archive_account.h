@@ -8,6 +8,7 @@
 void archive_account_load(void);
 void archive_account_clear(void);
 cJSON *archive_account_status(void);
+bool archive_account_signed_in(void);
 /* {action:"sign-in", email, password} or {action:"sign-out"}. Signing in waits
  * for Archive.org on the calling thread; never call it under orbit.mutex. */
 int archive_account_action(const cJSON *input, char *error, size_t cap);

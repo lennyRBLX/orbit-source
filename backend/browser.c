@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "archive_account.h"
 #include "remote_sources.h"
 #include "debrid.h"
 #include "browser_platform.h"
@@ -819,6 +820,7 @@ static void download_pspkg(void) {
 }
 
 static void update_pspkg_metadata(PspkgLink *link, const RemoteFileMetadata *metadata) {
+    link->archive_requires_login = metadata->archive_requires_login;
     if (metadata->filename[0]) {
         copy_text(link->filename, sizeof link->filename, metadata->filename);
         pspkg_version(link->edition, link->filename, link->version, sizeof link->version);
@@ -834,7 +836,7 @@ static void update_pspkg_provider(PspkgLink *link, const char *url) {
     Release route = {.remote_page = true};
     copy_text(route.remote_provider_page, sizeof route.remote_provider_page, url);
     pthread_mutex_lock(&orbit.mutex);
-    unsigned revision = debrid_cache_revision_locked(&route);
+    unsigned revision = link->archive_requires_login ? 0 : debrid_cache_revision_locked(&route);
     pthread_mutex_unlock(&orbit.mutex);
     link->torbox_cached_revision = revision && debrid_check_cached(&route, revision) ? revision : 0;
 }
@@ -863,14 +865,16 @@ static void read_pspkg_pages_locked(void) {
         RemoteFileMetadata metadata = {0};
         bool read = remote_pspkg_provider_metadata(page.url, &session.cancel, &metadata);
         bool missing = metadata.status == REMOTE_METADATA_MISSING;
+        bool requires_login = metadata.status == REMOTE_METADATA_ARCHIVE_LOGIN;
         if (missing) copy_text(link.reason, sizeof link.reason, "missing-page");
+        else if (requires_login) copy_text(link.reason, sizeof link.reason, "archive-login-required");
         else if (read && active()) {
             update_pspkg_metadata(&link, &metadata);
             update_pspkg_provider(&link, page.url);
             link.reason[0] = 0;
         }
         pthread_mutex_lock(&orbit.mutex);
-        if ((read || missing) && page.index < session.pspkg_count && !session.stop &&
+        if ((read || missing || requires_login) && page.index < session.pspkg_count && !session.stop &&
             !atomic_load(&session.cancel) && selected_locked() && time(NULL) < session.pspkg_expires)
             session.pspkg_links[page.index] = link;
     }
@@ -1323,7 +1327,9 @@ cJSON *browser_status(void) {
         cJSON *choices = cJSON_AddArrayToObject(o, "pspkgLinks");
         for (size_t i = 0; !expired && choices && i < session.pspkg_count; i++) {
             const PspkgLink *link = &session.pspkg_links[i];
-            if (!strcmp(link->reason, "missing-page") || !strcmp(link->reason, "provider-unavailable")) continue;
+            if (!strcmp(link->reason, "missing-page") || !strcmp(link->reason, "provider-unavailable") ||
+                !strcmp(link->reason, "archive-login-required") ||
+                (link->archive_requires_login && !archive_account_signed_in())) continue;
             cJSON *choice = cJSON_CreateObject();
             if (!choice) break;
             char id[24];
@@ -1353,7 +1359,8 @@ cJSON *browser_status(void) {
                 copy_text(route.remote_provider_page, sizeof route.remote_provider_page, link->provider);
                 char host[254];
                 if (remote_link_host(&route, host, sizeof host)) cJSON_AddStringToObject(choice, "providerHost", host);
-                cJSON_AddBoolToObject(choice, "torboxAvailable", debrid_link_covered_locked(&route));
+                cJSON_AddBoolToObject(choice, "torboxAvailable",
+                                      !link->archive_requires_login && debrid_link_covered_locked(&route));
                 if (link->torbox_cached_revision &&
                     link->torbox_cached_revision == debrid_cache_revision_locked(&route))
                     cJSON_AddTrueToObject(choice, "torboxCached");
@@ -1515,7 +1522,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
                     if (!strcmp(id, json_text(input, "linkId")))
                         choice = &session.pspkg_links[i];
                 }
-                if (!choice || !storage ||
+                if (!choice || !storage || (choice->archive_requires_login && !archive_account_signed_in()) ||
                     (choice->reason[0] && strcmp(choice->reason, "verify-required"))) {
                     copy_text(error, cap, "Select a PSPKG link and connected drive."); code = 400;
                     goto done;
@@ -1531,7 +1538,7 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             session.pspkg_download = download;
             session.pspkg_selected = selected;
             session.pspkg_selected_index = choice ? (size_t)(choice - session.pspkg_links) : 0;
-            session.pspkg_torbox = !strcmp(json_text(input, "delivery"), "torbox");
+            session.pspkg_torbox = !selected.archive_requires_login && !strcmp(json_text(input, "delivery"), "torbox");
             if (!download) {
                 const char *game = json_text(input, "gameId");
                 if (!*game || strlen(game) >= sizeof session.pspkg_game ||

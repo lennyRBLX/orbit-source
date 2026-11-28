@@ -44,6 +44,7 @@ bool remote_next_mirror_locked(const Release *release, const char *after, Releas
 bool remote_mirror_locked(const Release *release, const char *id, Release *mirror, bool torbox);
 bool remote_torbox_route_locked(const Release *release, Release *route);
 bool remote_link_listed_locked(const Release *release);
+bool remote_link_archive_requires_login_locked(const Release *release);
 void remote_torbox_changed_locked(void);
 void remote_archive_account_changed_locked(void);
 /* Acquires orbit.mutex to check provider metadata. */
@@ -80,6 +81,7 @@ typedef enum {
     REMOTE_METADATA_CHALLENGE, REMOTE_METADATA_TIMEOUT, REMOTE_METADATA_NETWORK, REMOTE_METADATA_HTTP,
     REMOTE_METADATA_REDIRECT, REMOTE_METADATA_TOO_LARGE, REMOTE_METADATA_NO_SIZE,
     REMOTE_METADATA_AMBIGUOUS, REMOTE_METADATA_UNSUPPORTED,
+    REMOTE_METADATA_ARCHIVE_LOGIN,
 } RemoteMetadataStatus;
 const char *remote_metadata_status(RemoteMetadataStatus status);
 cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status, atomic_bool *cancel);
@@ -87,7 +89,7 @@ typedef struct {
     RemoteMetadataStatus status;
     unsigned confidence, candidate_count;
     long http_status;
-    bool attempted;
+    bool attempted, archive_requires_login;
     int64_t candidates[12];
     char effective_host[254];
     char pspkg_title_ids[12][10];

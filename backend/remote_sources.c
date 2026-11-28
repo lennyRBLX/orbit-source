@@ -2,6 +2,7 @@
 #include "pspkg.h"
 #include "catalog_view.h"
 #include "ca.h"
+#include "archive_account.h"
 #include "debrid.h"
 #include "provider_network.h"
 #include "state_file.h"
@@ -1297,10 +1298,18 @@ void remote_archive_account_changed_locked(void) {
         MetadataRequest *request = &metadata.requests[i];
         if (request->state == META_EMPTY) continue;
         const Release *r = release_find(request->id);
-        if (!r || remote_page_pending(r) || !remote_archive_url(provider_torbox_url(r))) continue;
+        if (!r || !remote_archive_url(provider_torbox_url(r))) continue;
         mirror_sizes |= request->mirror_size > 0;
+        bool restricted = request->file.archive_requires_login;
+        char id[sizeof request->id];
+        copy_text(id, sizeof id, request->id);
         cJSON_Delete(request->public_links);
         *request = (MetadataRequest){0};
+        if (restricted) {
+            copy_text(request->id, sizeof request->id, id);
+            request->state = META_DONE;
+            request->file.archive_requires_login = true;
+        }
     }
     if (mirror_sizes) rebuild_mirrors_locked();
     invalidate_locked();
@@ -1328,7 +1337,28 @@ static bool metadata_missing(const MetadataRequest *request, time_t now) {
            request->file.status == REMOTE_METADATA_MISSING;
 }
 
-bool remote_link_missing_locked(const Release *release) {
+static const MetadataRequest *archive_metadata_locked(const Release *r) {
+    if (!remote_archive_url(provider_torbox_url(r))) return NULL;
+    const Release *live = r->remote_alias ? release_find(r->id) : NULL;
+    if (live) r = mirror_route(live);
+    for (size_t i = 0; i < METADATA_LIMIT; i++) {
+        const MetadataRequest *request = &metadata.requests[i];
+        if (request->file.archive_requires_login && !strcmp(request->id, r->id)) return request;
+    }
+    return NULL;
+}
+
+bool remote_link_archive_requires_login_locked(const Release *r) {
+    return archive_metadata_locked(r) != NULL;
+}
+
+static bool archive_blocked(const MetadataRequest *request, time_t now) {
+    return request && request->file.archive_requires_login &&
+        (!archive_account_signed_in() || (request->state == META_DONE && request->expires > now &&
+                                          request->file.status == REMOTE_METADATA_ARCHIVE_LOGIN));
+}
+
+static bool provider_missing_locked(const Release *release) {
     if (!metadata.next_missing_expiry) return false;
     if (release->remote_alias) {
         const Release *live = release_find(release->id);
@@ -1342,10 +1372,15 @@ bool remote_link_missing_locked(const Release *release) {
     return false;
 }
 
+bool remote_link_missing_locked(const Release *r) {
+    return archive_blocked(archive_metadata_locked(r), time(NULL)) || provider_missing_locked(r);
+}
+
 bool remote_link_listed_locked(const Release *r) {
     /* Keep a covered missing provider discoverable so Details can check the
        cache, including when the account was connected after the provider check. */
-    return !remote_link_missing_locked(r) || debrid_link_covered_locked(r);
+    return !archive_blocked(archive_metadata_locked(r), time(NULL)) &&
+        (!provider_missing_locked(r) || debrid_link_covered_locked(r));
 }
 
 static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
@@ -1384,6 +1419,8 @@ static void metadata_done_locked(MetadataRequest *request, const RemoteFileMetad
                        ((r && (r->mirror_key[0] || r->remote_group[0])) ||
                         exact_file_metadata(&request->file) || exact_file_metadata(file));
     if (size_changed) request->mirror_size = file->size;
+    bool access_changed = request->file.archive_requires_login != file->archive_requires_login ||
+        (request->file.status == REMOTE_METADATA_ARCHIVE_LOGIN) != (file->status == REMOTE_METADATA_ARCHIVE_LOGIN);
     request->file = *file;
     request->expires = time(NULL) + (file->size || file->filename[0] || file->status == REMOTE_METADATA_MISSING ? 1800 : 300);
     request->state = META_DONE;
@@ -1393,7 +1430,7 @@ static void metadata_done_locked(MetadataRequest *request, const RemoteFileMetad
             metadata.next_missing_expiry = request->expires;
         changed = true;
     }
-    if (changed) invalidate_locked();
+    if (changed || access_changed) invalidate_locked();
 }
 
 void remote_mark_missing_locked(const Release *release) {
@@ -1469,7 +1506,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
         cJSON_AddStringToObject(row, "id", id);
         cJSON *hosts = cJSON_AddArrayToObject(row, "torboxHosts");
         unsigned mirrors = 0, available = 0;
-        bool unsupported = false;
+        bool unsupported = false, archive_login = false;
         bool group_pending = false, torbox_pending = false, torbox_cached = false, conflicting_size = false;
         do {
             mirrors++;
@@ -1479,6 +1516,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
                 group_pending = true;
             }
             if (request) metadata_snapshot(views, row, candidate, request, remote_mirror_group_locked(release), candidate == release);
+            if (archive_blocked(request, now)) { archive_login = true; continue; }
             const RemoteFileMetadata *current = request && request->state == META_DONE ? &request->file : NULL;
             if (current && current->status == REMOTE_METADATA_UNSUPPORTED) unsupported = true;
             bool direct = !current || (current->status != REMOTE_METADATA_MISSING &&
@@ -1499,7 +1537,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
             }
             if (!direct && !cached) continue;
             char host[254];
-            if (hosts && remote_link_host(candidate, host, sizeof host)) {
+            if (hosts && !(request && request->file.archive_requires_login) && remote_link_host(candidate, host, sizeof host)) {
                 const cJSON *item;
                 bool duplicate = false;
                 cJSON_ArrayForEach(item, hosts) duplicate |= !strcmp(item->valuestring, host);
@@ -1516,7 +1554,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
                  (copy_text(after, sizeof after, alternate.id), candidate = &alternate, true));
         pending |= group_pending || torbox_pending;
         cJSON_DeleteItemFromObjectCaseSensitive(row, "status");
-        cJSON_AddStringToObject(row, "status", group_pending ? "fetching" :
+        cJSON_AddStringToObject(row, "status", archive_login && !available ? "archive-login-required" : group_pending ? "fetching" :
             !available ? (unsupported ? "unsupported-format" : "missing") : remote_metadata_status(file.status));
         if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", available);
         if (torbox_cached) cJSON_AddTrueToObject(row, "torboxCached");

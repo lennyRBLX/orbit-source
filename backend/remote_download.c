@@ -13,6 +13,7 @@
 #include <strings.h>
 
 #define PAGE_LIMIT (1024U * 1024U)
+enum { ARCHIVE_FILE_LOGIN_REQUIRED = -4 };
 #define MIN_SAMPLE_BYTES 8
 #define MAX_SAMPLE_BYTES (DOWNLOAD_UFS_MAGIC_OFFSET + sizeof ((DownloadSample *)0)->ufs_magic)
 
@@ -617,6 +618,27 @@ static bool response_missing(const Response *response) {
     bool missing = status_phrase(text, "the item is not available due to issues with the item's content");
     free(text);
     return missing;
+}
+
+static bool archive_login_required(const Response *response) {
+    if (!remote_archive_url(response->url) || response_challenge(response)) return false;
+    return response->status == 401 || response->status == 403 ||
+        (response->status == 200 && response->body && !response->truncated &&
+         find_text(response->body, "you must log in to view this content"));
+}
+
+/* Probe public access first. Only retry denied Archive.org routes with the
+ * saved cookies, so the catalogue knows which results require sign-in. */
+static bool fetch_with_archive_login(const char *url, Response *response, bool *requires_login) {
+    Response initial = *response;
+    bool ok = fetch(url, response);
+    *requires_login = archive_login_required(response);
+    if (!*requires_login || !archive_account_signed_in()) return ok;
+
+    free(response->body);
+    *response = initial;
+    response->archive_session = true;
+    return fetch(url, response);
 }
 
 bool remote_download_html_missing(long status, const char *html, bool challenge) {
@@ -1449,20 +1471,28 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
     }
 }
 
+static void archive_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata);
+static int archive_file(const char *page, const Release *r, atomic_bool *cancel, char *url, size_t cap,
+                        RemoteFileMetadata *file_info);
+
 bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, RemoteFileMetadata *metadata) {
     const char *provider = remote_browser_provider(url);
     if (!*provider || !strcmp(provider, "pspkg")) return false;
     Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true, .html_only = true};
-    bool received = fetch(url, &page);
-    if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
+    bool received = fetch_with_archive_login(url, &page, &metadata->archive_requires_login);
+    if (archive_login_required(&page)) metadata->status = REMOTE_METADATA_ARCHIVE_LOGIN;
+    else if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
     bool ok = received && page.page && !page.json && !page.plain_text &&
-        page.body && !page.truncated && !response_challenge(&page) && metadata->status != REMOTE_METADATA_MISSING &&
+        page.body && !page.truncated && !response_challenge(&page) &&
+        metadata->status != REMOTE_METADATA_MISSING && metadata->status != REMOTE_METADATA_ARCHIVE_LOGIN &&
         !strcmp(provider, remote_browser_provider(page.url));
     if (ok) {
         Release file = {.remote_page = true};
         download_page_metadata(&page, &file, metadata);
         if (rootz_page(page.url)) rootz_metadata(&page, &file, metadata);
-        ok = metadata->status != REMOTE_METADATA_MISSING && metadata->status != REMOTE_METADATA_UNSUPPORTED;
+        if (!strcmp(provider, "archive")) archive_metadata(&page, &file, metadata);
+        ok = metadata->status != REMOTE_METADATA_MISSING && metadata->status != REMOTE_METADATA_UNSUPPORTED &&
+             metadata->status != REMOTE_METADATA_ARCHIVE_LOGIN;
     }
     free(page.body);
     return ok;
@@ -1472,13 +1502,14 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
                                char *out, size_t cap, RemoteFileMetadata *metadata) {
     if (!remote_https_url(url)) return "unsafe-url";
     bool file_candidate = !intermediate && !*remote_browser_provider(url);
-    Response response = {.cancel = cancel, .collect_page = true, .range = file_candidate,
-                         .archive_session = remote_archive_url(url), .use_http1 = intermediate};
-    bool ok = fetch(url, &response);
+    Response response = {.cancel = cancel, .collect_page = true, .range = file_candidate, .use_http1 = intermediate};
+    bool requires_login;
+    bool ok = fetch_with_archive_login(url, &response, &requires_login);
     const char *status = "";
     if (response.redirect_rejected || response.code == CURLE_TOO_MANY_REDIRECTS ||
         response.code == CURLE_UNSUPPORTED_PROTOCOL || response.code == CURLE_URL_MALFORMAT ||
         (response.status >= 300 && response.status < 400 && !ok)) status = "unsafe-url";
+    else if (archive_login_required(&response)) status = "archive-login-required";
     else if (response_missing(&response)) status = "missing-page";
     else if (*remote_browser_provider(response.url) && strcmp(remote_browser_provider(response.url), "pspkg") &&
              (ok || response_challenge(&response) || response_interactive(&response))) {
@@ -1498,7 +1529,9 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
         if (response.page && response.body && !response.truncated) {
             download_page_metadata(&response, &file, metadata);
             if (rootz_page(response.url)) rootz_metadata(&response, &file, metadata);
+            if (remote_archive_url(response.url)) archive_metadata(&response, &file, metadata);
             if (metadata->status == REMOTE_METADATA_MISSING) status = "missing-page";
+            else if (metadata->status == REMOTE_METADATA_ARCHIVE_LOGIN) status = "archive-login-required";
         } else if (!response.page && !file_from_response(&file, &response, url, NULL)) {
             file_metadata(&file, metadata);
             metadata->size = file.size;
@@ -1506,17 +1539,16 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
             metadata->status = REMOTE_METADATA_FOUND;
         }
     }
+    if (metadata) metadata->archive_requires_login |= requires_login;
     free(response.body);
     return status;
 }
-
-static void archive_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata);
 
 const char *remote_metadata_status(RemoteMetadataStatus status) {
     static const char *const states[] = {
         "not-attempted", "found", "missing", "interactive-verification", "challenge", "timeout",
         "network-tls-failure", "http-error", "redirected-to-invalid-host", "page-too-large",
-        "parse-no-size", "ambiguous-size", "unsupported-format",
+        "parse-no-size", "ambiguous-size", "unsupported-format", "archive-login-required",
     };
     return states[status];
 }
@@ -1610,9 +1642,10 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     if (!remote_metadata_option(r)) return false;
     bool direct = !remote_page_pending(r);
     const char *url = provider_torbox_url(r);
-    Response page = {.collect_page = true, .metadata_only = !direct, .range = direct,
-                     .archive_session = direct && remote_archive_url(url)};
-    bool ok = metadata_get(url, &page);
+    bool archive = remote_archive_url(url);
+    Response page = {.collect_page = true, .metadata_only = !direct, .range = direct};
+    bool ok = archive ? fetch_with_archive_login(url, &page, &metadata->archive_requires_login)
+                      : metadata_get(url, &page);
     bool interactive = response_interactive(&page);
     metadata->http_status = page.status;
     metadata->attempted = true;
@@ -1621,6 +1654,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         (page.status >= 300 && page.status < 400 && page.code != CURLE_OK))
         metadata->status = REMOTE_METADATA_REDIRECT;
     else if (response_challenge(&page)) metadata->status = REMOTE_METADATA_CHALLENGE;
+    else if (archive_login_required(&page)) metadata->status = REMOTE_METADATA_ARCHIVE_LOGIN;
     else if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
     else if (interactive && !ok) metadata->status = REMOTE_METADATA_INTERACTIVE;
     else if (page.code == CURLE_OPERATION_TIMEDOUT) metadata->status = REMOTE_METADATA_TIMEOUT;
@@ -1645,6 +1679,16 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         if (interactive && !metadata->filename[0] && metadata->status == REMOTE_METADATA_NO_SIZE)
             metadata->status = REMOTE_METADATA_INTERACTIVE;
     } else metadata->status = REMOTE_METADATA_NO_SIZE;
+    if (!ok && direct && archive && !metadata->archive_requires_login && !archive_account_signed_in() &&
+        (metadata->status == REMOTE_METADATA_NETWORK || metadata->status == REMOTE_METADATA_TIMEOUT)) {
+        /* The canonical item record can identify a restricted file even when
+         * the storage server does not return a usable response. */
+        RemoteFileMetadata file = {0};
+        if (archive_file(url, r, NULL, NULL, 0, &file) == ARCHIVE_FILE_LOGIN_REQUIRED) {
+            metadata->status = REMOTE_METADATA_ARCHIVE_LOGIN;
+            metadata->archive_requires_login = true;
+        }
+    }
     if (ok && page.page && rootz_page(page.url)) rootz_metadata(&page, r, metadata);
     if (ok && (metadata->status == REMOTE_METADATA_FOUND || metadata->status == REMOTE_METADATA_NO_SIZE ||
                metadata->status == REMOTE_METADATA_AMBIGUOUS))
@@ -1700,33 +1744,40 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
 
 }
 
-static int archive_file(const Response *page, const Release *r, char *url, size_t cap,
+static int archive_file(const char *page, const Release *r, atomic_bool *cancel, char *url, size_t cap,
                         RemoteFileMetadata *file_info) {
-    const char prefix[] = "https://archive.org/details/";
-    if (strncmp(page->url, prefix, sizeof prefix - 1)) return -1;
-    const char *id = page->url + sizeof prefix - 1;
+    const char details[] = "https://archive.org/details/", download[] = "https://archive.org/download/";
+    bool single = !strncmp(page, download, sizeof download - 1);
+    char target[sizeof r->filename] = "";
+    if (single && !remote_url_filename(page, target, sizeof target)) return -1;
+    if (!single && strncmp(page, details, sizeof details - 1)) return -1;
+    const char *id = page + (single ? sizeof download : sizeof details) - 1;
     size_t n = strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.");
-    if (!n || (id[n] && id[n] != '/' && id[n] != '?')) return -1;
+    if (!n || (single ? id[n] != '/' : (id[n] && id[n] != '/' && id[n] != '?'))) return -1;
     char path[2048];
     if (snprintf(path, sizeof path, "https://archive.org/metadata/%.*s", (int)n, id) >= (int)sizeof path)
         return -1;
-    Response metadata = {.cancel = page->cancel, .collect_page = true};
+    Response metadata = {.cancel = cancel, .collect_page = true, .metadata_only = true};
     int result = -1;
     bool ok = fetch(path, &metadata);
     if (response_missing(&metadata)) result = REMOTE_DOWNLOAD_MISSING;
     else if (ok && metadata.body && !metadata.truncated) {
         cJSON *root = cJSON_Parse(metadata.body);
+        bool signed_in = archive_account_signed_in(), needs_login = false;
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "is_dark"))) result = REMOTE_DOWNLOAD_MISSING;
         const cJSON *files = cJSON_GetObjectItemCaseSensitive(root, "files"), *entry;
-        cJSON_ArrayForEach(entry, files) {
+        cJSON_ArrayForEach(entry, (result == REMOTE_DOWNLOAD_MISSING ? NULL : files)) {
             const char *name = json_text(entry, "name");
             Release file = *r;
             const cJSON *private_file = cJSON_GetObjectItemCaseSensitive(entry, "private");
-            if (strcmp(json_text(entry, "source"), "original") ||
-                cJSON_IsTrue(private_file) || !strcmp(json_text(entry, "private"), "true") ||
+            bool restricted = cJSON_IsTrue(private_file) || !strcmp(json_text(entry, "private"), "true");
+            if ((single && strcmp(name, target)) || strcmp(json_text(entry, "source"), "original") ||
                 remote_file_format(&file, name)) continue;
+            if (restricted && !signed_in) { needs_login = true; continue; }
             if (result == 0) { result = -3; break; }
             if (file_info) {
                 file_metadata(&file, file_info);
+                file_info->archive_requires_login = restricted;
                 const cJSON *size = cJSON_GetObjectItemCaseSensitive(entry, "size");
                 if (cJSON_IsString(size)) size_value(size->valuestring, true, &file_info->size, &file_info->exact);
                 file_info->confidence = file_info->size ? 4 : 0;
@@ -1739,6 +1790,7 @@ static int archive_file(const Response *page, const Release *r, char *url, size_
             if (length > 0 && (size_t)length < cap) result = 0;
             curl_free(encoded);
         }
+        if (result == -1 && needs_login) result = ARCHIVE_FILE_LOGIN_REQUIRED;
         cJSON_Delete(root);
     }
     free(metadata.body);
@@ -1746,15 +1798,22 @@ static int archive_file(const Response *page, const Release *r, char *url, size_
 }
 
 static void archive_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {
+    static const char prefix[] = "https://archive.org/details/";
+    if (strncmp(page->url, prefix, sizeof prefix - 1)) return;
     RemoteFileMetadata file = {0};
-    int result = archive_file(page, r, NULL, 0, &file);
+    int result = archive_file(page->url, r, page->cancel, NULL, 0, &file);
     if (!result) {
         file.attempted = metadata->attempted;
+        file.archive_requires_login |= metadata->archive_requires_login;
         file.http_status = metadata->http_status;
         copy_text(file.effective_host, sizeof file.effective_host, metadata->effective_host);
         *metadata = file;
     }
     if (result == REMOTE_DOWNLOAD_MISSING) metadata->status = REMOTE_METADATA_MISSING;
+    if (result == ARCHIVE_FILE_LOGIN_REQUIRED) {
+        metadata->status = REMOTE_METADATA_ARCHIVE_LOGIN;
+        metadata->archive_requires_login = true;
+    }
 }
 
 /* Returns 0 for a verified direct file, 1 for an interactive provider page,
@@ -1763,7 +1822,9 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
     Response page = {.cancel = cancel, .collect_page = true};
     int result = -1;
     const char *selected_page = provider_torbox_url(r);
+    page.archive_session = remote_archive_url(selected_page);
     bool ok = fetch(selected_page, &page);
+    if (archive_login_required(&page)) { archive_account_refusal(selected_page, error, cap); goto done; }
     if (response_missing(&page)) { result = REMOTE_DOWNLOAD_MISSING; goto done; }
     if (!ok || response_challenge(&page) || response_interactive(&page)) {
         if (response_challenge(&page) || response_interactive(&page)) {
@@ -1807,7 +1868,8 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
     }
     if (!strncmp(page.url, "https://archive.org/details/", 28)) {
         char direct[sizeof r->url] = "";
-        int link = archive_file(&page, r, direct, sizeof direct, NULL);
+        int link = archive_file(page.url, r, page.cancel, direct, sizeof direct, NULL);
+        if (link == ARCHIVE_FILE_LOGIN_REQUIRED) { archive_account_refusal(selected_page, error, cap); goto done; }
         if (!link) {
             int verified = remote_download_verify(r, direct, cancel, error, cap);
             if (!verified || verified == REMOTE_DOWNLOAD_MISSING) result = verified;

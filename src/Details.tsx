@@ -24,7 +24,7 @@ import {
 import { defaultDrive, downloadSpacePlan, releaseState } from "./collection";
 import { gamePlatformLabel } from "./platform";
 import type { BrowserSelection } from "./browserHandoff";
-import { formatDate, formatNumber, genreName, placeName, t } from "./i18n";
+import { formatDate, genreName, placeName, t } from "./i18n";
 import { firmwareLabel, firmwareWarning } from "./firmware";
 import { rich } from "./Rich";
 import "./details.css";
@@ -244,6 +244,7 @@ export function Details({
     return {
       ...r,
       providerMissing: file.status === "missing" || file.status === "unsupported-format" ||
+        file.status === "archive-login-required" ||
         (!!r.providerMissing && file.status === "fetching"),
       provider: file.provider || r.provider,
       browserAvailable: file.browserAvailable ?? r.browserAvailable,
@@ -777,8 +778,6 @@ export function Details({
         <div>
           <dt>{release.compression ? t("Compressed size") : t("Download size")}</dt>
           <dd>{releaseSize(release)}
-            {release.sourceId === "remote" && release.sizeEstimateExact && !!release.sizeEstimateBytes &&
-              <small> · {t("{count} bytes", { count: formatNumber(release.sizeEstimateBytes) })}</small>}
             {release.metadataStatus === "ambiguous-size" && <small> · {t("Conflicting reported sizes")}</small>}
             {release.metadataSizeOnly && <small> · {t("Filename unverified")}</small>}
             {!release.sizeBytes && !release.sizeEstimateBytes && release.metadataStatus &&

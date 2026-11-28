@@ -30,6 +30,7 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             self.server.requests.append(validator)
             self.server.paths.append(self.path)
             self.server.ranges.append((self.path, self.headers.get("Range")))
+            self.server.http_versions.append((self.path, self.request_version))
             if self.path.startswith("/api/files/"):
                 self.server.page_tokens.append((self.path, self.headers.get("X-Page-Token")))
             extra = self.server.downloads.get(self.path)
@@ -61,6 +62,7 @@ class FixtureServer(http.server.ThreadingHTTPServer):
         self.requests = []
         self.paths = []
         self.ranges = []
+        self.http_versions = []
         self.page_tokens = []
         self.failure = None
         self.feed = None
@@ -1118,6 +1120,10 @@ class RemoteCatalogueTests(unittest.TestCase):
             thread.start()
             try:
                 with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                    entry = {"title": "Cyberpunk 2077", "titleId": "PPSA04029", "downloadLinks": [
+                        {"url": "https://buzzheavier.com/srowhmpdsdnb", "name": "BuzzHeavier"},
+                    ]}
+                    self.assertEqual(service.command("map", entry=entry)["sizeEstimateBytes"], 118_400_000_000)
                     cases = (
                         (path, "found", 118_400_000_000, False),
                         (path + "-exact", "found", 118_400_012_345, True),
@@ -1129,6 +1135,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                             self.assertEqual(service.command("metadata-page", url=base + url),
                                              {"status": status, "sizeBytes": size, "exact": exact})
                     self.assertEqual(server.ranges, [(url, None) for url, *_ in cases])
+                    self.assertEqual(server.http_versions, [(url, "HTTP/1.1") for url, *_ in cases])
             finally:
                 server.shutdown()
                 thread.join()

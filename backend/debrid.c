@@ -544,6 +544,7 @@ int debrid_action(const cJSON *input, char *err, size_t cap) {
 /* -1 means no currently usable host. Zero is an unreported size limit. */
 static int64_t covered_limit(const Release *r) {
     if (!r || !strcmp(r->id, "orbit-network-check")) return -1;
+    if (remote_link_archive_requires_login_locked(r)) return -1;
     if (!remote_page_pending(r) && !provider_supported(r) && !provider_browser_supported(r)) return -1;
     if (!strcmp(r->source, ORBIT_DIRECT_SOURCE)) return -1;
     char host[sizeof debrid.community_hosts[0].name];

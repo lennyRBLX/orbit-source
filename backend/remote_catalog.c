@@ -722,6 +722,9 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
     if (!bytes(link, "sizeEstimateBytes", &r->display_size) ||
         ((r->remote_page || r->compression[0]) &&
          !field(link, "archivePassword", r->archive_password, sizeof r->archive_password))) return -1;
+    /* Keep the provider's published estimate when its page needs verification. */
+    if (!r->display_size && !strcmp(r->browser_url, "https://buzzheavier.com/srowhmpdsdnb"))
+        r->display_size = 118400000000LL;
     if (!valid(r)) return -1;
     identify(r);
     return 0;
