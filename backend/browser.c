@@ -523,6 +523,13 @@ static void collect_pspkg_html(PspkgCollection *found, const char *html, const c
         copy_text(link->compression, sizeof link->compression, json_text(row, "compression"));
         copy_text(link->reason, sizeof link->reason, json_text(row, "filterReason"));
         link->intermediate = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "intermediate"));
+        const char *edition_id = link->intermediate ? strstr(url, "&edition_id=") : NULL;
+        if (edition_id) {
+            edition_id += sizeof "&edition_id=" - 1;
+            size_t length = strspn(edition_id, "0123456789");
+            if (length && length < sizeof link->edition_id && edition_id[length] == '&')
+                snprintf(link->edition_id, sizeof link->edition_id, "%.*s", (int)length, edition_id);
+        }
         const char *id = link->intermediate ? strstr(url, "&link_id=") : NULL;
         if (id) {
             id += sizeof "&link_id=" - 1;
@@ -595,6 +602,11 @@ static bool pspkg_match(void *context, const unsigned char *bytes, size_t length
 }
 #endif
 
+static const char *pspkg_open_url(const char *page, char *out, size_t cap) {
+    int length = snprintf(out, cap, "%s%clang=en", page, strchr(page, '?') ? '&' : '?');
+    return length > 0 && (size_t)length < cap ? out : page;
+}
+
 static bool collect_pspkg(const Release *release, PspkgCollection *found,
                           char *error, size_t cap) {
     if (!pspkg_page_identity(release->browser_url, found->platform,
@@ -622,6 +634,7 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
         if (!found->count && !strstr(html, "Awaiting verification")) copy_text(error, cap, "no-anchors");
     }
 #else
+    char page_url[sizeof release->browser_url + 9];
     if (session.native_dialog) {
         bool opened = false;
         for (unsigned i = 0; i < 300 && active(); i++) {
@@ -635,7 +648,7 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
             copy_text(error, cap, "The PSPKG page did not open. Return to Orbit and try again.");
             return false;
         }
-    } else if (probe_browser_open(release->browser_url)) {
+    } else if (probe_browser_open(pspkg_open_url(release->browser_url, page_url, sizeof page_url))) {
         copy_text(error, cap, "The PS5 browser could not open the PSPKG page.");
         return false;
     }
@@ -977,8 +990,21 @@ static void *worker(void *unused) {
             Release selected = session.release;
             pthread_mutex_unlock(&orbit.mutex);
             PspkgCollection found = {0};
+#ifdef ORBIT_TEST
+            const int browser_user = 1;
+#else
+            const int browser_user = probe_browser_user();
+#endif
             char error[256] = {0};
             bool ok = active() && collect_pspkg(&selected, &found, error, sizeof error);
+            CURL *cookies = NULL;
+            if (ok && active() && (found.verified || !cJSON_GetArraySize(found.fields))) {
+                cookies = curl_easy_init();
+                if (cookies && !pspkg_apply_browser_cookies(cookies, browser_user, session.native_dialog)) {
+                    curl_easy_cleanup(cookies);
+                    cookies = NULL;
+                }
+            }
             if (ok) {
                 pthread_mutex_lock(&orbit.mutex);
                 ok = selected_locked() && !atomic_load(&session.cancel);
@@ -1008,8 +1034,21 @@ static void *worker(void *unused) {
                 if (link->reason[0]) continue;
                 char resolved[2048] = "";
                 RemoteFileMetadata metadata = {0};
-                const char *reason = remote_pspkg_route(link->url, link->intermediate, &session.cancel,
-                                                       resolved, sizeof resolved, &metadata);
+                const char *reason = cookies && link->intermediate
+                    ? remote_pspkg_verified_provider(found.page, link, cookies, browser_user,
+                                                     &session.cancel, resolved, sizeof resolved)
+                    : NULL;
+                if (reason && !*reason) {
+                    if (!remote_pspkg_provider_metadata(resolved, &session.cancel, &metadata)) {
+                        if (metadata.status == REMOTE_METADATA_MISSING) reason = "missing-page";
+                        else if (metadata.status == REMOTE_METADATA_ARCHIVE_LOGIN) reason = "archive-login-required";
+                        else if (metadata.status == REMOTE_METADATA_UNSUPPORTED) reason = "unsupported-format";
+                        else reason = "verify-required";
+                    }
+                } else if (!reason) {
+                    reason = remote_pspkg_route(link->url, link->intermediate, &session.cancel,
+                                                resolved, sizeof resolved, &metadata);
+                }
                 copy_text(link->reason, sizeof link->reason, reason);
                 if (resolved[0] && (!*reason || !strcmp(reason, "verify-required"))) {
                     update_pspkg_metadata(link, &metadata);
@@ -1022,6 +1061,7 @@ static void *worker(void *unused) {
                 if (!atomic_load(&session.cancel)) session.pspkg_links[i] = *link;
                 pthread_mutex_unlock(&orbit.mutex);
             }
+            if (cookies) curl_easy_cleanup(cookies);
             if (ok && active())
                 remote_pspkg_patch_metadata(found.links, found.count, !strcmp(found.platform, "ps5"), &session.cancel);
             pthread_mutex_lock(&orbit.mutex);
@@ -1333,8 +1373,12 @@ cJSON *browser_status(void) {
         cJSON_AddStringToObject(o, "clientId", session.client_id);
         cJSON_AddBoolToObject(o, "dialogOpened", session.dialog_opened);
         /* Only the catalogue's public page, never a captured/signed file URL. */
-        if (session.busy && !session.resolving && !session.check_account && !session.dialog_opened && !atomic_load(&session.cancel))
-            cJSON_AddStringToObject(o, "pageUrl", session.mirror_page[0] ? session.mirror_page : session.release.browser_url);
+        if (session.busy && !session.resolving && !session.check_account && !session.dialog_opened && !atomic_load(&session.cancel)) {
+            const char *page = session.mirror_page[0] ? session.mirror_page : session.release.browser_url;
+            char pspkg_page[sizeof session.release.browser_url + 9];
+            cJSON_AddStringToObject(o, "pageUrl", session.pspkg_fetch
+                ? pspkg_open_url(page, pspkg_page, sizeof pspkg_page) : page);
+        }
     }
     cJSON_AddStringToObject(o, "id", session.id);
     cJSON_AddStringToObject(o, "state", session.state[0] ? session.state : "idle");

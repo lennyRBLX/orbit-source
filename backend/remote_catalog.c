@@ -580,6 +580,12 @@ static bool normalize_url(const char *raw, char *url, size_t cap) {
     return ok;
 }
 
+bool remote_pspkg_provider_page(const char *url, char *out, size_t cap) {
+    if (!normalize_url(url, out, cap)) return false;
+    const char *provider = remote_browser_provider(out);
+    return *provider && strcmp(provider, "pspkg");
+}
+
 /* Returns 1 for an excluded format and -1 when an option cannot be interpreted. */
 static int map_link(const cJSON *entry, const cJSON *link, const char *source_id, Release *r) {
     memset(r, 0, sizeof *r);

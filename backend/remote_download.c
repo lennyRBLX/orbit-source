@@ -1,9 +1,11 @@
 #include "remote_sources.h"
 #include "archive_account.h"
+#include "browser_platform.h"
 #include "image_format.h"
 #include "provider_network.h"
 #include "ca.h"
 #include "pspkg.h"
+#include <openssl/crypto.h>
 
 #include <ctype.h>
 #include <math.h>
@@ -24,6 +26,7 @@ typedef struct {
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
     bool metadata_only, redirect_status, range, plain_text, html_only, archive_session, use_http1;
     const char *page_token;
+    CURL *pspkg_session;
     const char *json_post, *referer;
     long timeout;
     const char *initial_url;
@@ -143,7 +146,8 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
 static size_t body(char *data, size_t a, size_t b, void *context) {
     Response *r = context;
     size_t n = a * b;
-    if (cancelled(r) || (r->html_only && (!r->page || r->json || r->plain_text))) return 0;
+    if (cancelled(r) || (r->html_only &&
+        (!r->page || r->plain_text || r->json != (r->pspkg_session && r->json_post)))) return 0;
     bool collect = r->collect_page && (r->page || r->error_page || r->plain_text);
     if (!collect && r->collect_page && !r->used) {
         size_t offset = 0;
@@ -172,11 +176,18 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
     return r->truncated ? 0 : n;
 }
 
+static void fetch_close(Response *r) {
+    if (r->pspkg_session) curl_easy_reset(r->handle);
+    else curl_easy_cleanup(r->handle);
+    r->handle = NULL;
+}
+
 static bool fetch(const char *url, Response *r) {
     if (!(r->direct ? direct_http_url(url) : remote_https_url(url)) || cancelled(r)) return false;
-    CURL *curl = curl_easy_init();
+    CURL *curl = r->pspkg_session ? r->pspkg_session : curl_easy_init();
     if (!curl) return false;
     r->handle = curl;
+    if (r->pspkg_session) curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
     r->initial_url = url;
     struct curl_blob ca = {(void *)orbit_ca, sizeof orbit_ca - 1, CURL_BLOB_COPY};
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -190,7 +201,7 @@ static bool fetch(const char *url, Response *r) {
     struct curl_slist *headers_out = NULL;
     if (r->page_token) {
         headers_out = curl_slist_append(NULL, r->page_token);
-        if (!headers_out) { curl_easy_cleanup(curl); r->handle = NULL; return false; }
+        if (!headers_out) { fetch_close(r); return false; }
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers_out);
     }
     if (r->json_post) {
@@ -198,16 +209,28 @@ static bool fetch(const char *url, Response *r) {
         struct curl_slist *with_accept = headers_out ? curl_slist_append(headers_out, "Accept: application/json") : NULL;
         if (!with_accept) {
             curl_slist_free_all(headers_out);
-            curl_easy_cleanup(curl);
-            r->handle = NULL;
+            fetch_close(r);
             return false;
         }
         headers_out = with_accept;
+        if (r->pspkg_session) {
+            const char *headers[] = {"Origin: https://pspkg.com", "Sec-Fetch-Site: same-origin",
+                "Sec-Fetch-Mode: cors", "Sec-Fetch-Dest: empty"};
+            for (size_t i = 0; i < sizeof headers / sizeof *headers; i++) {
+                with_accept = curl_slist_append(headers_out, headers[i]);
+                if (!with_accept) {
+                    curl_slist_free_all(headers_out);
+                    fetch_close(r);
+                    return false;
+                }
+                headers_out = with_accept;
+            }
+        }
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers_out);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->json_post);
-        curl_easy_setopt(curl, CURLOPT_REFERER, r->referer);
     }
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->page_token || r->json_post ? 0L : 1L);
+    if (r->referer) curl_easy_setopt(curl, CURLOPT_REFERER, r->referer);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->page_token || r->json_post || r->pspkg_session ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
 #ifndef ORBIT_TEST
     const char *protocols = r->direct && !strncasecmp(url, "http://", 7) ? "http,https" : "https";
@@ -275,9 +298,8 @@ static bool fetch(const char *url, Response *r) {
         if (r->range && curl_easy_header(curl, "Content-Encoding", 0, CURLH_HEADER, -1, &header) == CURLHE_OK &&
             strcasecmp(header->value, "identity")) r->size = 0;
     }
-    curl_easy_cleanup(curl);
+    fetch_close(r);
     curl_slist_free_all(headers_out);
-    r->handle = NULL;
     return ok;
 }
 
@@ -1664,6 +1686,65 @@ bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, Remote
     }
     free(page.body);
     return ok;
+}
+
+static bool pspkg_resolve_form(const char *html, char *form, size_t cap) {
+    const char marker[] = "var CSRF_TOKEN";
+    const char *value = strstr(html, marker);
+    if (!value) return false;
+    value += sizeof marker - 1;
+    value += strspn(value, " \t");
+    if (*value != '=') return false;
+    value += 1 + strspn(value + 1, " \t");
+    char quote = *value;
+    if (quote != '\'' && quote != '"') return false;
+    value++;
+    size_t length = strspn(value, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-");
+    if (!length || length > 96 || value[length] != quote) return false;
+    int written = snprintf(form, cap, "csrf=%.*s&dl_action=resolve", (int)length, value);
+    return written > 0 && (size_t)written < cap;
+}
+
+/* The authenticated handoff returns only the provider URL. Its cookies and
+ * CSRF value stay on the exact PSPKG endpoint and are never sent to the host. */
+const char *remote_pspkg_verified_provider(const char *page, const PspkgLink *link, CURL *cookies, int user,
+                                           atomic_bool *cancel, char *out, size_t cap) {
+    char platform[4], game[13];
+#ifndef ORBIT_TEST
+    if (user != probe_browser_user()) return NULL;
+#endif
+    if (!cookies || user < 0 || !link->intermediate || !remote_https_url(link->url) ||
+        !pspkg_page_identity(page, platform, sizeof platform, game, sizeof game) ||
+        !pspkg_link_matches(link->url, page, platform, game, link->edition_id))
+        return NULL;
+
+    Response response = {.cancel = cancel, .collect_page = true, .metadata_only = true, .html_only = true,
+        .pspkg_session = cookies, .referer = page, .timeout = 5};
+    char post[128] = "";
+    bool ready = fetch(link->url, &response) && response.body && !response.truncated &&
+        !response_challenge(&response) && pspkg_resolve_form(response.body, post, sizeof post);
+    if (response.body) OPENSSL_cleanse(response.body, response.used);
+    free(response.body);
+#ifndef ORBIT_TEST
+    ready = ready && user == probe_browser_user();
+#endif
+    if (!ready) {
+        OPENSSL_cleanse(post, sizeof post);
+        return NULL;
+    }
+    Response reply = {.cancel = cancel, .collect_page = true, .metadata_only = true, .html_only = true,
+        .pspkg_session = cookies, .json_post = post, .referer = link->url, .timeout = 5};
+    cJSON *result = fetch(link->url, &reply) && reply.json && reply.body && !reply.truncated
+        ? cJSON_ParseWithOpts(reply.body, NULL, true) : NULL;
+    OPENSSL_cleanse(post, sizeof post);
+    free(reply.body);
+
+    const char *status = NULL;
+    const char *target = json_text(result, "url");
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(result, "success")) && *target)
+        status = remote_pspkg_provider_page(target, out, cap) ? "" : "unsupported-provider";
+    cJSON_Delete(result);
+    return status;
 }
 
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,

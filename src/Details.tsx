@@ -539,8 +539,9 @@ export function Details({
             </select>
           )}
           <button className="pspkg-fetch" type="button" disabled={pending || !!browser?.active || !browser?.available}
+            aria-busy={pspkgHere?.pspkgReleaseId === listingId && !!browser?.active}
             onClick={() => void fetchLinks()}>
-            {t("Fetch PSPKG")}
+            {pspkgLinks.length ? t("Refresh PSPKG links") : t("Fetch PSPKG")}
           </button>
           {pspkgHere?.pspkgReleaseId === listingId && pspkgStatus(pspkgHere?.pspkgStatus) && (
             <p role="status">{pspkgStatus(pspkgHere?.pspkgStatus)}</p>
@@ -557,19 +558,19 @@ export function Details({
               {pspkgLinks.map((link) => {
                 const size = pspkgDelivery === "torbox" && link.torboxAvailable && link.torboxSizeBytes
                   ? bytes(link.torboxSizeBytes)
-                  : link.sizeBytes ? `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}` : "";
+                  : link.sizeBytes ? `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}` : t("Unknown size");
                 return (
                   <button key={link.id} type="button"
                     disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
                     onClick={() => void selectPspkgLink(link.id)}>
                     <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
-                    {link.gameName && <small>{[link.gameName, link.titleId, link.region].filter(Boolean).join(" · ")}</small>}
-                    <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
-                      link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
-                    {(link.version || link.filename || size || link.hasArchivePassword) ? (
-                      <small>{[formatVersion(link.version), link.filename, size,
-                        link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
-                    ) : null}
+                    {(link.gameName || link.titleId || link.region) &&
+                      <small>{[link.gameName, link.titleId, link.region].filter(Boolean).join(" · ")}</small>}
+                    <small>{[link.providerHost, link.edition || [link.format, link.compression].filter(Boolean).join(" · "),
+                      link.group, link.torboxAvailable && (link.torboxCached ? `TorBox ${t("Cached")}` : t("TorBox available")),
+                      reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
+                    <small>{[formatVersion(link.version), link.filename, size,
+                      link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
                   </button>
                 );
               })}

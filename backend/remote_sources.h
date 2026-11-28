@@ -10,6 +10,7 @@
 
 #include "orbit.h"
 #include "pspkg.h"
+#include <curl/curl.h>
 
 /* Startup loads the built-in catalogues and their cache before reading the queue. */
 int remote_sources_load(void);
@@ -104,6 +105,10 @@ typedef struct {
 } RemoteFileMetadata;
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
                                char *out, size_t cap, RemoteFileMetadata *metadata);
+bool remote_pspkg_provider_page(const char *url, char *out, size_t cap);
+/* NULL means the browser session could not resolve the handoff. */
+const char *remote_pspkg_verified_provider(const char *page, const PspkgLink *link, CURL *cookies, int user,
+                                           atomic_bool *cancel, char *out, size_t cap);
 bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, RemoteFileMetadata *metadata);
 bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, cJSON **links);
 cJSON *remote_metadata_json_locked(const char *ids);

@@ -11,6 +11,7 @@ void viking_download_context(Release *release, bool native);
 bool viking_apply_download(CURL *curl, const Release *release);
 /* Kept separate for tests with synthetic databases, never exposed by HTTP. */
 bool viking_read_cookies(CURL *curl, const char *path, time_t now);
+bool pspkg_apply_browser_cookies(CURL *curl, int user, bool native);
 VikingState viking_page_state(const char *html);
 const char *viking_cached_state(bool native);
 /* Asks vikingfile.com whether a pasted pass (viking_pass.h) is signed in. */

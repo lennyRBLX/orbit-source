@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -61,6 +62,23 @@ class Fixture(BaseHTTPRequestHandler):
                 "logged-in-user": "fixture-user", "logged-in-sig": "fixture-signature",
             }}}
             self.reply(json.dumps(result).encode(), headers={"Content-Type": "application/json"})
+            return
+        if urlsplit(self.path).path == "/ps5/download.php" and self.server.pspkg_mode == "verified":
+            link = parse_qs(urlsplit(self.path).query)["link_id"][0]
+            self.server.calls.append("resolve:" + link)
+            if (self.headers.get("Cookie") != "PHPSESSID=refreshed-fixture" or
+                    self.headers.get("Sec-Fetch-Site") != "same-origin" or
+                    self.headers.get("Referer") != self.server.base + self.path or
+                    parse_qs(body.decode()) != {"csrf": ["fixture-csrf"], "dl_action": ["resolve"]}):
+                self.reply(b"", 403)
+                return
+            routes = {
+                GTA_HANDOFFS[0]: self.server.base + VIKING_PAGE,
+                GTA_HANDOFFS[1]: "https://gofile.io/d/not-supported",
+                GTA_HANDOFFS[2]: self.server.base + FILE_REDIRECT,
+            }
+            self.reply(json.dumps({"success": True, "url": routes[link]}).encode(),
+                       headers={"Content-Type": "application/json"})
             return
         if self.path == "/api/internal/loadpatches":
             request = json.loads(body)
@@ -157,7 +175,7 @@ class Fixture(BaseHTTPRequestHandler):
         elif path == "/ps4/ps4-games-list":
             self.reply(b'<a href="/ps4/cyberpunk-2077-13811.html">Cyberpunk 2077</a>')
         elif path == "/ps5/ps5-games-list":
-            if self.server.pspkg_mode in ("pages", "pages-missing"):
+            if self.server.pspkg_mode in ("pages", "pages-missing", "verified"):
                 self.reply(f'<a href="/ps5/{GTA_SLUG}.html">Grand Theft Auto VI (GTA 6)</a>'.encode())
             else:
                 self.reply(b'<a href="/ps5/cyberpunk-2077-ultimate-edition-13811.html">Cyberpunk 2077 Ultimate Edition</a>')
@@ -197,8 +215,16 @@ class Fixture(BaseHTTPRequestHandler):
                 routes["2"] = ARCHIVE_FILE
                 routes["3"] = SECOND_PAGE
                 routes["6"] = BUZZ_CHALLENGE
-            if self.server.pspkg_mode in ("pages", "pages-missing"):
-                self.reply(b'<button>Continue to Download</button>', headers={"Content-Type": "text/html"})
+            if self.server.pspkg_mode in ("pages", "pages-missing", "verified"):
+                link = parse_qs(urlsplit(self.path).query)["link_id"][0]
+                expected = "verified-fixture" if link == GTA_HANDOFFS[0] else "refreshed-fixture"
+                verified = self.server.pspkg_mode == "verified" and self.headers.get("Cookie") == "PHPSESSID=" + expected
+                markup = b'<button>Continue to Download</button>'
+                headers = {"Content-Type": "text/html"}
+                if verified:
+                    markup += b'<script>var CSRF_TOKEN = "fixture-csrf";</script>'
+                    headers["Set-Cookie"] = "PHPSESSID=refreshed-fixture; Path=/; HttpOnly"
+                self.reply(markup, headers=headers)
             elif self.path.endswith("route=expired"):
                 self.reply(b"<p>Verification required</p>", 403, {"Content-Type": "text/html"})
             else:
@@ -221,10 +247,10 @@ class Fixture(BaseHTTPRequestHandler):
                 self.reply(b"", 302, {"Location": "/original"})
         elif path == VIKING_PAGE:
             self.server.calls.append(path)
-            if self.headers.get("Range"):
+            if self.headers.get("Range") or self.headers.get("Cookie"):
                 self.reply(b"", 416)
                 return
-            name = ("CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode in ("pages", "pages-missing")
+            name = ("CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode in ("pages", "pages-missing", "verified")
                     else "02.120 PPSA04029-[DLPSGAME.COM].rar")
             self.reply(f'<div id="file-information"><h2 id="filename">{name}</h2>'
                        '<p id="size">199.55 GB</p></div>'.encode(),
@@ -351,7 +377,7 @@ class TorBoxRouting(unittest.TestCase):
                         reveal["fields"]["1"] = f'<a href="{fixture.base}{VIKING_PAGE}">Viki</a>'
                     if pspkg == "unavailable":
                         reveal["fields"]["6"] = anchor("6")
-                    if pspkg in ("pages", "pages-missing"):
+                    if pspkg in ("pages", "pages-missing", "verified"):
                         reveal["fields"] = {"29356": "".join(
                             f'<a href="download.php?game_id=14552&amp;edition_id=29356&amp;link_id={link_id}">Provider</a>'
                             for link_id in GTA_HANDOFFS)}
@@ -359,6 +385,15 @@ class TorBoxRouting(unittest.TestCase):
                         routes = ("1", "3", "2", "expired") if pspkg == "patches-ps5" else ("1", "3", "expired")
                         reveal["fields"] = {str(i): anchor(link) for i, link in enumerate(routes, 1)}
                     env.update(ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
+                    if pspkg == "verified":
+                        cookie_db = root / "browser-cookies.db"
+                        with sqlite3.connect(cookie_db) as db:
+                            db.execute("CREATE TABLE Cookie (name, value, domain, path, expires, session, secure)")
+                            db.executemany("INSERT INTO Cookie VALUES (?, ?, ?, '/', 0, 1, 0)", [
+                                ("PHPSESSID", "verified-fixture", "127.0.0.1"),
+                                ("unrelated", "not-for-orbit", "127.0.0.1"),
+                            ])
+                        env["ORBIT_TEST_PSPKG_COOKIES"] = str(cookie_db)
                     if pspkg == "patches-ps4":
                         env.update(ORBIT_TEST_PSPKG_PS4_URL=fixture.base + "/ps4/",
                                    ORBIT_TEST_ORBISPATCHES_URL=fixture.base)
@@ -424,6 +459,18 @@ class TorBoxRouting(unittest.TestCase):
             call("/browser", {"action": "cancel", "id": status["id"]})
         status = wait_for(lambda: result if not (result := call("/browser"))["active"] else None)
         self.assertEqual(status["pspkgGameId"], release["gameId"])
+        if mode == "verified":
+            choices = {link["handoffId"]: link for link in status["pspkgLinks"]}
+            first = choices[GTA_HANDOFFS[0]]
+            self.assertEqual(first["reason"], "")
+            self.assertEqual(first["filename"], "CODENAME-VICE-Compressed.7z")
+            self.assertEqual(first["sizeBytes"], 199_550_000_000)
+            self.assertTrue(first["torboxAvailable"])
+            self.assertEqual(choices[GTA_HANDOFFS[1]]["reason"], "unsupported-provider")
+            self.assertEqual(choices[GTA_HANDOFFS[2]]["reason"], "verify-required")
+            self.assertEqual(call("/downloads"), [])
+            self.assertEqual(list((drive / "homebrew").iterdir()), [])
+            return
         if mode in ("pages", "pages-missing"):
             self.assertIn("Grand Theft Auto VI", release["title"])
             self.assertEqual(status["pspkgStatus"], "verify-required")
@@ -559,6 +606,14 @@ class TorBoxRouting(unittest.TestCase):
         calls = self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="pages")
         for path in (VIKING_PAGE, SECOND_PAGE, FILE_REDIRECT):
             self.assertEqual(calls.count(path), 1)
+        self.assertNotIn("/original", calls)
+        self.assertNotIn("create", calls)
+
+    def test_pspkg_fetch_reuses_verification_for_metadata_only(self):
+        calls = self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="verified")
+        self.assertEqual([call for call in calls if call.startswith("resolve:")],
+                         ["resolve:" + link for link in GTA_HANDOFFS])
+        self.assertIn(VIKING_PAGE, calls)
         self.assertNotIn("/original", calls)
         self.assertNotIn("create", calls)
 
