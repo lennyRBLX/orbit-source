@@ -438,6 +438,7 @@ const char *remote_browser_provider(const char *url) {
         const char *path = strchr(url + 17, '/');
         if (path && !strncmp(path, "/pspkg-provider/vikingfile.com/", sizeof "/pspkg-provider/vikingfile.com/" - 1)) return "vikingfile";
         if (path && !strncmp(path, "/pspkg-provider/buzzheavier.com/", sizeof "/pspkg-provider/buzzheavier.com/" - 1)) return "buzzheavier";
+        if (path && !strncmp(path, "/pspkg-provider/datavaults.co/", sizeof "/pspkg-provider/datavaults.co/" - 1)) return "datavaults";
     }
 #endif
     if (strncmp(url, "https://", 8)) return "";

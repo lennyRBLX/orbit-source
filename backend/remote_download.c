@@ -711,11 +711,12 @@ static bool filename_label(const char *label) {
     return has_label(label, "filename") || has_label(label, "file-name") || has_label(label, "tier-name");
 }
 
-static bool page_filename(const char *html, const Release *r, char *name, size_t cap, const char **anchor) {
+static bool page_filename(const Response *page, const Release *r, char *name, size_t cap, const char **anchor) {
     Release file = *r;
+    bool datavaults = !strcmp(remote_browser_provider(page->url), "datavaults");
     char heading[sizeof file.filename] = "", title[512] = "";
     const char *heading_tag = NULL;
-    for (const char *tag = html; (tag = strchr(tag, '<')); ) {
+    for (const char *tag = page->body; (tag = strchr(tag, '<')); ) {
         const char *next = skip_markup(tag);
         if (next != tag) { tag = next; continue; }
         const char *end = strchr(tag, '>');
@@ -723,6 +724,11 @@ static bool page_filename(const char *html, const Release *r, char *name, size_t
         char label[128], value[512];
         bool named = (tag_is(tag + 1, "a") && tag_value(tag, end, "download", name, cap)) ||
                      tag_value(tag, end, "data-filename", name, cap);
+        if (!named && datavaults && tag_is(tag + 1, "input") &&
+            tag_value(tag, end, "type", label, sizeof label) && !strcasecmp(label, "hidden") &&
+            tag_value(tag, end, "name", label, sizeof label) && !strcasecmp(label, "fname")) {
+            named = tag_value(tag, end, "value", name, cap);
+        }
         if (!named && ((tag_value(tag, end, "id", label, sizeof label) && filename_label(label)) ||
                        (tag_value(tag, end, "class", label, sizeof label) && filename_label(label)))) {
             named = tag_value(tag, end, "title", name, cap) || element_text(tag, end, name, cap);
@@ -1392,7 +1398,7 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
     Release file = *r;
     char name[sizeof file.filename] = "";
     const char *anchor = NULL;
-    bool named = page_filename(page->body, r, name, sizeof name, &anchor);
+    bool named = page_filename(page, r, name, sizeof name, &anchor);
     if (!named) {
         PageLink link = {0};
         if (!page_link(page, r, NULL, &link) && (link.pinned || link.recognized)) {
@@ -1766,7 +1772,7 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
     if (*provider) {
         *locator = *r;
         char name[sizeof r->filename];
-        if (page_filename(page.body, r, name, sizeof name, NULL)) {
+        if (page_filename(&page, r, name, sizeof name, NULL)) {
             if (remote_provider_file_format(locator, name, NULL) > 0) goto done;
             copy_text(locator->filename, sizeof locator->filename, name);
         }
@@ -1798,7 +1804,7 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         if (link.pinned) {
             name = link.filename;
             copy_text(file.filename, sizeof file.filename, name);
-        } else if (!*provider && !link.recognized && page_filename(page.body, r, heading, sizeof heading, NULL)) {
+        } else if (!*provider && !link.recognized && page_filename(&page, r, heading, sizeof heading, NULL)) {
             name = heading;
         }
         bool received = fetch(link.url, &response);

@@ -423,6 +423,10 @@ class RemoteCatalogueTests(unittest.TestCase):
                                   b'<span><strong>42 MiB</strong></span></div>'),
             "data": (200, b'<h1>Fixture.pkg</h1><span id="filesize">1 GB</span>'
                            b'<span data-file-size="1323456789"></span>'),
+            "datavaults": (200, b'<title>Download PPSA04029</title><form method="POST">'
+                                 b'<input type="hidden" name="fname" value="PPSA04029.7z">'
+                                 b'<h1><span>Downloading</span><br><span>PPSA04029.7z</span></h1>'
+                                 b'<p><span>Size:</span> 109.7 GB<br><span>Uploaded:</span> 2026-08-27</p></form>'),
             "other": (200, b'<title>Fixture.zip</title><div data-size="99999999999">Premium plan</div>'
                             b'<p>Upload limit: 10 TB</p><p>Page 24</p><p>Cloud storage 50 GB</p>'
                             b'<span data-size-bytes="4321000000">Premium quota</span>'
@@ -448,6 +452,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             "challenge-ok": (200, b'<script>window._cf_chl_opt = {};</script><h1>File removed</h1>'),
             "provider-error": (503, b'<h1>File not found</h1>'),
             "fake-name": (200, b'<script>const message = "File not found";</script>'
+                               b'<input type="hidden" name="fname" value="Fixture.7z">'
                                b'<span data-filename="Deleted"></span>'),
             "live": (200, b'<title>Mirror.pkg</title><p>File size: 1.2 MB</p>'),
             "rootz/active": (200, b'<script>const shortId = "active"; const pageToken = "rootz-fixture-token";</script>'
@@ -455,15 +460,17 @@ class RemoteCatalogueTests(unittest.TestCase):
             "rootz/dead": (200, b'<script>var data = {"shortId":"dead","pageToken":"rootz-fixture-token"};</script>'
                                 b'<title>Former File.rar</title>'),
         }
+        paths = {key: "/metadata/" + key for key in pages}
+        paths["datavaults"] = "/pspkg-provider/datavaults.co/f14d7lfgvlxg"
         for key, (status, body) in pages.items():
-            server.downloads["/metadata/" + key] = (status, {} if key == "no-type" else html, body)
+            server.downloads[paths[key]] = (status, {} if key == "no-type" else html, body)
         for key in ("active", "dead"):
             obj = {"fileName": "Fixture.rar", "size": 118401234567, "mimeType": "application/vnd.rar",
                    "status": "active" if key == "active" else "deleted", "downloadAllowed": key == "active"}
             server.downloads[f"/api/files/download-by-short?shortId={key}"] = (
                 200, {"Content-Type": "application/json"}, json.dumps(obj).encode())
         server.feed = {"packages": [{"title": "Metadata fixture", "titleId": "PPSA12345",
-                        "downloadLinks": [{"name": key, "url": address + "/metadata/" + key,
+                        "downloadLinks": [{"name": key, "url": address + paths[key],
                                            **({"format": "exFAT"} if key == "akira-image" else {})}
                                           for key in pages]}]}
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -494,6 +501,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                     ("buzz", "Fixture.zip", "Game folder", "zip", int(3.75 * 1024 ** 3), False),
                     ("buzz-sibling", "Fixture.zip", "Game folder", "zip", 42 * 1024 ** 2, False),
                     ("data", "Fixture.pkg", "PKG", None, 1323456789, True),
+                    ("datavaults", "PPSA04029.7z", "Game folder", "7z", 109700000000, False),
                     ("keeper", "Fixture.rar", "Game folder", "rar", 71 * 1024, False),
                     ("rootz/active", "Fixture.rar", "Game folder", "rar", 118401234567, True),
                     ("other", "Fixture.zip", "Game folder", "zip", 0, False),
@@ -523,6 +531,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                     (f"/api/files/download-by-short?shortId={key}", "rootz-fixture-token")
                     for key in ("active", "dead")
                 ])
+                self.assertIn((paths["datavaults"], None), server.ranges)
                 by_id = {row["id"]: row for row in service.command("view")["remote"]}
                 self.assertNotIn(rows["viking"], by_id)
                 self.assertNotIn("providerMissing", by_id[rows["challenge"]])
