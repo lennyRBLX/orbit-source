@@ -239,7 +239,7 @@ bool remote_metadata_url(const char *url) {
 }
 
 bool remote_metadata_option(const Release *r) {
-    return remote_page_pending(r) && remote_metadata_url(r->browser_url);
+    return (remote_page_pending(r) || provider_browser_supported(r)) && remote_https_url(r->browser_url);
 }
 
 static bool token(const char *label, const char *word) {
@@ -656,8 +656,8 @@ cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_
             result == 3 ? "wrong-platform-or-section" : result ? "invalid-url-or-fields" : "";
         const Release *installed = result ? NULL : release_find(mapped.id);
         bool enabled = installed && remote_source_enabled_locked(installed);
-        bool visible = enabled;
-        if (enabled && installed->mirror_key[0]) {
+        bool visible = enabled && !remote_link_missing_locked(installed);
+        if (visible && installed->mirror_key[0]) {
             Release first;
             if (remote_next_mirror_locked(installed, "", &first) && strcmp(first.id, installed->id) < 0)
                 visible = false;

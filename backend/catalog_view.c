@@ -145,7 +145,8 @@ static bool append_remote_locked(cJSON *out) {
     size_t mirror_count = 0;
     for (i = 0; i < orbit.remote_release_count; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (r->mirror_key[0] && source_enabled_locked(r)) mirrors[mirror_count++] = r;
+        if (r->mirror_key[0] && source_enabled_locked(r) && !remote_link_missing_locked(r))
+            mirrors[mirror_count++] = r;
     }
     qsort(mirrors, mirror_count, sizeof *mirrors, compare_mirrors);
     i = 0;
@@ -158,7 +159,7 @@ static bool append_remote_locked(cJSON *out) {
     bool ok = true;
     for (i = 0; i < orbit.remote_release_count && ok; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (!source_enabled_locked(r)) continue;
+        if (!source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
         size_t begin = 0, end = 0;
         if (r->mirror_key[0]) {
             begin = first_mirror(mirrors, mirror_count, r->mirror_key);
@@ -237,7 +238,7 @@ static cJSON *snapshot_locked(bool addons) {
                          ? &orbit.releases[slot]
                          : release_find(id);
         slot++;
-        if (!source_enabled_locked(r)) continue;
+        if (!source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
         cJSON *entry = cJSON_Duplicate(x, true);
         if (!entry) {
             cJSON_Delete(a);
@@ -247,6 +248,7 @@ static cJSON *snapshot_locked(bool addons) {
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
         cJSON_AddBoolToObject(entry, "browserAvailable", provider_browser_supported(r));
         cJSON_AddBoolToObject(entry, "directAvailable", provider_url_supported(r));
+        if (remote_metadata_option(r)) cJSON_AddTrueToObject(entry, "providerMetadata");
         char host[254];
         if (remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
         firmware_describe(entry, orbit.firmware);

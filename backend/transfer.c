@@ -1293,7 +1293,10 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed)
     pthread_mutex_lock(&orbit.mutex);
     bool found = true;
     if (j->mirror_id[0]) found = remote_mirror_locked(&j->release, j->mirror_id, candidate);
-    else *candidate = j->release;
+    else {
+        *candidate = j->release;
+        found = !remote_link_missing_locked(candidate);
+    }
     pthread_mutex_unlock(&orbit.mutex);
     if (!found) {
         *source_failed = true;
@@ -1302,9 +1305,15 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed)
     }
     if (torbox(t)) return true;
     Release locator;
-    int checked = remote_page_pending(candidate)
+    bool pending = remote_page_pending(candidate);
+    int checked = pending
         ? remote_download_resolve(candidate, &locator, &j->cancel, t->error, sizeof t->error)
         : remote_download_verify(candidate, candidate->url, &j->cancel, t->error, sizeof t->error);
+    if (checked == REMOTE_DOWNLOAD_MISSING && (pending || !candidate->remote_page)) {
+        pthread_mutex_lock(&orbit.mutex);
+        remote_mark_missing_locked(candidate);
+        pthread_mutex_unlock(&orbit.mutex);
+    }
     if (checked || !remote_mirror_file(t->release, candidate)) {
         *source_failed = true;
         if (!t->error[0]) copy_text(t->error, sizeof t->error, "The mirror did not return the selected file.");

@@ -310,6 +310,7 @@ static void community_file(Release *selected, const Release *file) {
 static bool resolve_community(Release *selected, char *etag, char *modified, char *error, size_t cap) {
     Release candidate = *selected, interactive = {0}, interactive_locator = {0};
     char after[sizeof candidate.id] = "";
+    bool missing = false;
     while (active()) {
         Release locator;
         error[0] = 0;
@@ -317,9 +318,12 @@ static bool resolve_community(Release *selected, char *etag, char *modified, cha
         int result = remote_page_pending(&candidate)
             ? remote_download_resolve(&candidate, &locator, &session.cancel, error, cap)
             : remote_download_verify(&candidate, candidate.url, &session.cancel, error, cap);
-        if (result == 1 && !strcmp(locator.source, "vikingfile") && active() &&
-            viking_resolve_download(&locator, session.native_dialog, &session.cancel) &&
-            !verify_community_capture(&candidate, &locator, locator.url, error, cap)) result = 0;
+        if (result == 1 && !strcmp(locator.source, "vikingfile") && active()) {
+            bool viking_missing;
+            if (viking_resolve_download(&locator, session.native_dialog, &session.cancel, &viking_missing) &&
+                !verify_community_capture(&candidate, &locator, locator.url, error, cap)) result = 0;
+            else if (viking_missing) result = REMOTE_DOWNLOAD_MISSING;
+        }
         if (!result && (primary || remote_mirror_file(selected, &candidate))) {
             community_file(selected, &candidate);
             pthread_mutex_lock(&orbit.mutex);
@@ -332,12 +336,19 @@ static bool resolve_community(Release *selected, char *etag, char *modified, cha
             interactive_locator = locator;
         }
         pthread_mutex_lock(&orbit.mutex);
+        if (result == REMOTE_DOWNLOAD_MISSING) {
+            remote_mark_missing_locked(&candidate);
+            missing = true;
+        }
         bool next = remote_next_mirror_locked(selected, after, &candidate);
         pthread_mutex_unlock(&orbit.mutex);
         if (!next) break;
         copy_text(after, sizeof after, candidate.id);
     }
-    if (!interactive.id[0] || !active()) return false;
+    if (!interactive.id[0] || !active()) {
+        if (missing && !error[0]) copy_text(error, cap, REMOTE_DOWNLOAD_REMOVED);
+        return false;
+    }
 
     pthread_mutex_lock(&orbit.mutex);
     session.resolving = false;
@@ -504,6 +515,11 @@ static void download_pspkg(void) {
     if (ok) ok = capture(&locator, NULL, etag, modified, &validated, error, sizeof error);
     Release route = selected;
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
+    bool missing = ok && *provider && remote_download_confirm_missing(locator.url, &session.cancel);
+    if (missing) {
+        copy_text(error, sizeof error, REMOTE_DOWNLOAD_REMOVED);
+        ok = false;
+    }
     if (ok) {
         if (*provider) {
             copy_text(route.remote_provider_page, sizeof route.remote_provider_page, locator.url);
@@ -517,6 +533,16 @@ static void download_pspkg(void) {
         }
     }
     pthread_mutex_lock(&orbit.mutex);
+    if (missing) {
+        for (size_t i = 0; i < session.pspkg_count; i++) {
+            const PspkgLink *item = &session.pspkg_links[i];
+            if (strcmp(item->edition_id, choice.edition_id) || strcmp(item->link_id, choice.link_id)) continue;
+            session.pspkg_count--;
+            memmove(&session.pspkg_links[i], &session.pspkg_links[i + 1],
+                    (session.pspkg_count - i) * sizeof session.pspkg_links[0]);
+            break;
+        }
+    }
     if (ok && *provider && !session.stop && !atomic_load(&session.cancel) && selected_locked() &&
         debrid_link_covered_locked(&route)) {
         Job *job = NULL;
@@ -673,14 +699,18 @@ static void *worker(void *unused) {
         if (remote_page_pending(&resolved)) {
             validated = ok = resolve_community(&resolved, etag, modified, error, sizeof error);
         } else {
-            ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
+            bool missing = false;
+            ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel, &missing);
             if (ok) {
                 ok = !validate_capture(&resolved, etag, modified, error, sizeof error);
                 validated = ok;
             }
             pthread_mutex_lock(&orbit.mutex);
             session.resolving = false;
-            if (!ok) {
+            if (missing) {
+                remote_mark_missing_locked(&resolved);
+                copy_text(error, sizeof error, REMOTE_DOWNLOAD_REMOVED);
+            } else if (!ok) {
                 resolved = session.release;
                 error[0] = etag[0] = modified[0] = 0;
                 if (!atomic_load(&session.cancel)) state_locked("opening", "Opening the download page on your PS5…");
@@ -688,7 +718,8 @@ static void *worker(void *unused) {
             if (ok) session.return_to_browser = false;
             pthread_mutex_unlock(&orbit.mutex);
             viking_download_context(&resolved, session.native_dialog);
-            if (!ok && active()) ok = capture(&resolved, NULL, etag, modified, &validated, error, sizeof error);
+            if (!ok && !missing && active())
+                ok = capture(&resolved, NULL, etag, modified, &validated, error, sizeof error);
         }
         pthread_mutex_lock(&orbit.mutex);
         ok = ok && !session.stop && !atomic_load(&session.cancel) && selected_locked();
