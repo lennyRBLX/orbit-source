@@ -90,7 +90,9 @@ static struct {
 } metadata = {.changed = PTHREAD_COND_INITIALIZER};
 
 static MetadataRequest *metadata_request_locked(const char *id, time_t now);
-static bool metadata_torbox_cached_locked(const Release *r);
+static const MetadataRequest *torbox_metadata_locked(const Release *r);
+static bool provider_unsupported_locked(const Release *r);
+static MetadataRequest *cached_metadata_locked(const char *id, time_t now);
 
 typedef struct {
     char title_id[sizeof ((Release *)0)->title_id];
@@ -159,8 +161,8 @@ const char *remote_mirror_group_locked(const Release *r) {
 }
 
 static const Release *mirror_route(const Release *r) {
-    return r->remote_alias && r->remote_alias <= orbit.remote_release_count
-        ? &orbit.remote_releases[r->remote_alias - 1] : r;
+    const Release *canonical = r->remote_alias[0] ? release_find(r->remote_alias) : NULL;
+    return canonical ? canonical : r;
 }
 
 static int64_t mirror_size_locked(const Release *r) {
@@ -189,7 +191,7 @@ static bool next_mirror_locked(const Release *release, const char *after, Releas
     const Release *best = NULL;
     for (size_t i = 0; i < orbit.remote_release_count; i++) {
         const Release *next = &orbit.remote_releases[i];
-        if (!next->remote_alias && strcmp(next->id, after) > 0 &&
+        if (!next->remote_alias[0] && strcmp(next->id, after) > 0 &&
             (!best || strcmp(next->id, best->id) < 0) && mirror_enabled(release, live, next) &&
             (include_missing || !remote_link_missing_locked(next)))
             best = next;
@@ -200,7 +202,7 @@ static bool next_mirror_locked(const Release *release, const char *after, Releas
             strcmp(options->title_id, release->title_id)) continue;
         for (size_t i = 0; i < options->count; i++) {
             const Release *next = &options->rows[i];
-            if (release_find(next->id) != next) continue;
+            if (release_find(next->id) != next || next->remote_alias[0]) continue;
             if (strcmp(next->id, after) > 0 && (!best || strcmp(next->id, best->id) < 0) &&
                 mirror_enabled(release, live, next) &&
                 (include_missing || !remote_link_missing_locked(next))) best = next;
@@ -223,21 +225,48 @@ bool remote_mirror_locked(const Release *release, const char *id, Release *mirro
     return true;
 }
 
-bool remote_torbox_route_locked(const Release *r, Release *route) {
-    if (metadata_torbox_cached_locked(r)) { *route = *r; return true; }
-    bool found = !remote_link_missing_locked(r) && debrid_link_covered_locked(r);
-    if (found) *route = *r;
+static bool direct_route_locked(const Release *r) {
+    return !remote_link_missing_locked(r) && !provider_unsupported_locked(r) &&
+        (remote_page_pending(r) || provider_supported(r) || provider_browser_supported(r));
+}
+
+static unsigned torbox_route_rank_locked(const Release *r) {
+    const MetadataRequest *cached = torbox_metadata_locked(r);
+    if (cached) return debrid_size_allowed(cached->torbox_size) ? 2 : 0;
+    return !remote_link_missing_locked(r) && !provider_unsupported_locked(r) && debrid_link_covered_locked(r) ? 1 : 0;
+}
+
+bool remote_direct_route_locked(const Release *r, Release *route) {
+    const Release *primary = mirror_route(r);
+    unsigned best = direct_route_locked(primary) ? 1 + torbox_route_rank_locked(primary) : 0;
+    if (best) *route = *primary;
     Release mirror;
     char after[sizeof mirror.id] = "";
-    while (next_mirror_locked(r, after, &mirror, true)) {
-        if (metadata_torbox_cached_locked(&mirror)) { *route = mirror; return true; }
-        if (!found && !remote_link_missing_locked(&mirror) && debrid_link_covered_locked(&mirror)) {
+    while (best < 3 && next_mirror_locked(r, after, &mirror, false)) {
+        unsigned rank = direct_route_locked(&mirror) ? 1 + torbox_route_rank_locked(&mirror) : 0;
+        if (rank > best) {
             *route = mirror;
-            found = true;
+            best = rank;
         }
         copy_text(after, sizeof after, mirror.id);
     }
-    return found;
+    return best != 0;
+}
+
+bool remote_torbox_route_locked(const Release *r, Release *route) {
+    unsigned best = torbox_route_rank_locked(r);
+    if (best) *route = *r;
+    Release mirror;
+    char after[sizeof mirror.id] = "";
+    while (best < 2 && next_mirror_locked(r, after, &mirror, true)) {
+        unsigned rank = torbox_route_rank_locked(&mirror);
+        if (rank > best) {
+            *route = mirror;
+            best = rank;
+        }
+        copy_text(after, sizeof after, mirror.id);
+    }
+    return best != 0;
 }
 
 unsigned long remote_sources_generation_locked(void) { return remote.generation; }
@@ -251,12 +280,15 @@ void remote_torbox_changed_locked(void) {
     if (metadata.next_missing_expiry) invalidate_locked();
 }
 
-enum MirrorEvidenceType { MIRROR_URL, MIRROR_DECLARED, MIRROR_CHECKSUM, MIRROR_EXACT_FILE };
+enum MirrorEvidenceType {
+    MIRROR_URL, MIRROR_DECLARED, MIRROR_CHECKSUM, MIRROR_EXACT_FILE, MIRROR_NAMED_SIZE, MIRROR_VERSION_SIZE,
+};
 
 typedef struct {
     enum MirrorEvidenceType type;
     Release *release;
-    const char *key, *format, *compression;
+    const char *key, *format, *compression, *selector;
+    bool targeted;
     int64_t size;
     size_t index;
 } MirrorEvidence;
@@ -265,8 +297,11 @@ typedef struct {
     Release *release;
     size_t parent, alias;
     const char *checksum;
+    const RemoteFileMetadata *metadata;
+    char version[sizeof ((Release *)0)->remote_version];
+    const char *known_version;
     int64_t size;
-    bool shared;
+    bool exact, shared;
 } MirrorGroup;
 
 static int compare_evidence_keys(const MirrorEvidence *a, const MirrorEvidence *b) {
@@ -275,21 +310,17 @@ static int compare_evidence_keys(const MirrorEvidence *a, const MirrorEvidence *
     if (!order) order = strcmp(a->release->platform, b->release->platform);
     if (!order) order = strcmp(a->key, b->key);
     if (!order && a->type == MIRROR_URL) {
-        order = strcmp(a->format, b->format);
-        if (!order) order = strcmp(a->release->format, b->release->format);
-        if (!order) order = strcmp(a->release->compression, b->release->compression);
+        order = strcmp(a->selector, b->selector);
+        if (!order) order = strcmp(a->format, b->format);
+        if (!order) order = strcmp(a->compression, b->compression);
     }
-    if (!order && a->type != MIRROR_DECLARED)
+    if (!order && (a->type == MIRROR_CHECKSUM || a->type == MIRROR_EXACT_FILE))
         order = strcmp(a->release->remote_edition, b->release->remote_edition);
-    if (!order && a->type == MIRROR_URL)
-        order = strcmp(a->release->remote_version, b->release->remote_version);
-    if (!order && a->type == MIRROR_URL)
-        order = strcmp(a->release->remote_region, b->release->remote_region);
     if (!order && a->type >= MIRROR_CHECKSUM) {
         order = strcmp(a->format, b->format);
         if (!order) order = strcmp(a->compression, b->compression);
-        if (!order) order = strcmp(a->release->remote_version, b->release->remote_version);
-        if (!order) order = strcmp(a->release->remote_region, b->release->remote_region);
+        if (!order && a->type <= MIRROR_EXACT_FILE)
+            order = strcmp(a->release->remote_region, b->release->remote_region);
         if (!order && a->size != b->size) order = a->size < b->size ? -1 : 1;
     }
     return order;
@@ -304,7 +335,10 @@ static int route_rank(const Release *r) {
 static int compare_evidence(const void *left, const void *right) {
     const MirrorEvidence *a = left, *b = right;
     int order = compare_evidence_keys(a, b);
-    if (!order && a->type == MIRROR_URL) order = route_rank(b->release) - route_rank(a->release);
+    if (!order && a->type == MIRROR_URL) {
+        order = (int)a->targeted - (int)b->targeted;
+        if (!order) order = route_rank(b->release) - route_rank(a->release);
+    }
     return order ? order : strcmp(a->release->id, b->release->id);
 }
 
@@ -333,7 +367,8 @@ bool remote_mirror_file(const Release *selected, const Release *file) {
     pthread_mutex_lock(&orbit.mutex);
     const Release *live = release_find(selected->id);
     const Release *other = release_find(file->id);
-    if (other && strcmp(selected->id, file->id) && !mirror_enabled(selected, live, other)) {
+    bool same_route = live && other && mirror_route(live) == mirror_route(other);
+    if (other && strcmp(selected->id, file->id) && !same_route && !mirror_enabled(selected, live, other)) {
         pthread_mutex_unlock(&orbit.mutex);
         return false;
     }
@@ -346,7 +381,9 @@ bool remote_mirror_file(const Release *selected, const Release *file) {
         const MetadataRequest *request = &metadata.requests[i];
         const RemoteFileMetadata *known = &request->file;
         if (!strcmp(request->id, selected->id) && exact_file_metadata(known)) {
-            matches = known->size == file->size && !strcmp(known->filename, file->filename);
+            const MetadataRequest *alternate = other && !same_route ? cached_metadata_locked(other->id, time(NULL)) : NULL;
+            matches = known->size == file->size && (!strcmp(known->filename, file->filename) ||
+                (alternate && !strcmp(alternate->file.filename, file->filename)));
             break;
         }
     }
@@ -354,9 +391,32 @@ bool remote_mirror_file(const Release *selected, const Release *file) {
     return matches;
 }
 
+/* Use the same decimal units and tenths as Details for approximate sizes.
+ * Exact file lengths still have to agree byte for byte. */
+static int64_t mirror_size_bucket(int64_t size) {
+    if (size < 1000000) return size;
+    int64_t step = size < 1000000000 ? 100000 : 100000000;
+    return (size / step + (size % step >= step / 2)) * step;
+}
+
+static void mirror_version(const Release *r, const char *filename, char *version, size_t cap) {
+    if (!r->remote_version[0]) {
+        pspkg_version("", filename, version, cap);
+        return;
+    }
+    const char *raw = r->remote_version + strspn(r->remote_version, "vV ");
+    while (*raw == '0' && isdigit((unsigned char)raw[1])) raw++;
+    copy_text(version, cap, raw);
+    char *dot = strchr(version, '.');
+    if (dot && strlen(dot) == 4 && strspn(dot + 1, "0123456789") == 3 && dot[3] == '0')
+        dot[3] = 0;
+}
+
 static bool mirror_files_conflict(const MirrorGroup *a, const MirrorGroup *b) {
-    return (a->size && b->size && a->size != b->size) ||
-           (a->checksum && b->checksum && strcmp(a->checksum, b->checksum));
+    return (a->size && b->size && (a->exact && b->exact ? a->size != b->size :
+                mirror_size_bucket(a->size) != mirror_size_bucket(b->size))) ||
+           (a->checksum && b->checksum && strcmp(a->checksum, b->checksum)) ||
+           (*a->known_version && *b->known_version && strcmp(a->known_version, b->known_version));
 }
 
 static void join_mirror_evidence(MirrorGroup *groups, const MirrorEvidence *evidence,
@@ -374,8 +434,12 @@ static void join_mirror_evidence(MirrorGroup *groups, const MirrorEvidence *evid
             if (a != b) {
                 groups[b].parent = a;
                 groups[a].shared = true;
-                if (!groups[a].size) groups[a].size = groups[b].size;
+                if (!groups[a].size || (!groups[a].exact && groups[b].exact)) {
+                    groups[a].size = groups[b].size;
+                    groups[a].exact = groups[b].exact;
+                }
                 if (!groups[a].checksum) groups[a].checksum = groups[b].checksum;
+                if (!*groups[a].known_version) groups[a].known_version = groups[b].known_version;
             }
             break;
         }
@@ -390,7 +454,7 @@ static bool rebuild_mirrors_locked(void) {
             capacity += title_options[slot].count;
     if (!capacity) return false;
     MirrorGroup *groups = calloc(capacity, sizeof *groups);
-    MirrorEvidence *evidence = malloc((3 * capacity + METADATA_LIMIT) * sizeof *evidence);
+    MirrorEvidence *evidence = malloc((5 * capacity + METADATA_LIMIT) * sizeof *evidence);
     size_t count = installed;
     for (size_t i = 0; groups && i < installed; i++) groups[i].release = &orbit.remote_releases[i];
     for (size_t slot = 0; groups && slot < sizeof title_options / sizeof *title_options; slot++) {
@@ -403,25 +467,51 @@ static bool rebuild_mirrors_locked(void) {
     }
     if (groups && evidence) {
         size_t used = 0;
+        for (size_t i = 0; i < METADATA_LIMIT; i++) {
+            const MetadataRequest *request = &metadata.requests[i];
+            if (!request->mirror_size && !request->file.filename[0]) continue;
+            size_t index = 0;
+            while (index < count && strcmp(groups[index].release->id, request->id)) index++;
+            if (index < count) groups[index].metadata = &request->file;
+        }
         for (size_t i = 0; i < count; i++) {
-            Release *r = groups[i].release;
-            groups[i].parent = i;
-            if (r->sha256[0]) groups[i].checksum = r->sha256;
-            groups[i].size = r->size;
+            MirrorGroup *group = &groups[i];
+            Release *r = group->release;
+            const RemoteFileMetadata *file = group->metadata;
+            const char *filename = file && file->filename[0] ? file->filename : r->filename[0] ? r->filename :
+                r->remote_filename_synthetic ? "" : r->remote_filename;
+            group->parent = i;
+            group->checksum = r->sha256[0] ? r->sha256 : NULL;
+            group->exact = r->size > 0 || (file && file->exact && file->size > 0);
+            group->size = r->size > 0 ? r->size : file && file->size > 0 ? file->size : r->display_size;
+            mirror_version(r, filename, group->version, sizeof group->version);
+            group->known_version = group->version;
+            if (pspkg_source(r->remote_catalog_id)) continue;
+
+            const char *format = file && file->format[0] ? file->format : r->format;
+            const char *compression = file && file->filename[0] ? file->compression : r->compression;
             const char *url = provider_torbox_url(r);
-            /* Only installed routes participate in URL aliasing and exact-file discovery. */
-            if (i < installed && *url && !pspkg_source(r->remote_catalog_id)) {
+            if (*url) {
                 const char *selector = !strncmp(url, "https://archive.org/details/", 28) &&
                     !r->remote_filename_synthetic ? r->remote_filename : "";
                 evidence[used++] = (MirrorEvidence){.type = MIRROR_URL, .release = r, .key = url,
-                    .format = selector, .index = i};
+                    .format = format, .compression = compression, .selector = selector,
+                    .targeted = i >= installed, .index = i};
             }
             if (r->mirror_key[0])
                 evidence[used++] = (MirrorEvidence){.type = MIRROR_DECLARED, .release = r,
                     .key = r->mirror_key, .index = i};
-            if (i < installed && (r->sha256[0] || (!r->remote_page && r->size > 0 && r->filename[0])))
-                evidence[used++] = (MirrorEvidence){r->sha256[0] ? MIRROR_CHECKSUM : MIRROR_EXACT_FILE,
-                    r, r->sha256[0] ? r->sha256 : r->filename, r->format, r->compression, r->size, i};
+            if (group->checksum || (group->exact && *filename))
+                evidence[used++] = (MirrorEvidence){.type = group->checksum ? MIRROR_CHECKSUM : MIRROR_EXACT_FILE,
+                    .release = r, .key = group->checksum ? group->checksum : filename, .format = format,
+                    .compression = compression, .size = group->size, .index = i};
+            if (group->size <= 0 || !*format || !strcmp(format, "Unknown")) continue;
+            if (*filename)
+                evidence[used++] = (MirrorEvidence){.type = MIRROR_NAMED_SIZE, .release = r, .key = filename,
+                    .format = format, .compression = compression, .size = mirror_size_bucket(group->size), .index = i};
+            if (group->version[0])
+                evidence[used++] = (MirrorEvidence){.type = MIRROR_VERSION_SIZE, .release = r, .key = group->version,
+                    .format = format, .compression = compression, .size = mirror_size_bucket(group->size), .index = i};
         }
         /* A scan capped mid-package can see fewer declared mirrors than
          * Details. Apply the full declaration to the installed copy too. */
@@ -440,20 +530,6 @@ static bool rebuild_mirrors_locked(void) {
                 }
             }
         }
-        for (size_t i = 0; i < METADATA_LIMIT; i++) {
-            const MetadataRequest *request = &metadata.requests[i];
-            const RemoteFileMetadata *file = &request->file;
-            if (!request->mirror_size) continue;
-            size_t index = 0;
-            while (index < count && strcmp(groups[index].release->id, request->id)) index++;
-            if (index == count) continue;
-            Release *r = groups[index].release;
-            if (pspkg_source(r->remote_catalog_id)) continue;
-            if (!groups[index].size || file->exact) groups[index].size = request->mirror_size;
-            if (index < installed && exact_file_metadata(file))
-                evidence[used++] = (MirrorEvidence){MIRROR_EXACT_FILE, r, file->filename,
-                    file->format, file->compression, file->size, index};
-        }
         qsort(evidence, used, sizeof *evidence, compare_evidence);
         for (size_t first = 0, end; first < used; first = end) {
             end = first + 1;
@@ -465,17 +541,17 @@ static bool rebuild_mirrors_locked(void) {
     for (size_t i = 0; i < count; i++) {
         Release *r = groups ? groups[i].release : &orbit.remote_releases[i];
         const char *group = "";
-        size_t alias = 0;
+        const char *alias = "";
         if (groups && evidence) {
             size_t root = mirror_root(groups, i);
             if (groups[root].shared) {
                 group = groups[root].release->id;
-                alias = groups[i].alias;
+                if (groups[i].alias) alias = groups[groups[i].alias - 1].release->id;
             }
         }
-        changed |= strcmp(r->remote_group, group) || r->remote_alias != alias;
+        changed |= strcmp(r->remote_group, group) || strcmp(r->remote_alias, alias);
         copy_text(r->remote_group, sizeof r->remote_group, group);
-        r->remote_alias = alias;
+        copy_text(r->remote_alias, sizeof r->remote_alias, alias);
     }
     free(evidence);
     free(groups);
@@ -738,14 +814,14 @@ cJSON *remote_title_options_locked(const Release *selected) {
     TitleOptions *slot = load_title_options_locked(title.title_id);
     for (size_t i = 0; i < slot->count; i++) {
         const Release *row = &slot->rows[i];
-        if (release_find(row->id) != row || row->remote_alias) continue;
+        if (release_find(row->id) != row || row->remote_alias[0]) continue;
         const Release *members[128] = {row};
         size_t count = 1;
         const char *group = remote_mirror_group_locked(row);
         bool represented = false;
         for (size_t j = 0; *group && j < orbit.remote_release_count; j++) {
             const Release *member = &orbit.remote_releases[j];
-            if (!member->remote_alias && !strcmp(group, remote_mirror_group_locked(member)) &&
+            if (!member->remote_alias[0] && !strcmp(group, remote_mirror_group_locked(member)) &&
                 remote_link_listed_locked(member)) {
                 represented = true;
                 break;
@@ -755,7 +831,7 @@ cJSON *remote_title_options_locked(const Release *selected) {
         for (size_t j = 0; !represented && *group && j < slot->count && count < 128; j++) {
             const Release *member = &slot->rows[j];
             if (member == row || strcmp(group, remote_mirror_group_locked(member)) ||
-                release_find(member->id) != member || member->remote_alias) continue;
+                release_find(member->id) != member || member->remote_alias[0]) continue;
             bool member_missing = remote_link_missing_locked(member);
             if (member_missing != missing ? !member_missing : strcmp(member->id, row->id) < 0)
                 represented = true;
@@ -1325,12 +1401,21 @@ static MetadataRequest *cached_metadata_locked(const char *id, time_t now) {
     return NULL;
 }
 
-static bool metadata_torbox_cached_locked(const Release *r) {
+static const MetadataRequest *torbox_metadata_locked(const Release *r) {
+    const MetadataRequest *request = cached_metadata_locked(mirror_route(r)->id, time(NULL));
+    if (!request || !request->torbox_cached) return NULL;
     unsigned revision = debrid_cache_revision_locked(r);
-    if (!revision) return false;
-    const Release *live = release_find(r->id);
-    const MetadataRequest *request = cached_metadata_locked(live ? mirror_route(live)->id : r->id, time(NULL));
-    return request && request->torbox_revision == revision && request->torbox_cached;
+    return revision && request->torbox_revision == revision ? request : NULL;
+}
+
+int64_t remote_torbox_size_locked(const Release *r) {
+    const MetadataRequest *request = torbox_metadata_locked(r);
+    return request ? request->torbox_size : 0;
+}
+
+static bool provider_unsupported_locked(const Release *r) {
+    const MetadataRequest *request = cached_metadata_locked(mirror_route(r)->id, time(NULL));
+    return request && request->file.status == REMOTE_METADATA_UNSUPPORTED;
 }
 
 static bool metadata_missing(const MetadataRequest *request, time_t now) {
@@ -1340,7 +1425,7 @@ static bool metadata_missing(const MetadataRequest *request, time_t now) {
 
 static const MetadataRequest *archive_metadata_locked(const Release *r) {
     if (!remote_archive_url(provider_torbox_url(r))) return NULL;
-    const Release *live = r->remote_alias ? release_find(r->id) : NULL;
+    const Release *live = r->remote_alias[0] ? release_find(r->id) : NULL;
     if (live) r = mirror_route(live);
     for (size_t i = 0; i < METADATA_LIMIT; i++) {
         const MetadataRequest *request = &metadata.requests[i];
@@ -1361,7 +1446,7 @@ static bool archive_blocked(const MetadataRequest *request, time_t now) {
 
 static bool provider_missing_locked(const Release *release) {
     if (!metadata.next_missing_expiry) return false;
-    if (release->remote_alias) {
+    if (release->remote_alias[0]) {
         const Release *live = release_find(release->id);
         if (live) release = mirror_route(live);
     }
@@ -1381,7 +1466,8 @@ bool remote_link_listed_locked(const Release *r) {
     /* Keep a covered missing provider discoverable so Details can check the
        cache, including when the account was connected after the provider check. */
     return !archive_blocked(archive_metadata_locked(r), time(NULL)) &&
-        (!provider_missing_locked(r) || debrid_link_covered_locked(r));
+        (!provider_missing_locked(r) || (debrid_link_covered_locked(r) &&
+                                         debrid_size_allowed(remote_torbox_size_locked(r))));
 }
 
 static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
@@ -1407,7 +1493,7 @@ static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
     if (same) {
         entry->file = previous;
         entry->mirror_size = previous_size;
-    } else if (previous_size && rebuild_mirrors_locked()) invalidate_locked();
+    } else if ((previous_size || previous.filename[0]) && rebuild_mirrors_locked()) invalidate_locked();
     pthread_cond_signal(&metadata.changed);
     return entry;
 }
@@ -1415,10 +1501,10 @@ static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
 static void metadata_done_locked(MetadataRequest *request, const RemoteFileMetadata *file) {
     bool size_changed = file->status == REMOTE_METADATA_FOUND && file->size > 0 &&
                         request->mirror_size != file->size;
-    const Release *r = size_changed ? release_find(request->id) : NULL;
     bool check_group = !strncmp(request->id, "rs-", 3) &&
-                       ((r && (r->mirror_key[0] || r->remote_group[0])) ||
-                        exact_file_metadata(&request->file) || exact_file_metadata(file));
+        (size_changed || request->file.exact != file->exact || request->file.size != file->size ||
+         strcmp(request->file.filename, file->filename) || strcmp(request->file.format, file->format) ||
+         strcmp(request->file.compression, file->compression));
     if (size_changed) request->mirror_size = file->size;
     bool access_changed = request->file.archive_requires_login != file->archive_requires_login ||
         (request->file.status == REMOTE_METADATA_ARCHIVE_LOGIN) != (file->status == REMOTE_METADATA_ARCHIVE_LOGIN);
@@ -1506,7 +1592,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
         if (!row) continue;
         cJSON_AddStringToObject(row, "id", id);
         cJSON *hosts = cJSON_AddArrayToObject(row, "torboxHosts");
-        unsigned mirrors = 0, available = 0;
+        unsigned mirrors = 0, selectable = 0, available = 0, best_rank = 0;
         bool unsupported = false, archive_login = false;
         bool group_pending = false, torbox_pending = false, torbox_cached = false, conflicting_size = false;
         do {
@@ -1524,7 +1610,7 @@ cJSON *remote_metadata_json_locked(const char *ids) {
                                        current->status != REMOTE_METADATA_UNSUPPORTED);
             unsigned revision = current && current->status != REMOTE_METADATA_UNSUPPORTED
                 ? debrid_cache_revision_locked(candidate) : 0;
-            bool cached = false;
+            bool cached = false, undersized = false;
             if (revision) {
                 if (request->torbox_revision != revision) {
                     request->torbox_revision = revision;
@@ -1534,12 +1620,15 @@ cJSON *remote_metadata_json_locked(const char *ids) {
                     pthread_cond_signal(&metadata.changed);
                 }
                 torbox_pending |= request->torbox_state != META_DONE;
-                cached = request->torbox_cached;
+                undersized = !debrid_size_allowed(request->torbox_size);
+                cached = request->torbox_cached && !undersized;
                 torbox_cached |= cached;
             }
             if (!direct && !cached) continue;
+            selectable++;
             char host[254];
-            if (hosts && !(request && request->file.archive_requires_login) && remote_link_host(candidate, host, sizeof host)) {
+            if (hosts && !undersized && !(request && request->file.archive_requires_login) &&
+                remote_link_host(candidate, host, sizeof host)) {
                 const cJSON *item;
                 bool duplicate = false;
                 cJSON_ArrayForEach(item, hosts) duplicate |= !strcmp(item->valuestring, host);
@@ -1547,25 +1636,28 @@ cJSON *remote_metadata_json_locked(const char *ids) {
             }
             if (!direct) continue;
             available++;
-            if (!route.id[0]) {
+            unsigned rank = 1 + torbox_route_rank_locked(candidate);
+            if (current && file.size && current->size && file.confidence == current->confidence &&
+                (file.exact && current->exact ? file.size != current->size :
+                    mirror_size_bucket(file.size) != mirror_size_bucket(current->size))) conflicting_size = true;
+            if (rank > best_rank) {
+                best_rank = rank;
                 route = *candidate;
-                if (current) file = *current;
-            } else if (current && file.size && current->size && file.size != current->size &&
-                       file.confidence == current->confidence) conflicting_size = true;
+                file = current ? *current : (RemoteFileMetadata){0};
+            }
         } while (next_mirror_locked(release, after, &alternate, true) &&
                  (copy_text(after, sizeof after, alternate.id), candidate = &alternate, true));
         pending |= group_pending || torbox_pending;
         cJSON_DeleteItemFromObjectCaseSensitive(row, "status");
         cJSON_AddStringToObject(row, "status", archive_login && !available ? "archive-login-required" : group_pending ? "fetching" :
             !available ? (unsupported ? "unsupported-format" : "missing") : remote_metadata_status(file.status));
-        if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", available);
+        if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", selectable);
         if (torbox_cached) cJSON_AddTrueToObject(row, "torboxCached");
         if (torbox_cached) {
             Release torbox_route;
             if (remote_torbox_route_locked(release, &torbox_route)) {
-                const MetadataRequest *selected = cached_metadata_locked(torbox_route.id, now);
-                if (selected && selected->torbox_size)
-                    cJSON_AddNumberToObject(row, "torboxSizeBytes", (double)selected->torbox_size);
+                int64_t size = remote_torbox_size_locked(&torbox_route);
+                if (size) cJSON_AddNumberToObject(row, "torboxSizeBytes", (double)size);
             }
         }
         if (torbox_pending) cJSON_AddTrueToObject(row, "torboxPending");
@@ -1624,6 +1716,7 @@ static void *metadata_worker(void *unused) {
                 cache->torbox_state = META_DONE;
                 cache->torbox_cached = cached;
                 cache->torbox_size = size;
+                if (!debrid_size_allowed(size) && metadata_missing(cache, time(NULL))) invalidate_locked();
             }
             continue;
         }

@@ -37,7 +37,7 @@ typedef struct {
     char remote_provider_page[256]; /* Public provider selected for a PSPKG job. */
     char mirror_key[65]; /* Shared identity of verified community mirrors, when available. */
     char remote_group[24]; /* ID of the reconciled mirror group, when shared. */
-    size_t remote_alias; /* One-based index of the installed route for a repeated URL. */
+    char remote_alias[24]; /* ID of the canonical route for a repeated URL. */
     bool remote_page; /* Stable catalogue identity is the selected provider page. */
     char compression[8]; /* "zip", "7z" or "rar"; empty for a plain file. */
     char archive_password[129]; /* Public source password, optional. */

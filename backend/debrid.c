@@ -22,6 +22,7 @@
 #define HOST_COUNT 5
 #define CACHE_PATH "/webdl/checkcached?"
 #define WEB_LIST_PATH "/webdl/mylist?limit=1000"
+#define TORBOX_SMALL_FILE "TorBox reported a file under 0.5 GB."
 /* How long TorBox gets to list a download whose create answer was lost before Orbit
  * decides the request never arrived and sends it again. */
 #define SUBMIT_GRACE 120
@@ -598,10 +599,19 @@ static const cJSON *single_web_file(const cJSON *item) {
         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(file, "zipped")) ? file : NULL;
 }
 
+bool debrid_size_allowed(int64_t size) {
+#ifdef ORBIT_TEST
+    /* Routing fixtures transfer compact files. Policy tests use the production limit. */
+    if (getenv("ORBIT_TEST_ALLOW_SMALL_TORBOX")) return true;
+#endif
+    return size <= 0 || size >= INT64_C(500000000);
+}
+
 static int64_t web_file_size(const Release *r, const cJSON *file, const char *name) {
     int64_t size;
-    if (!identifier(file, "size", &size) || !size || (r->size > 0 && r->size != size))
-        return 0;
+    if (!identifier(file, "size", &size) || !size) return 0;
+    if (!debrid_size_allowed(size)) return size;
+    if (r->size > 0 && r->size != size) return 0;
     if (r->filename[0] && !release_filename_matches(r, name)) return 0;
     Release candidate = *r;
     return remote_provider_file_format(&candidate, name, NULL) ? 0 : size;
@@ -693,6 +703,9 @@ bool debrid_default_locked(const Release *r) {
 int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
     if (!debrid.connected || !debrid.key[0]) { copy_text(err, cap, "Connect TorBox in App settings first."); return 409; }
     if (debrid.busy || time(NULL) >= debrid.checked + HOST_TTL) { copy_text(err, cap, "Refresh TorBox in App settings before starting this download."); return 409; }
+    if (!debrid_size_allowed(remote_torbox_size_locked(r))) {
+        copy_text(err, cap, TORBOX_SMALL_FILE); return 409;
+    }
     if (covered_limit(r) < 0) {
         copy_text(err, cap, "TorBox is unavailable for this option. Choose the original source or check App settings."); return 409;
     }
@@ -709,7 +722,7 @@ bool debrid_resume_after_missing_locked(Job *job, const Release *route) {
     if (job->direct_missing || job->debrid_fallback == DEBRID_MISSING ||
         job->debrid_fallback == DEBRID_FAILED || orbit.state_failed ||
         !source_enabled_locked(route) || debrid.busy ||
-        !debrid_link_covered_locked(route) ||
+        !debrid_link_covered_locked(route) || !debrid_size_allowed(remote_torbox_size_locked(route)) ||
         job_delete_partial_locked(job, job->error, sizeof job->error) ||
         debrid_prepare_locked(route, job, job->error, sizeof job->error) != 200)
         return false;
@@ -753,11 +766,13 @@ DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, t
     pthread_mutex_lock(&orbit.mutex);
     bool account = debrid_job_account_locked(job);
     bool checking = debrid.busy && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
+    bool allowed_size = debrid_size_allowed(remote_torbox_size_locked(route));
     bool covered = source_enabled_locked(route) && debrid_link_covered_locked(route);
     copy_text(key, sizeof key, account ? debrid.key : "");
     pthread_mutex_unlock(&orbit.mutex);
     if (!account && checking) { *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end; }
     if (!account) { copy_text(err, cap, "Reconnect the original TorBox account before resuming this download."); goto end; }
+    if (!allowed_size) { copy_text(err, cap, TORBOX_SMALL_FILE); goto end; }
     if (!covered) {
         if (checking) { *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end; }
         copy_text(err, cap, "TorBox is unavailable for this option. Choose the original source or check App settings.");
@@ -862,6 +877,11 @@ DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, t
     Release selected = *resolved;
     bool match = identifier(file, "id", &file_id) && identifier(file, "size", &size) && size > 0 &&
         (job->debrid_file < 0 || job->debrid_file == file_id);
+    if (!debrid_size_allowed(size)) {
+        cJSON_Delete(list);
+        copy_text(err, cap, TORBOX_SMALL_FILE);
+        goto end;
+    }
     if (match && using_mirror) {
         Release file_from_mirror = *route;
         file_from_mirror.size = size;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import { type Release } from "./types";
+import { torboxSizeAllowed, type Release } from "./types";
 import { t } from "./i18n";
 import { rich } from "./Rich";
 import { releaseHasTorboxHost } from "./browse";
@@ -26,6 +26,7 @@ export function torboxAvailable(status: DebridStatus | null, release: Release) {
     !!status?.connected &&
     !!status.available &&
     !status.busy &&
+    torboxSizeAllowed(release.torboxSizeBytes) &&
     !!availableHost(status, release)
   );
 }

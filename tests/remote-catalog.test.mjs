@@ -89,4 +89,10 @@ test("TorBox coverage wins the default and its size follows the selected deliver
   assert.equal(preferredRelease([curated, torbox], { ...filters, source: ["archive"] }, last, hosts), curated);
   assert.equal(releaseSize(torbox, true), "118.4 GB");
   assert.equal(releaseSize(torbox), "Unknown size");
+  const cached = { ...torbox, id: "cached", torboxCached: true };
+  assert.equal(preferredRelease([torbox, cached], undefined, last, hosts), cached);
+  const undersized = { ...cached, torboxSizeBytes: 9, sizeEstimateBytes: 109_700_000_000 };
+  assert.equal(preferredRelease([undersized, torbox], undefined, last, hosts), torbox);
+  assert.equal(releaseSize(undersized, true), "≈109.7 GB");
+  assert.equal(releaseSize({ ...cached, torboxSizeBytes: 500_000_000 }, true), "500.0 MB");
 });

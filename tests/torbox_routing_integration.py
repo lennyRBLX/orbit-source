@@ -244,11 +244,12 @@ class TorBoxRouting(unittest.TestCase):
     def run_download(self, hosters, *, cached=False, truncate=False, original_fails=False, explicit=None,
                      browser=False, processing=None, rejection=None, key="valid", interrupt=None,
                      transient=False, mirrors=False, pspkg=None, check_cache=False, archive_availability=False,
-                     account_only=False):
+                     account_only=False, enforce_minimum=False):
         with tempfile.TemporaryDirectory() as temp, ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as fixture:
             fixture.base = f"http://127.0.0.1:{fixture.server_port}"
             fixture.calls = []
             fixture.check_cache = check_cache
+            fixture.enforce_minimum = enforce_minimum
             fixture.cache_queries = []
             cache_url = "/pspkg-provider/buzzheavier.com/file.pkg" if pspkg else "/provider"
             fixture.cache_hash = (hashlib.md5((fixture.base + cache_url).encode()).hexdigest()
@@ -281,6 +282,9 @@ class TorBoxRouting(unittest.TestCase):
                 original_url = fixture.base + "/original"
                 env = dict(os.environ, ORBIT_TEST_URL=original_url, ORBIT_TEST_SIZE=str(len(FILE)),
                            ORBIT_TEST_SOURCE="archive", ORBIT_TEST_TORBOX_URL=fixture.base)
+                env.pop("ORBIT_TEST_ALLOW_SMALL_TORBOX", None)
+                if not enforce_minimum:
+                    env["ORBIT_TEST_ALLOW_SMALL_TORBOX"] = "1"
                 if fixture.browser:
                     env["ORBIT_TEST_CATALOGUE_URL"] = fixture.base + "/catalogue.json"
                 if archive_availability:
@@ -577,8 +581,9 @@ class TorBoxRouting(unittest.TestCase):
                 return result["files"][0] if not result["pending"] else None
 
             row = wait_for(metadata_done)
-            self.assertEqual(bool(row.get("torboxCached")), cached)
-            self.assertEqual(row.get("torboxSizeBytes"), len(FILE) if cached else None)
+            accepted_cache = cached and not fixture.enforce_minimum
+            self.assertEqual(bool(row.get("torboxCached")), accepted_cache)
+            self.assertEqual(row.get("torboxSizeBytes"), len(FILE) if accepted_cache else None)
             self.assertNotIn("create", fixture.calls)
             self.assertNotIn("/torbox-file", fixture.calls)
             if any(h["status"] for h in fixture.hosters):
@@ -590,6 +595,12 @@ class TorBoxRouting(unittest.TestCase):
             if fixture.original_fails:
                 self.assertEqual(row["status"], "missing")
         download = {"releaseId": release["id"], "storageId": "desktop"}
+        if fixture.enforce_minimum and fixture.check_cache and fixture.original_fails:
+            with self.assertRaises(HTTPError) as failure:
+                call("/downloads", dict(download, delivery="torbox"))
+            self.assertEqual(failure.exception.code, 409)
+            self.assertEqual(call("/downloads"), [])
+            return
         if explicit == "browser":
             call("/browser", dict(download, action="start", returnTarget="browser"))
             job_id = wait_for(lambda: call("/browser")["jobId"])
@@ -638,6 +649,24 @@ class TorBoxRouting(unittest.TestCase):
             with self.subTest(up=up, cached=cached, missing=missing):
                 self.run_download([{"domains": ["127.0.0.1"], "status": up}], browser=True,
                                   cached=cached, original_fails=missing, check_cache=True)
+
+    def test_small_torbox_file_uses_direct_even_when_torbox_is_requested(self):
+        hosters = [{"domains": ["127.0.0.1"], "status": True}]
+        for check_cache in (True, False):
+            with self.subTest(check_cache=check_cache):
+                calls = self.run_download(hosters, browser=True, cached=True, check_cache=check_cache,
+                                          explicit="torbox", enforce_minimum=True)
+                self.assertNotIn("/torbox-file", calls)
+                self.assertNotIn("create", calls)
+                self.assertEqual("list" in calls, not check_cache)
+                self.assertIn("/original", calls)
+
+    def test_small_torbox_cache_cannot_replace_a_missing_provider(self):
+        calls = self.run_download([{"domains": ["127.0.0.1"], "status": True}], browser=True, cached=True,
+                                  original_fails=True, check_cache=True, enforce_minimum=True)
+        self.assertNotIn("list", calls)
+        self.assertNotIn("create", calls)
+        self.assertNotIn("/torbox-file", calls)
 
     def test_ready_account_item_supplies_size_after_cache_miss(self):
         calls = self.run_download([{"domains": ["127.0.0.1"], "status": True}], browser=True,

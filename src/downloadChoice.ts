@@ -1,6 +1,6 @@
 // Which download option a game page starts on: one matching the Browse filters the game was
 // found with, then prefer TorBox, the last source and format, and direct downloads in that order.
-import type { Release } from "./types";
+import { torboxSizeAllowed, type Release } from "./types";
 import { filtersOptions, releaseFormat, releaseHasTorboxHost, releaseMatches, type BrowseFilters } from "./browse";
 
 const KEY = "orbit.download-choice.v1";
@@ -24,12 +24,16 @@ export function rememberChoice(r: Release) {
 // torbox: the sources TorBox can download now.
 export function preferredRelease(releases: Release[], filters?: BrowseFilters, last = lastChoice(), torbox?: ReadonlySet<string>): Release {
   const filtered = !!filters && filtersOptions(filters);
-  const rank = (r: Release) => [
-    filtered && releaseMatches(r, filters!, torbox) ? 0 : 1,
-    torbox && (!r.providerMissing || r.torboxCached) && releaseHasTorboxHost(r, torbox) ? 0 : 1,
-    last && r.sourceId === last.source ? (releaseFormat(r) === last.format ? 0 : 1) : 2,
-    r.browserAvailable ? 1 : 0,
-  ];
+  const rank = (r: Release) => {
+    const covered = torbox && torboxSizeAllowed(r.torboxSizeBytes) &&
+      (!r.providerMissing || r.torboxCached) && releaseHasTorboxHost(r, torbox);
+    return [
+      filtered && releaseMatches(r, filters!, torbox) ? 0 : 1,
+      covered ? (r.torboxCached ? 0 : 1) : 2,
+      last && r.sourceId === last.source ? (releaseFormat(r) === last.format ? 0 : 1) : 2,
+      r.browserAvailable ? 1 : 0,
+    ];
+  };
   return releases
     .map((r, i) => ({ r, i, k: rank(r) }))
     .sort((a, b) => a.k[0] - b.k[0] || a.k[1] - b.k[1] || a.k[2] - b.k[2] ||

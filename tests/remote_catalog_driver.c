@@ -32,6 +32,7 @@ bool link_release_valid(const Release *r) { (void)r; return false; }
 bool link_url_allowed(const char *url) { (void)url; return false; }
 void link_host(const char *url, char *out, size_t cap) { (void)url; if (cap) out[0] = 0; }
 bool job_can_replace_link(const Job *j) { (void)j; return false; }
+bool debrid_size_allowed(int64_t size) { return size <= 0 || size >= INT64_C(500000000); }
 bool debrid_link_covered_locked(const Release *r) { (void)r; return false; }
 unsigned debrid_cache_revision_locked(const Release *r) { (void)r; return 0; }
 bool debrid_web_metadata(const Release *r, unsigned revision, bool check_account_list, int64_t *size) {
@@ -226,7 +227,7 @@ int main(int argc, char **argv) {
                 cJSON_ArrayForEach(id, ids) {
                     Release *r = cJSON_IsString(id) ? release_find(id->valuestring) : NULL;
                     if (r && !strcmp(r->source, "remote")) {
-                        r->remote_alias = 0;
+                        r->remote_alias[0] = 0;
                         copy_text(r->remote_group, sizeof r->remote_group, "fixture");
                         memset(r->mirror_key, 'a', sizeof r->mirror_key - 1);
                     }

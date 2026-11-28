@@ -1344,7 +1344,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def test_exact_provider_files_become_mirrors_across_catalogues(self):
+    def test_filename_and_version_size_estimates_form_mirrors_across_catalogues(self):
         server = FixtureServer()
         base = server.url.removesuffix("/catalogue.json")
         game = {"title": "File identity test", "titleId": "PPSA12345"}
@@ -1356,10 +1356,16 @@ class RemoteCatalogueTests(unittest.TestCase):
             )
             return {"name": label, "url": base + path, **fields}
 
-        server.feed = {"packages": [dict(game, downloadLinks=[option("alpha"), option("estimate", size="")])]}
+        server.feed = {"packages": [dict(game, downloadLinks=[
+            option("alpha", version="02.120"),
+            option("same-name-estimate", size=""),
+        ])]}
         server.feeds["/second.json"] = {"packages": [dict(game, downloadLinks=[
-            option("beta"), option("different-file", filename="other.pkg"), option("different-version", version="2.0"),
-            option("different-size", size='data-size-bytes="930000001"'),
+            option("beta", version="2.12"),
+            option("same-version-estimate", filename="renamed.pkg", size="", version="v2.12"),
+            option("different-file", filename="other.pkg"),
+            option("different-version", version="2.0"),
+            option("different-size", size='data-size-bytes="930000001"', version="2.12"),
         ])]}
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1368,7 +1374,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertEqual(service.command("start"), 0)
                 service.idle()
                 before = [row for row in service.command("view")["remote"] if row["titleId"] == game["titleId"]]
-                self.assertEqual(len(before), 6)
+                self.assertEqual(len(before), 7)
                 ids = ",".join(row["id"] for row in before)
                 deadline = time.monotonic() + 8
                 while True:
@@ -1379,12 +1385,12 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertFalse(result["pending"])
                 after = [row for row in service.command("view")["remote"] if row["titleId"] == game["titleId"]]
                 mirror, = [row for row in after if row.get("mirrorCount")]
-                self.assertEqual(mirror["mirrorCount"], 2)
-                self.assertIn(mirror["provider"], {"alpha", "beta"})
+                self.assertEqual(mirror["mirrorCount"], 4)
                 self.assertCountEqual([row["provider"] for row in after if row != mirror],
-                                      ["estimate", "different-file", "different-version", "different-size"])
+                                      ["different-file", "different-version", "different-size"])
                 metadata = service.command("metadata", ids=mirror["id"])
-                self.assertCountEqual([row["label"] for row in metadata["options"]], ["alpha", "beta"])
+                self.assertCountEqual([row["label"] for row in metadata["options"]],
+                                      ["alpha", "beta", "same-name-estimate", "same-version-estimate"])
                 self.assertCountEqual([path for path in server.paths if path.startswith("/metadata/")], server.downloads)
         finally:
             server.shutdown()

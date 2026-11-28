@@ -43,6 +43,8 @@ const char *remote_mirror_group_locked(const Release *release);
 bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror);
 bool remote_mirror_locked(const Release *release, const char *id, Release *mirror, bool torbox);
 bool remote_torbox_route_locked(const Release *release, Release *route);
+bool remote_direct_route_locked(const Release *release, Release *route);
+int64_t remote_torbox_size_locked(const Release *release);
 bool remote_link_listed_locked(const Release *release);
 bool remote_link_archive_requires_login_locked(const Release *release);
 void remote_torbox_changed_locked(void);

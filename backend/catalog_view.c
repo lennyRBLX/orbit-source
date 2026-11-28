@@ -194,7 +194,7 @@ static bool append_remote_locked(cJSON *out) {
     size_t mirror_count = 0;
     for (i = 0; i < orbit.remote_release_count; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (!r->remote_alias && *remote_mirror_group_locked(r) && source_enabled_locked(r))
+        if (!r->remote_alias[0] && *remote_mirror_group_locked(r) && source_enabled_locked(r))
             mirrors[mirror_count++] = r;
     }
     qsort(mirrors, mirror_count, sizeof *mirrors, compare_mirrors);
@@ -208,7 +208,7 @@ static bool append_remote_locked(cJSON *out) {
     bool ok = true;
     for (i = 0; i < orbit.remote_release_count && ok; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (r->remote_alias || !source_enabled_locked(r)) continue;
+        if (r->remote_alias[0] || !source_enabled_locked(r)) continue;
         bool pspkg = !strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) || !strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE);
         size_t begin = 0, end = 0;
         const char *group = remote_mirror_group_locked(r);

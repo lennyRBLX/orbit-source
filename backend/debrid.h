@@ -8,7 +8,9 @@ cJSON *debrid_status(void);
 int debrid_action(const cJSON *input, char *error, size_t cap);
 /* Called under orbit.mutex; does not perform network requests. */
 int debrid_prepare_locked(const Release *release, Job *job, char *error, size_t cap);
-/* Suggested route only. Reported host limits never prevent an explicit TorBox request. */
+/* A zero size means TorBox has yet to report a file length. */
+bool debrid_size_allowed(int64_t size);
+/* Reported host limits are advisory. */
 bool debrid_default_locked(const Release *release);
 bool debrid_link_covered_locked(const Release *release);
 unsigned debrid_cache_revision_locked(const Release *release);

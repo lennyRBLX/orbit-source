@@ -283,8 +283,8 @@ export function Details({
     listings.find((listing) => listing.titleIdMatch)?.id || listings[0]?.id;
   const pspkgLinks = pspkgHere?.pspkgReleaseId === listingId ? pspkgHere?.pspkgLinks || [] : [];
   const canTorbox = torboxAvailable(debrid.status, release) && (!release.providerMissing || !!release.torboxCached);
-  const delivery = release.providerMissing && canTorbox ? "torbox" : deliveryChoice ?? (canTorbox ? "torbox" : undefined);
-  const torbox = !isPspkg && canTorbox && delivery !== "direct";
+  const delivery = canTorbox && (release.providerMissing || deliveryChoice !== "direct") ? "torbox" : "direct";
+  const torbox = !isPspkg && delivery === "torbox";
   const displaySize = (option: Release) => releaseSize(option,
     option.id === release.id ? torbox : torboxAvailable(debrid.status, option));
   const transferRelease = torbox && release.torboxSizeBytes
@@ -333,9 +333,9 @@ export function Details({
   // Download doesn't fit on this drive: it opens Not enough space instead.
   const short = !!drive && !enough;
   useEffect(() => {
-    if (releases.length && release.id !== releaseId && options.some((r) => r.id === releaseId))
+    if (releases.length && release.id !== releaseId)
       setReleaseId(release.id);
-  }, [releases.length, release.id, releaseId, options]);
+  }, [releases.length, release.id, releaseId]);
   useEffect(() => {
     setError("");
     setDownloadAgain(false);

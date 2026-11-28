@@ -773,7 +773,7 @@ cJSON *remote_catalog_diagnostics_locked(const cJSON *entry, const char *source_
             result == 3 ? "wrong-platform-or-section" : result ? "invalid-url-or-fields" : "";
         const Release *installed = result ? NULL : release_find(mapped.id);
         bool enabled = installed && remote_source_enabled_locked(installed);
-        bool visible = enabled && !installed->remote_alias && !remote_link_missing_locked(installed);
+        bool visible = enabled && !installed->remote_alias[0] && !remote_link_missing_locked(installed);
         if (visible && *remote_mirror_group_locked(installed)) {
             Release first;
             if (remote_next_mirror_locked(installed, "", &first) && strcmp(first.id, installed->id) < 0)

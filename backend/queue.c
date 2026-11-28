@@ -376,8 +376,17 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
             return 409;
         }
     }
-    delivery_job.browser_pending = !torbox && !pin && job_needs_browser(r);
-    if (!torbox && !delivery_job.browser_pending && !provider_supported(r) &&
+    Release direct_route;
+    const Release *direct = r;
+    if (!torbox && !pin && !strcmp(r->source, "remote") &&
+        remote_direct_route_locked(r, &direct_route) && strcmp(r->id, direct_route.id) &&
+        remote_mirror_locked(r, direct_route.id, &direct_route, false)) {
+        direct = &direct_route;
+        copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, direct->id);
+        copy_text(delivery_job.mirror_first, sizeof delivery_job.mirror_first, direct->id);
+    }
+    delivery_job.browser_pending = !torbox && !pin && job_needs_browser(direct);
+    if (!torbox && !delivery_job.browser_pending && !provider_supported(direct) &&
         !(dry_run && provider_browser_supported(r))) {
         copy_text(err, cap, provider_browser_supported(r)
             ? (!strcmp(r->source, "akirabox") || !strcmp(r->source, "vikingfile")

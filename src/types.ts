@@ -124,8 +124,10 @@ export const formatVersion = (version?: string | null) =>
   (version || "").trim().replace(/^(?:v+\s*)?(?=\d)/i, "v");
 export const releaseVersion = (release: Release) =>
   formatVersion(release.version) || formatVersion(release.resolvedVersion);
+export const torboxSizeAllowed = (size?: number) => !size || size >= 500_000_000;
 export function releaseSize(release: Release, useTorbox = false) {
-  if (useTorbox && release.torboxSizeBytes) return bytes(release.torboxSizeBytes);
+  if (useTorbox && release.torboxSizeBytes && torboxSizeAllowed(release.torboxSizeBytes))
+    return bytes(release.torboxSizeBytes);
   if (release.sizeBytes || release.sourceId !== "remote") return bytes(release.sizeBytes);
   return release.sizeEstimateBytes
     ? `${release.sizeEstimateExact ? "" : "≈"}${bytes(release.sizeEstimateBytes)}`
