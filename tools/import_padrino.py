@@ -19,6 +19,7 @@ TITLE_ID = re.compile(r'(CUSA|PPSA)[0-9]{5}\Z')
 UNSUPPORTED_COMPRESSION = re.compile(r'(?<![a-z0-9])(?:lz4|zstd|zst|zstandard)(?![a-z0-9])', re.I)
 FILE = re.compile(r'\.(?:pkg|fpkg|exfat|ffpfsc|zip|7z|rar)\Z', re.I)
 VOLUME = re.compile(r'(?:\.part[0-9]+\.rar|\.r[0-9]{2}|\.z[0-9]{2}|\.[0-9]{3})\Z', re.I)
+PART_LABEL = re.compile(r'(?<![a-z0-9])(?:part|volume)[ ._-]*[0-9]+', re.I)
 VIKING = {'vikingfile.com', 'vik1ngfile.site', 'vik1ngf1le.online'}
 
 
@@ -79,8 +80,6 @@ def diagnostic_url(value):
     if not parts:
         return '[invalid URL]'
     host = parts.hostname
-    if not parts.query and not re.search(r'(?i)/(?:download|token|signed)/', parts.path):
-        return value
     return f'https://{host}/[redacted]'
 
 
@@ -94,8 +93,8 @@ def option(row):
         return None, 'unsupported_category'
     filename = row.get('filename')
     if (row.get('volume') or row.get('part') or row.get('multipart')
-            or re.search(r'\b(?:part|volume)[ ._-]*[0-9]+\b', row.get('label') or '', re.I)
-            or (isinstance(filename, str) and VOLUME.search(filename))):
+            or PART_LABEL.search(row.get('label') or '')
+            or (isinstance(filename, str) and (VOLUME.search(filename) or PART_LABEL.search(filename)))):
         return None, 'multipart'
     if row.get('unavailableReason') or row.get('health') in ('dead', 'broken', 'unavailable'):
         return None, 'unavailable'
@@ -117,6 +116,9 @@ def option(row):
             continue
         path = parts.path.rstrip('/') or '/'
         name = unquote(path.rsplit('/', 1)[-1])
+        candidate = name.removesuffix('.html') if parts.hostname == 'rapidgator.net' else name
+        if VOLUME.search(candidate) or PART_LABEL.search(candidate):
+            return None, 'multipart'
         if (parts.hostname in {'filekeeper.net', 'datavaults.co', 'datanodes.to'}
                 and supported_filename(name) and path.count('/') == 2):
             path = path.rsplit('/', 1)[0]
@@ -126,9 +128,7 @@ def option(row):
             url = urlunsplit(canonical)
             page = True
             break
-        if VOLUME.search(name):
-            rejection = rejection or 'multipart'
-        elif not requires_browser and supported_filename(name):
+        if not requires_browser and supported_filename(name):
             if parts.query and parts.hostname in PAGE_PATHS:
                 continue
             filename = name

@@ -281,14 +281,14 @@ static int file_format(Release *r, const char *name, bool community, const char 
     if (community && unsupported_label(name)) return 1;
     const char *suffix = strrchr(name, '.');
     if (community && suffix && ((strlen(suffix) == 4 && strspn(suffix + 1, "0123456789") == 3) ||
-        (strlen(suffix) == 4 && strchr("rRzZ", suffix[1]) && strspn(suffix + 2, "0123456789") == 2))) return 1;
-    const char *excluded[] = {".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".001", ".r00", ".rename"};
+        (strlen(suffix) == 4 && strchr("rRzZ", suffix[1]) && strspn(suffix + 2, "0123456789") == 2))) return 2;
+    const char *excluded[] = {".iso", ".img", ".tar", ".gz", ".bz2", ".xz", ".rename"};
     for (size_t i = 0; i < sizeof excluded / sizeof *excluded; i++)
         if (suffix && !strcasecmp(suffix, excluded[i])) return 1;
     if (suffix && !strcasecmp(suffix, ".rar")) {
         const char *volume = suffix;
         while (volume > name && isdigit((unsigned char)volume[-1])) volume--;
-        if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 1;
+        if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 2;
     }
     if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
         strcasecmp(suffix, ".exfat") && strcasecmp(suffix, ".ffpfsc")))

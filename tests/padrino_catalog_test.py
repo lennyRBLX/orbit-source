@@ -67,6 +67,9 @@ class PadrinoImporterTests(unittest.TestCase):
             ({'url': DIRECT, 'requiresBrowser': True}, 'unsupported_provider_page'),
             ({'url': DIRECT, 'label': 'LZ4 game folder'}, 'unsupported_compression'),
             ({'url': DIRECT, 'label': 'Game part 2'}, 'multipart'),
+            ({'url': 'https://filekeeper.net/abc123def456/Game.part01.rar', 'requiresBrowser': True}, 'multipart'),
+            ({'url': 'https://rapidgator.net/file/0123456789abcdef0123456789abcdef/Game.part01.rar.html',
+              'requiresBrowser': True}, 'multipart'),
             ({'url': DIRECT, 'category': 'update'}, 'unsupported_category'),
             ({'url': DIRECT, 'volume': 1}, 'multipart'),
             ({'url': DIRECT, 'filename': 'game.part01.rar'}, 'multipart'),
@@ -127,7 +130,7 @@ class PadrinoImporterTests(unittest.TestCase):
             self.assertIn('Skipped 1 candidates (unsupported_provider_page=1)', stdout.getvalue())
             self.assertEqual([json.loads(line) for line in stderr.getvalue().splitlines()], [{
                 'titleId': 'PPSA12345', 'id': 'rejected', 'reason': 'unsupported_provider_page',
-                'provider': 'Example', 'url': 'https://example.org/id', 'browserUrl': 'https://example.org/page',
+                'provider': 'Example', 'url': 'https://example.org/[redacted]', 'browserUrl': 'https://example.org/[redacted]',
             }])
             result = json.loads(gzip.decompress(original))
             self.assertEqual(result['schemaVersion'], 1)
