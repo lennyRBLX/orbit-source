@@ -19,9 +19,14 @@ typedef struct {
     bool (*active)(void *); /* Checks deadline, cancellation and process identity. */
     bool (*match)(void *, const unsigned char *, size_t);
     void *match_context;
+    size_t match_span;
     uint64_t remaining, attempted, readable;
     unsigned failures;
 } ProbeReader;
+static inline size_t probe_match_span(const ProbeReader *reader) {
+    /* The default covers escaped UTF-16 URLs. */
+    return reader->match_span ? reader->match_span : PROBE_MATCH_MAX * 4;
+}
 typedef enum {
     PROBE_ABSENT, PROBE_FOUND, PROBE_STOPPED, PROBE_BUDGET, PROBE_INVALID
 } ProbeResult;

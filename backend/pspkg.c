@@ -77,6 +77,36 @@ bool pspkg_page_identity(const char *page, char *platform, size_t platform_cap,
     return true;
 }
 
+bool pspkg_page_redirect(const char *page, const char *redirect) {
+    const char *path, *next;
+    if (!origin(page, &path) || !origin(redirect, &next)) return false;
+    size_t host = (size_t)(path - page);
+    if (host != (size_t)(next - redirect) || memcmp(page, redirect, host)) return false;
+    /* The general page can make a same-game round trip through the locale route. */
+    if (!strncmp(next, "/ar/", 4)) next += 3;
+    size_t length = strcspn(path, "?");
+    return length == strcspn(next, "?") && !memcmp(path, next, length);
+}
+
+bool pspkg_link_matches(const char *url, const char *page, const char *platform,
+                        const char *game_id, const char *edition_id) {
+    const char *path, *page_path, *part, *name;
+    if (!origin(url, &path) || !origin(page, &page_path) ||
+        path - url != page_path - page || memcmp(url, page, (size_t)(path - url)) ||
+        !section(path, &part, &name) || strcmp(part, platform)) return false;
+    size_t edition_length = strspn(edition_id, "0123456789");
+    if (!edition_length || edition_length > 12 || edition_id[edition_length]) return false;
+    char prefix[80];
+    int length = snprintf(prefix, sizeof prefix, "download.php?game_id=%s&edition_id=%s&link_id=",
+                          game_id, edition_id);
+    if (length < 0 || (size_t)length >= sizeof prefix || strncmp(name, prefix, (size_t)length))
+        return false;
+    name += length;
+    size_t link_length = strspn(name, "0123456789");
+    return link_length && link_length <= 12 &&
+        (!name[link_length] || !strcmp(name + link_length, "&route=browser"));
+}
+
 static bool read_char(const unsigned char *bytes, size_t length, size_t *at,
                       size_t step, unsigned char *out) {
     if (*at + step > length || (step == 2 && bytes[*at + 1])) return false;

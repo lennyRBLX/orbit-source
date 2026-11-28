@@ -219,6 +219,13 @@ class TorBoxRouting(unittest.TestCase):
                     reveal = {"success": True, "fields": {
                         str(i): anchor(link) for i, link in enumerate(("1", "2", "3", "5", "expired"), 1)
                     }}
+                    reveal["fields"]["4"] = (
+                        '<ul class="dpx-meta"><li class="dpx-meta-row dpx-meta-password">'
+                        '<span class="dpx-label">Password:</span><strong class="dpx-password dp-password">'
+                        'fixture &amp; password</strong></li><li class="dpx-meta-row dpx-meta-size">'
+                        '<span class="dpx-label">Size:</span> <strong>100.29 GB</strong></li></ul>'
+                        '<span class="dpx-group-label"><i></i> Base Game</span>' + anchor("5")
+                    )
                     reveal["fields"]["999"] = '<a href="download.php?route=not-this-listing">Unrelated</a>'
                     env.update(ORBIT_TEST_PSPKG_PS5_URL=fixture.base + "/ps5/",
                                ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
@@ -293,11 +300,19 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual(status["pspkgStatus"], "partial")
         choices = status["pspkgLinks"]
         self.assertIn("unsafe-url", [link["reason"] for link in choices])
-        self.assertIn("verify-required", [link["reason"] for link in choices])
-        self.assertIn("unsupported-format", [link["reason"] for link in choices])
+        gated = next(link for link in choices if link["reason"] == "verify-required")
+        self.assertNotIn("sizeBytes", gated)
+        self.assertNotIn("hasArchivePassword", gated)
+        edition = next(link for link in choices if link["reason"] == "unsupported-format")
+        self.assertEqual((edition["group"], edition["sizeBytes"], edition["sizeExact"],
+                          edition["hasArchivePassword"]), ("Base Game", 100_290_000_000, False, True))
+        self.assertNotIn("fixture & password", json.dumps(choices))
         self.assertNotIn("download.php", json.dumps(choices))
         available = [link for link in choices if not link["reason"]]
         self.assertEqual(len(available), 2)
+        for choice in available:
+            self.assertEqual((choice["filename"], choice["sizeBytes"], choice["sizeExact"]),
+                             ("file.pkg", len(FILE), True))
         link = available[0 if mode == "viking" else 1]
         self.assertEqual((link["titleId"], link["version"], link["region"], link["format"]),
                          ("PPSA04029", "02.120", "EUR", "PKG"))

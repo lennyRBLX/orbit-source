@@ -11,6 +11,14 @@ int main(int argc, char **argv) {
     assert(!strcmp(page, "https://pspkg.com/ps5/download-grand-theft-auto-vi-14552.html"));
     assert(pspkg_page_identity(page, platform, sizeof platform, game_id, sizeof game_id));
     assert(!strcmp(platform, "ps5") && !strcmp(game_id, "14552"));
+    assert(pspkg_page_redirect(page, "https://pspkg.com/ar/ps5/download-grand-theft-auto-vi-14552.html?slug=grand-theft-auto-vi&id=14552"));
+    assert(pspkg_page_redirect(page, "https://pspkg.com/ps5/download-grand-theft-auto-vi-14552.html?id=14552&id=14552"));
+    assert(!pspkg_page_redirect(page, "https://pspkg.com/ar/ps5/download-grand-theft-auto-vi-14553.html"));
+    assert(!pspkg_page_redirect(page, "https://example.com/ar/ps5/download-grand-theft-auto-vi-14552.html"));
+    const char *route = "https://pspkg.com/ps5/download.php?game_id=14552&edition_id=29336&link_id=85873";
+    assert(pspkg_link_matches(route, page, platform, game_id, "29336"));
+    assert(!pspkg_link_matches(route, page, platform, "14553", "29336"));
+    assert(!pspkg_link_matches(route, page, platform, game_id, "29337"));
     assert(!pspkg_download_page("https://pspkg.com/ps5-arabic/grand-theft-auto-vi-14552.html", page, sizeof page));
     assert(!pspkg_page_identity("https://pspkg.com/ps5/download-grand-theft-auto-vi-14552.html?id=7",
                                 platform, sizeof platform, game_id, sizeof game_id));

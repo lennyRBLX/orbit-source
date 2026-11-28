@@ -472,12 +472,16 @@ typedef struct {
     size_t count;
 } PspkgCollection;
 
-static void collect_pspkg_html(PspkgCollection *found, const char *html, const char *edition) {
+static void collect_pspkg_html(PspkgCollection *found, const char *html, const char *edition,
+                               const char *field_id) {
     cJSON *rows = remote_pspkg_session_links(html, found->page, edition);
     const cJSON *row;
     cJSON_ArrayForEach(row, rows) {
         const char *url = json_text(row, "url");
         if (!*url || strlen(url) >= sizeof found->links[0].url) continue;
+        if (field_id && !pspkg_link_matches(url, found->page, found->platform, found->game_id, field_id))
+            continue;
+        if (field_id) found->verified = true;
         size_t i = 0;
         for (; i < found->count; i++)
             if (!strcmp(found->links[i].url, url) &&
@@ -491,6 +495,10 @@ static void collect_pspkg_html(PspkgCollection *found, const char *html, const c
         }
         copy_text(link->label, sizeof link->label, json_text(row, "label"));
         copy_text(link->edition, sizeof link->edition, json_text(row, "edition"));
+        copy_text(link->group, sizeof link->group, json_text(row, "group"));
+        copy_text(link->filename, sizeof link->filename, json_text(row, "filename"));
+        copy_text(link->archive_password, sizeof link->archive_password, json_text(row, "archivePassword"));
+        link->size = json_int(row, "sizeEstimateBytes");
         copy_text(link->title_id, sizeof link->title_id, json_text(row, "titleId"));
         copy_text(link->version, sizeof link->version, json_text(row, "version"));
         copy_text(link->region, sizeof link->region, json_text(row, "region"));
@@ -504,23 +512,26 @@ static void collect_pspkg_html(PspkgCollection *found, const char *html, const c
 
 /* The landing page publishes field IDs. After the user's verification, its
  * script replaces those elements with HTML from the browser's JSON response.
- * Accept only fields belonging to this specific landing page. */
+ * If Cloudflare blocks the public landing request, bind revealed rows using
+ * their same-origin game and edition IDs instead. */
 static void collect_pspkg_reveal(PspkgCollection *found, const char *json, size_t length) {
     cJSON *reply = cJSON_ParseWithLength(json, length);
     const cJSON *fields = cJSON_GetObjectItemCaseSensitive(reply, "fields");
     if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "success")) && cJSON_IsObject(fields)) {
+        bool has_labels = cJSON_GetArraySize(found->fields) > 0;
         const cJSON *field;
         cJSON_ArrayForEach(field, fields) {
             const char *edition = json_text(found->fields, field->string);
-            if (!*edition || !cJSON_IsString(field)) continue;
-            found->verified = true;
-            collect_pspkg_html(found, field->valuestring, edition);
+            if (!cJSON_IsString(field) || (has_labels && !*edition)) continue;
+            if (has_labels) found->verified = true;
+            collect_pspkg_html(found, field->valuestring, edition, has_labels ? NULL : field->string);
         }
     }
     cJSON_Delete(reply);
 }
 
 #ifndef ORBIT_TEST
+#define PSPKG_REVEAL_SPAN (32U * 1024U)
 static bool pspkg_match(void *context, const unsigned char *bytes, size_t length) {
     PspkgCollection *found = context;
     /* Search only for the shape of a successful reveal response. The parser
@@ -528,26 +539,35 @@ static bool pspkg_match(void *context, const unsigned char *bytes, size_t length
     static const char success[] = "{\"success\":true";
     for (size_t i = 0; i + sizeof success <= length; i++) {
         if (bytes[i] != '{') continue;
+        size_t span = length - i < PSPKG_REVEAL_SPAN ? length - i : PSPKG_REVEAL_SPAN;
         if (!memcmp(bytes + i, success, sizeof success - 1))
-            collect_pspkg_reveal(found, (const char *)bytes + i, length - i);
+            collect_pspkg_reveal(found, (const char *)bytes + i, span);
+        if (found->verified) return true;
         if (i + 2 * sizeof success > length || bytes[i + 1]) continue;
         size_t j = 0;
         while (j < sizeof success - 1 && bytes[i + j * 2] == (unsigned char)success[j] &&
                !bytes[i + j * 2 + 1]) j++;
         if (j != sizeof success - 1) continue;
-        size_t cap = (length - i) / 2;
-        char *json = malloc(cap + 1);
+        size_t units = span / 2;
+        char *json = malloc(units * 6 + 1);
         if (!json) continue;
-        for (j = 0; j < cap && bytes[i + j * 2] && !bytes[i + j * 2 + 1]; j++)
-            json[j] = (char)bytes[i + j * 2];
-        json[j] = 0;
-        collect_pspkg_reveal(found, json, j);
+        size_t used = 0;
+        for (j = 0; j < units; j++) {
+            unsigned code = bytes[i + j * 2] | ((unsigned)bytes[i + j * 2 + 1] << 8);
+            if (!code) break;
+            if (code < 0x80) json[used++] = (char)code;
+            /* JSON decodes these UTF-16 code units, including surrogate pairs. */
+            else used += (size_t)snprintf(json + used, 7, "\\u%04x", code);
+        }
+        json[used] = 0;
+        collect_pspkg_reveal(found, json, used);
         free(json);
+        if (found->verified) return true;
     }
-    if (!found->verified && !cJSON_GetArraySize(found->fields))
+    if (!cJSON_GetArraySize(found->fields))
         pspkg_scan_links(bytes, length, found->platform, found->game_id,
                          found->links, &found->count, PSPKG_LINK_LIMIT);
-    return false; /* The whole response may contain many choices. */
+    return false;
 }
 #endif
 
@@ -574,7 +594,7 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
     if (!active()) return false;
     if (html) {
         if (*html == '{') collect_pspkg_reveal(found, html, strlen(html));
-        else collect_pspkg_html(found, html, NULL);
+        else collect_pspkg_html(found, html, NULL, NULL);
         if (!found->count && !strstr(html, "Awaiting verification")) copy_text(error, cap, "no-anchors");
     }
 #else
@@ -605,7 +625,7 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
     int64_t last_new = 0;
     PspkgCollection *collection = found;
     ProbeReader reader = {.read = probe_target_read, .active = native_active,
-        .match = pspkg_match, .match_context = collection,
+        .match = pspkg_match, .match_context = collection, .match_span = PSPKG_REVEAL_SPAN,
         .remaining = PROBE_SESSION_BUDGET};
     while (active() && monotonic() < deadline && reader.remaining) {
         ProbeTarget current[PROBE_TARGET_LIMIT] = {{0}};
@@ -626,7 +646,7 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
         }
         memcpy(targets, current, sizeof targets);
         count = n;
-        for (int i = 0; i < count && active() && reader.remaining; i++) {
+        for (int i = 0; i < count && active() && reader.remaining && !found->verified; i++) {
             reader.context = &targets[i];
             size_t before = found->count;
             (void)probe_target_scan_slice(&targets[i], &reader,
@@ -666,7 +686,7 @@ static void download_pspkg(void) {
     if (ok && choice.provider[0]) copy_text(locator.url, sizeof locator.url, choice.provider);
     else if (ok) {
         route_status = remote_pspkg_route(choice.url, choice.intermediate, &session.cancel,
-                                          locator.url, sizeof locator.url);
+                                          locator.url, sizeof locator.url, NULL);
         if (*route_status) {
             ok = false;
             if (!strcmp(route_status, "verify-required")) {
@@ -690,6 +710,8 @@ static void download_pspkg(void) {
         }
     }
     Release route = selected;
+    if (choice.archive_password[0])
+        copy_text(route.archive_password, sizeof route.archive_password, choice.archive_password);
     if (choice.format[0]) copy_text(route.format, sizeof route.format, choice.format);
     if (choice.edition[0]) copy_text(route.remote_edition, sizeof route.remote_edition, choice.edition);
     if (choice.version[0]) copy_text(route.remote_version, sizeof route.remote_version, choice.version);
@@ -698,6 +720,7 @@ static void download_pspkg(void) {
         copy_text(route.compression, sizeof route.compression, choice.compression);
         for (char *p = route.compression; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 'a' - 'A';
     }
+    if (choice.size && !choice.size_exact) route.display_size = choice.size;
     remote_pspkg_identify_choice(&route, choice.url, selected_index);
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
     bool cached = false;
@@ -866,10 +889,17 @@ static void *worker(void *unused) {
                 PspkgLink *link = &found.links[i];
                 if (link->reason[0]) continue;
                 char resolved[2048] = "";
+                RemoteFileMetadata metadata = {0};
                 const char *reason = remote_pspkg_route(link->url, link->intermediate, &session.cancel,
-                                                       resolved, sizeof resolved);
+                                                       resolved, sizeof resolved, &metadata);
                 if (*reason) copy_text(link->reason, sizeof link->reason, reason);
                 else {
+                    if (metadata.filename[0])
+                        copy_text(link->filename, sizeof link->filename, metadata.filename);
+                    if (metadata.size) {
+                        link->size = metadata.size;
+                        link->size_exact = metadata.exact;
+                    }
                     const char *provider = remote_browser_provider(resolved);
                     if (*provider && strlen(resolved) < sizeof link->provider) {
                         copy_text(link->provider, sizeof link->provider, resolved);
@@ -1170,6 +1200,13 @@ cJSON *browser_status(void) {
             cJSON_AddNumberToObject(choice, "number", (double)i + 1);
             cJSON_AddStringToObject(choice, "label", link->label[0] ? link->label : "PSPKG");
             cJSON_AddStringToObject(choice, "edition", link->edition);
+            if (link->group[0]) cJSON_AddStringToObject(choice, "group", link->group);
+            if (link->filename[0]) cJSON_AddStringToObject(choice, "filename", link->filename);
+            if (link->size > 0) {
+                cJSON_AddNumberToObject(choice, "sizeBytes", (double)link->size);
+                cJSON_AddBoolToObject(choice, "sizeExact", link->size_exact);
+            }
+            if (link->archive_password[0]) cJSON_AddTrueToObject(choice, "hasArchivePassword");
             cJSON_AddStringToObject(choice, "titleId", link->title_id);
             cJSON_AddStringToObject(choice, "version", link->version);
             cJSON_AddStringToObject(choice, "region", link->region);

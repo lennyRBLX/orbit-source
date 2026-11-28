@@ -410,6 +410,11 @@ export interface PspkgChoice {
   format: string;
   compression: string;
   reason: string;
+  group?: string;
+  filename?: string;
+  sizeBytes?: number;
+  sizeExact?: boolean;
+  hasArchivePassword?: boolean;
   providerHost?: string;
   torboxAvailable?: boolean;
   torboxCached?: boolean;

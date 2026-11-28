@@ -23,8 +23,6 @@ void remote_sources_test_refresh_locked(void);
 cJSON *remote_pspkg_links(const char *html);
 cJSON *remote_pspkg_session_links(const char *html, const char *page, const char *heading);
 void remote_pspkg_identify_choice(Release *release, const char *url, size_t index);
-const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
-                               char *out, size_t cap);
 int remote_sources_start(void);
 void remote_sources_stop(void);
 void remote_sources_tick(void);
@@ -88,6 +86,8 @@ typedef struct {
     int64_t size;
     bool exact;
 } RemoteFileMetadata;
+const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
+                               char *out, size_t cap, RemoteFileMetadata *metadata);
 bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, cJSON **links);
 cJSON *remote_metadata_json_locked(const char *ids);
 int remote_release_parse(const cJSON *entry, Release *release);

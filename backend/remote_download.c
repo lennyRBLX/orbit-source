@@ -44,11 +44,7 @@ static bool resolve_href(const char *base, const char *href, char *out, size_t c
 static bool metadata_origin(const char *initial, const char *next) {
     if (!strcmp(initial, next)) return true;
     const char *provider = remote_browser_provider(initial);
-    if (!strcmp(provider, "pspkg")) {
-        if (strcmp(provider, remote_browser_provider(next))) return false;
-        size_t length = strcspn(initial, "?");
-        return length == strcspn(next, "?") && !memcmp(initial, next, length);
-    }
+    if (!strcmp(provider, "pspkg")) return pspkg_page_redirect(initial, next);
     if (*provider && !strcmp(provider, remote_browser_provider(next))) return true;
     const char *initial_host = strstr(initial, "://"), *next_host = strstr(next, "://");
     if (initial_host && next_host && initial_host - initial == next_host - next &&
@@ -1127,6 +1123,9 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
     cJSON *links = cJSON_CreateArray();
     if (!links) return NULL;
     char edition[256] = "";
+    char group[128] = "", password[sizeof ((Release *)0)->archive_password] = "";
+    SizeChoice edition_size = {0};
+    RemoteFileMetadata candidates = {0};
     if (heading) copy_text(edition, sizeof edition, heading);
     bool base = !phrase(edition, "update") && !phrase(edition, "patch") &&
                 !phrase(edition, "backport") && !phrase(edition, "dlc");
@@ -1137,6 +1136,22 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         if (!end) break;
         const char *current = tag;
         tag = end + 1;
+        char classes[128];
+        if (heading && tag_value(current, end, "class", classes, sizeof classes)) {
+            if (has_label(classes, "dpx-meta-size")) {
+                char text[128];
+                if (element_text(current, end, text, sizeof text))
+                    offer_size(&edition_size, &candidates, text, 3, false, false);
+            } else if (has_label(classes, "dpx-password")) {
+                const char *close = element_end(current, end);
+                if (!close || memchr(end + 1, '<', (size_t)(close - end - 1)) ||
+                    !html_text(end + 1, (size_t)(close - end - 1), password, sizeof password) ||
+                    !utf8_text(password)) password[0] = 0;
+            } else if (has_label(classes, "dpx-group-label")) {
+                group[0] = 0;
+                element_text(current, end, group, sizeof group);
+            }
+        }
         if (tag_is(current + 1, "h2") || tag_is(current + 1, "h3") || tag_is(current + 1, "h4")) {
             element_text(current, end, edition, sizeof edition);
             base = !phrase(edition, "update") && !phrase(edition, "patch") &&
@@ -1167,13 +1182,24 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         cJSON_AddStringToObject(item, "name", provider);
         cJSON_AddStringToObject(item, "label", label);
         if (*edition) cJSON_AddStringToObject(item, "edition", edition);
+        if (*group) cJSON_AddStringToObject(item, "group", group);
+        if (*password) cJSON_AddStringToObject(item, "archivePassword", password);
+        if (valid) {
+            char name[sizeof ((Release *)0)->filename] = "";
+            if (!tag_value(current, end, "download", name, sizeof name) &&
+                !tag_value(current, end, "data-filename", name, sizeof name) && file)
+                remote_url_filename(href, name, sizeof name);
+            Release detected = {0};
+            if (safe_page_name(name) && !remote_provider_file_format(&detected, name, NULL))
+                cJSON_AddStringToObject(item, "filename", name);
+        }
         bool unsupported = phrase(edition, "zstd") || phrase(edition, "lz4") ||
                            phrase(label, "zstd") || phrase(label, "lz4") || phrase(edition, "pfs");
         bool multipart = phrase(edition, "part") || phrase(edition, "multipart") ||
                          phrase(label, "part") || phrase(label, "volume");
         const char *formats[] = {"FPKG", "PKG", "PFS", "exFAT", "FFPFSC"};
         for (size_t i = 0; i < sizeof formats / sizeof *formats; i++)
-            if (phrase(edition, formats[i])) {
+            if (phrase(edition, formats[i]) || phrase(group, formats[i])) {
                 cJSON_AddStringToObject(item, "format", formats[i]);
                 break;
             }
@@ -1216,10 +1242,10 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
         else if (!base) cJSON_AddStringToObject(item, "filterReason", "unsupported-category");
         else cJSON_AddStringToObject(item, "filterReason", "");
         cJSON_AddBoolToObject(item, "metadataEligible", base && !unsupported && !multipart);
-        SizeChoice size = {0};
-        RemoteFileMetadata candidates = {0};
-        offer_size(&size, &candidates, edition, 2, false, false);
-        offer_size(&size, &candidates, label, 2, false, false);
+        SizeChoice size = edition_size;
+        RemoteFileMetadata text_candidates = {0};
+        offer_size(&size, &text_candidates, edition, 2, false, false);
+        offer_size(&size, &text_candidates, label, 2, false, false);
         if (size.size && !size.ambiguous) cJSON_AddNumberToObject(item, "sizeEstimateBytes", (double)size.size);
         for (const char *at = edition; *at; at++) {
             if (strncasecmp(at, "CUSA", 4) && strncasecmp(at, "PPSA", 4)) continue;
@@ -1264,8 +1290,6 @@ static cJSON *pspkg_field_labels(const char *html) {
 
 static bool response_interactive(const Response *page);
 
-/* For revealed URLs that are independently public, use the normal bounded
- * redirect policy. A browser-only session is never copied into libcurl. */
 cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status, atomic_bool *cancel) {
     Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true};
     bool ok = fetch(url, &page);
@@ -1274,13 +1298,49 @@ cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status,
     else if (page.status == 404 || page.status == 410 || response_missing(&page)) *status = REMOTE_METADATA_MISSING;
     else if (response_interactive(&page)) *status = REMOTE_METADATA_INTERACTIVE;
     else if (ok) *status = REMOTE_METADATA_NO_SIZE;
-    cJSON *fields = page.body && !page.truncated ? pspkg_field_labels(page.body) : NULL;
+    const char *path = strstr(page.url, "://");
+    path = path ? strchr(path + 3, '/') : NULL;
+    cJSON *fields = ok && page.body && !page.truncated && path && strncmp(path, "/ar/", 4)
+        ? pspkg_field_labels(page.body) : NULL;
     free(page.body);
     return fields;
 }
 
+static void download_page_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {
+    Release file = *r;
+    char name[sizeof file.filename] = "";
+    const char *anchor = NULL;
+    bool named = page_filename(page->body, r, name, sizeof name, &anchor);
+    if (!named) {
+        PageLink link = {0};
+        if (!page_link(page, r, NULL, &link) && (link.pinned || link.recognized)) {
+            copy_text(name, sizeof name, link.filename);
+            named = true;
+        }
+    }
+    page_size(page->body, anchor, name, metadata);
+    const char *title = find_text(page->body, "<title>");
+    char title_text[512];
+    if (title && element_text(title, title + 6, title_text, sizeof title_text) &&
+        (phrase(title_text, "LZ4") || phrase(title_text, "ZSTD") || phrase(title_text, "PFS"))) {
+        metadata->status = REMOTE_METADATA_UNSUPPORTED;
+        metadata->size = 0;
+        metadata->exact = false;
+    } else if (named) {
+        int format = remote_provider_file_format(&file, name, NULL);
+        if (!format && r->compression[0] && strcmp(r->compression, file.compression)) format = 1;
+        if (!format) file_metadata(&file, metadata);
+        else if (format > 0) {
+            metadata->status = REMOTE_METADATA_UNSUPPORTED;
+            metadata->size = 0;
+            metadata->confidence = 0;
+            metadata->exact = false;
+        } else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
+    }
+}
+
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
-                               char *out, size_t cap) {
+                               char *out, size_t cap, RemoteFileMetadata *metadata) {
     if (!remote_https_url(url)) return "unsafe-url";
     Response response = {.cancel = cancel, .collect_page = true, .range = !intermediate};
     bool ok = fetch(url, &response);
@@ -1299,6 +1359,18 @@ const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *
     else if (!ok || !response.url[0] || strlen(response.url) >= cap) status = "provider-unavailable";
     else if (response.page && !*remote_browser_provider(response.url)) status = "unsupported-provider";
     else copy_text(out, cap, response.url);
+    if (metadata && ok && !*status && !response_challenge(&response)) {
+        Release file = {.remote_page = true};
+        if (response.page && response.body && !response.truncated) {
+            download_page_metadata(&response, &file, metadata);
+            if (rootz_page(response.url)) rootz_metadata(&response, &file, metadata);
+        } else if (!response.page && !file_from_response(&file, &response, url, NULL)) {
+            file_metadata(&file, metadata);
+            metadata->size = file.size;
+            metadata->exact = true;
+            metadata->status = REMOTE_METADATA_FOUND;
+        }
+    }
     free(response.body);
     return status;
 }
@@ -1432,36 +1504,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         } else metadata->status = REMOTE_METADATA_UNSUPPORTED;
     } else if (direct) metadata->status = interactive ? REMOTE_METADATA_INTERACTIVE : REMOTE_METADATA_NO_SIZE;
     else if (page.body) {
-        Release file = *r;
-        char name[sizeof file.filename] = "";
-        const char *anchor = NULL;
-        bool named = page_filename(page.body, r, name, sizeof name, &anchor);
-        if (!named) {
-            PageLink link = {0};
-            if (!page_link(&page, r, NULL, &link) && (link.pinned || link.recognized)) {
-                copy_text(name, sizeof name, link.filename);
-                named = true;
-            }
-        }
-        page_size(page.body, anchor, name, metadata);
-        const char *title = find_text(page.body, "<title>");
-        char title_text[512];
-        if (title && element_text(title, title + 6, title_text, sizeof title_text) &&
-            (phrase(title_text, "LZ4") || phrase(title_text, "ZSTD") || phrase(title_text, "PFS"))) {
-            metadata->status = REMOTE_METADATA_UNSUPPORTED;
-            metadata->size = 0;
-            metadata->exact = false;
-        } else if (named) {
-            int format = remote_provider_file_format(&file, name, NULL);
-            if (!format && r->compression[0] && strcmp(r->compression, file.compression)) format = 1;
-            if (!format) file_metadata(&file, metadata);
-            else if (format > 0) {
-                metadata->status = REMOTE_METADATA_UNSUPPORTED;
-                metadata->size = 0;
-                metadata->confidence = 0;
-                metadata->exact = false;
-            } else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
-        }
+        download_page_metadata(&page, r, metadata);
         if (interactive && !metadata->filename[0] && metadata->status == REMOTE_METADATA_NO_SIZE)
             metadata->status = REMOTE_METADATA_INTERACTIVE;
     } else metadata->status = REMOTE_METADATA_NO_SIZE;

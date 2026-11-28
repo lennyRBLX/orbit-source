@@ -102,7 +102,7 @@ int probe_target_read(void *context, uint64_t address, void *bytes, size_t lengt
 }
 
 ProbeResult probe_target_scan_slice(ProbeTarget *target, ProbeReader *reader, const char *marker, size_t slice) {
-    if (slice && slice <= PROBE_MATCH_MAX * 4) return PROBE_INVALID;
+    if (slice && slice <= probe_match_span(reader)) return PROBE_INVALID;
     if (!probe_target_active(target)) return PROBE_STOPPED;
     size_t size = 0;
     unsigned char *bytes = query(KERN_PROC_VMMAP, target->pid, &size);
@@ -138,7 +138,7 @@ ProbeResult probe_target_scan_slice(ProbeTarget *target, ProbeReader *reader, co
             /* Re-read a bounded overlap so URLs crossing a slice edge retain
              * the same ASCII/UTF-16/JSON handling as a continuous scan. */
             if (end < entry.kve_end) {
-                const uint64_t overlap = PROBE_MATCH_MAX * 4 - 1;
+                const uint64_t overlap = probe_match_span(reader) - 1;
                 target->cursor = end - start > overlap ? end - overlap : start;
                 end_of_map = false;
                 break;
