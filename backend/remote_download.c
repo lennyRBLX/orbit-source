@@ -17,7 +17,7 @@ typedef struct {
     char *body;
     size_t used;
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
-    bool metadata_only, redirect_status, range, plain_text;
+    bool metadata_only, redirect_status, range, plain_text, html_only;
     const char *page_token;
     const char *initial_url;
     CURLcode code;
@@ -105,10 +105,13 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
         location[end - start] = 0;
         curl_easy_getinfo(r->handle, CURLINFO_EFFECTIVE_URL, &base);
         if (!base || !resolve_href(base, location, resolved, sizeof resolved) ||
-            !metadata_origin(r->initial_url, resolved)) {
+            !metadata_origin(r->initial_url, resolved) ||
+            (r->html_only && strcmp(remote_browser_provider(r->initial_url), remote_browser_provider(resolved)))) {
             r->redirect_rejected = true;
             return 0;
         }
+    } else if (r->html_only && n >= 20 && !strncasecmp(data, "Content-Disposition:", 20)) {
+        return 0;
     } else if (n >= 13 && !strncasecmp(data, "cf-mitigated:", 13)) {
         size_t offset = 13;
         while (offset < n && (data[offset] == ' ' || data[offset] == '\t')) offset++;
@@ -130,7 +133,7 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
 static size_t body(char *data, size_t a, size_t b, void *context) {
     Response *r = context;
     size_t n = a * b;
-    if (cancelled(r)) return 0;
+    if (cancelled(r) || (r->html_only && (!r->page || r->json || r->plain_text))) return 0;
     bool collect = r->collect_page && (r->page || r->error_page || r->plain_text);
     if (!collect && r->collect_page && !r->used) {
         size_t offset = 0;
@@ -1337,6 +1340,23 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
             metadata->exact = false;
         } else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
     }
+}
+
+bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, RemoteFileMetadata *metadata) {
+    const char *provider = remote_browser_provider(url);
+    if (!*provider || !strcmp(provider, "pspkg")) return false;
+    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true, .html_only = true};
+    bool ok = fetch(url, &page) && page.page && !page.json && !page.plain_text &&
+        page.body && !page.truncated && !response_challenge(&page) && !response_missing(&page) &&
+        !strcmp(provider, remote_browser_provider(page.url));
+    if (ok) {
+        Release file = {.remote_page = true};
+        download_page_metadata(&page, &file, metadata);
+        if (rootz_page(page.url)) rootz_metadata(&page, &file, metadata);
+        ok = metadata->status != REMOTE_METADATA_MISSING && metadata->status != REMOTE_METADATA_UNSUPPORTED;
+    }
+    free(page.body);
+    return ok;
 }
 
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,

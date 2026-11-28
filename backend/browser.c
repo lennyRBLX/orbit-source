@@ -13,6 +13,11 @@
 #include <string.h>
 #include <time.h>
 
+typedef struct {
+    size_t index;
+    char url[sizeof ((PspkgLink *)0)->provider];
+} PspkgPage;
+
 /* One user-requested session, held only in memory. The queue receives a validated
  * selected file route, never arbitrary browser bytes or account credentials. */
 static struct {
@@ -29,8 +34,9 @@ static struct {
     char pspkg_game[64], pspkg_status[32];
     bool pspkg_torbox;
     PspkgLink pspkg_links[PSPKG_LINK_LIMIT], pspkg_selected;
+    PspkgPage pspkg_pages[PSPKG_LINK_LIMIT];
     size_t pspkg_selected_index;
-    size_t pspkg_count;
+    size_t pspkg_count, pspkg_page_count;
     time_t pspkg_expires;
     Release release;
     Storage storage;
@@ -506,6 +512,13 @@ static void collect_pspkg_html(PspkgCollection *found, const char *html, const c
         copy_text(link->compression, sizeof link->compression, json_text(row, "compression"));
         copy_text(link->reason, sizeof link->reason, json_text(row, "filterReason"));
         link->intermediate = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "intermediate"));
+        const char *id = link->intermediate ? strstr(url, "&link_id=") : NULL;
+        if (id) {
+            id += sizeof "&link_id=" - 1;
+            size_t length = strspn(id, "0123456789");
+            if (length && length < sizeof link->link_id && (!id[length] || id[length] == '&'))
+                snprintf(link->link_id, sizeof link->link_id, "%.*s", (int)length, id);
+        }
     }
     cJSON_Delete(rows);
 }
@@ -803,6 +816,73 @@ static void download_pspkg(void) {
     session.finished_ms = milliseconds() - session.started_ms;
 }
 
+static void update_pspkg_metadata(PspkgLink *link, const RemoteFileMetadata *metadata) {
+    if (metadata->filename[0])
+        copy_text(link->filename, sizeof link->filename, metadata->filename);
+    if (metadata->size) {
+        link->size = metadata->size;
+        link->size_exact = metadata->exact;
+    }
+}
+
+static void update_pspkg_provider(PspkgLink *link, const char *url) {
+    copy_text(link->provider, sizeof link->provider, url);
+    Release route = {.remote_page = true};
+    copy_text(route.remote_provider_page, sizeof route.remote_provider_page, url);
+    pthread_mutex_lock(&orbit.mutex);
+    unsigned revision = debrid_cache_revision_locked(&route);
+    pthread_mutex_unlock(&orbit.mutex);
+    link->torbox_cached_revision = revision && debrid_check_cached(&route, revision) ? revision : 0;
+}
+
+static void pspkg_choices_ready_locked(void) {
+    size_t usable = 0, waiting = 0;
+    for (size_t i = 0; i < session.pspkg_count; i++) {
+        usable += !session.pspkg_links[i].reason[0];
+        waiting += !strcmp(session.pspkg_links[i].reason, "verify-required");
+    }
+    copy_text(session.pspkg_status, sizeof session.pspkg_status, usable
+        ? usable < session.pspkg_count ? "partial" : "ready" : waiting ? "verify-required" : "rejected");
+    state_locked("links-ready", usable ? "PSPKG download choices are ready. Select one to continue."
+        : "PSPKG links need verification or were rejected by download policy.");
+}
+
+/* A paired client can report public provider pages seen in its own browser.
+ * This worker reads HTML and updates link choices without creating jobs. */
+static void read_pspkg_pages_locked(void) {
+    for (size_t i = 0; i < session.pspkg_page_count; i++) {
+        if (session.stop || atomic_load(&session.cancel) || !selected_locked() ||
+            time(NULL) >= session.pspkg_expires) break;
+        PspkgPage page = session.pspkg_pages[i];
+        PspkgLink link = session.pspkg_links[page.index];
+        pthread_mutex_unlock(&orbit.mutex);
+        RemoteFileMetadata metadata = {0};
+        bool read = remote_pspkg_provider_metadata(page.url, &session.cancel, &metadata);
+        if (read && active()) {
+            update_pspkg_metadata(&link, &metadata);
+            update_pspkg_provider(&link, page.url);
+            link.reason[0] = 0;
+        }
+        pthread_mutex_lock(&orbit.mutex);
+        if (read && page.index < session.pspkg_count && !session.stop &&
+            !atomic_load(&session.cancel) && selected_locked() && time(NULL) < session.pspkg_expires)
+            session.pspkg_links[page.index] = link;
+    }
+    if (atomic_load(&session.cancel)) {
+        copy_text(session.pspkg_status, sizeof session.pspkg_status, "cancelled");
+    } else if (selected_locked()) {
+        pspkg_choices_ready_locked();
+    } else {
+        copy_text(session.pspkg_status, sizeof session.pspkg_status, "expired");
+        state_locked("failed", "The source or catalogue option changed. Fetch PSPKG links again.");
+    }
+    memset(session.pspkg_pages, 0, sizeof session.pspkg_pages);
+    memset(&session.release, 0, sizeof session.release);
+    session.pspkg_page_count = 0;
+    session.finished_ms = milliseconds() - session.started_ms;
+    session.resolving = session.busy = false;
+}
+
 static void *worker(void *unused) {
     (void)unused;
     pthread_mutex_lock(&orbit.mutex);
@@ -811,6 +891,10 @@ static void *worker(void *unused) {
             pthread_cond_wait(&session.changed, &orbit.mutex);
         if (session.stop) break;
         session.pending = false;
+        if (session.pspkg_page_count) {
+            read_pspkg_pages_locked();
+            continue;
+        }
         /* Account pages use the provider's own cookie jar. Do not scan their
          * memory, read credentials, validate a file, or create a queue entry. */
         if (session.account) {
@@ -894,23 +978,11 @@ static void *worker(void *unused) {
                                                        resolved, sizeof resolved, &metadata);
                 if (*reason) copy_text(link->reason, sizeof link->reason, reason);
                 else {
-                    if (metadata.filename[0])
-                        copy_text(link->filename, sizeof link->filename, metadata.filename);
-                    if (metadata.size) {
-                        link->size = metadata.size;
-                        link->size_exact = metadata.exact;
-                    }
+                    update_pspkg_metadata(link, &metadata);
                     const char *provider = remote_browser_provider(resolved);
-                    if (*provider && strlen(resolved) < sizeof link->provider) {
-                        copy_text(link->provider, sizeof link->provider, resolved);
-                        Release route = {.remote_page = true};
-                        copy_text(route.remote_provider_page, sizeof route.remote_provider_page, resolved);
-                        pthread_mutex_lock(&orbit.mutex);
-                        unsigned revision = debrid_cache_revision_locked(&route);
-                        pthread_mutex_unlock(&orbit.mutex);
-                        if (revision && debrid_check_cached(&route, revision))
-                            link->torbox_cached_revision = revision;
-                    } else copy_text(link->url, sizeof link->url, resolved);
+                    if (*provider && strlen(resolved) < sizeof link->provider)
+                        update_pspkg_provider(link, resolved);
+                    else copy_text(link->url, sizeof link->url, resolved);
                 }
                 pthread_mutex_lock(&orbit.mutex);
                 if (!atomic_load(&session.cancel)) session.pspkg_links[i] = *link;
@@ -918,11 +990,6 @@ static void *worker(void *unused) {
             }
             pthread_mutex_lock(&orbit.mutex);
             if (ok && selected_locked() && !atomic_load(&session.cancel)) {
-                size_t usable = 0, waiting = 0;
-                for (size_t i = 0; i < found.count; i++) {
-                    usable += !found.links[i].reason[0];
-                    waiting += !strcmp(found.links[i].reason, "verify-required");
-                }
                 memcpy(session.pspkg_links, found.links, found.count * sizeof found.links[0]);
                 session.pspkg_count = found.count;
                 session.pspkg_expires = time(NULL) + 300;
@@ -931,10 +998,7 @@ static void *worker(void *unused) {
                 if (ttl) session.pspkg_expires = time(NULL) + atoi(ttl);
 #endif
                 copy_text(session.pspkg_release_id, sizeof session.pspkg_release_id, selected.id);
-                copy_text(session.pspkg_status, sizeof session.pspkg_status, usable
-                    ? usable < found.count ? "partial" : "ready" : waiting ? "verify-required" : "rejected");
-                state_locked("links-ready", usable ? "PSPKG download choices are ready. Select one to continue."
-                    : "PSPKG links need verification or were rejected by download policy.");
+                pspkg_choices_ready_locked();
             } else {
                 const char *status = atomic_load(&session.cancel) ? "cancelled" : !selected_locked() ? "scan-miss" :
                     error[0] && !strcmp(error, "missing-page") ? "missing-page" :
@@ -1107,6 +1171,67 @@ static void begin_download_locked(const Release *r, const Storage *storage, cons
         : session.resolving ? "Checking sign-in…" : "Opening the download page on your PS5…");
     pthread_cond_signal(&session.changed);
 }
+
+int browser_pspkg_pages(const cJSON *input, char *error, size_t cap) {
+    const cJSON *items = cJSON_GetObjectItemCaseSensitive(input, "pages");
+    int length = cJSON_GetArraySize(items);
+    if (!cJSON_IsArray(items) || length < 1 || length > PSPKG_LINK_LIMIT) {
+        copy_text(error, cap, "Select valid PSPKG links and provider pages.");
+        return 400;
+    }
+    pthread_mutex_lock(&orbit.mutex);
+    int code = 409;
+    const Release *r = release_find(session.pspkg_release_id);
+    if (!session.ready || session.stop || session.busy || !available() || !r ||
+        strcmp(session.pspkg_release_id, json_text(input, "releaseId")) ||
+        strcmp(session.id, json_text(input, "id")) ||
+        time(NULL) >= session.pspkg_expires || !source_enabled_locked(r)) {
+        copy_text(error, cap, "Fetch this game's PSPKG links again.");
+        goto done;
+    }
+    PspkgPage pages[PSPKG_LINK_LIMIT];
+    bool included[PSPKG_LINK_LIMIT] = {0};
+    size_t count = 0;
+    const cJSON *item;
+    cJSON_ArrayForEach(item, items) {
+        const char *id = json_text(item, "handoffId");
+        const char *url = json_text(item, "providerUrl");
+        const char *provider = remote_browser_provider(url);
+        size_t index = session.pspkg_count;
+        for (size_t i = 0; *id && i < session.pspkg_count; i++) {
+            const PspkgLink *link = &session.pspkg_links[i];
+            if (link->intermediate && !strcmp(link->link_id, id) && !strcmp(link->reason, "verify-required")) {
+                if (index != session.pspkg_count) { index = session.pspkg_count; break; }
+                index = i;
+            }
+        }
+        if (!*provider || !strcmp(provider, "pspkg") || index == session.pspkg_count ||
+            included[index] || strlen(url) >= sizeof pages[0].url || !remote_https_url(url)) {
+            code = 400;
+            copy_text(error, cap, "Select valid PSPKG links and provider pages.");
+            goto done;
+        }
+        included[index] = true;
+        pages[count].index = index;
+        copy_text(pages[count].url, sizeof pages[count].url, url);
+        count++;
+    }
+    if (start_worker_locked()) {
+        code = 503;
+        copy_text(error, cap, "PSPKG verification could not start. Try again.");
+        goto done;
+    }
+    begin_download_locked(r, NULL, NULL, false, "", false);
+    memcpy(session.pspkg_pages, pages, count * sizeof pages[0]);
+    session.pspkg_page_count = count;
+    session.pspkg_expires = time(NULL) + 300;
+    copy_text(session.pspkg_status, sizeof session.pspkg_status, "resolving");
+    state_locked("validating", "Checking the PSPKG provider links.");
+    code = 202;
+done:
+    pthread_mutex_unlock(&orbit.mutex);
+    return code;
+}
 int browser_start_queued_locked(Job *j, char *error, size_t cap) {
     if (session.busy) return 0;
     if (!session.ready || session.stop || !available() || start_worker_locked()) {
@@ -1198,6 +1323,7 @@ cJSON *browser_status(void) {
             snprintf(id, sizeof id, "%zu", i + 1);
             cJSON_AddStringToObject(choice, "id", id);
             cJSON_AddNumberToObject(choice, "number", (double)i + 1);
+            if (link->link_id[0]) cJSON_AddStringToObject(choice, "handoffId", link->link_id);
             cJSON_AddStringToObject(choice, "label", link->label[0] ? link->label : "PSPKG");
             cJSON_AddStringToObject(choice, "edition", link->edition);
             if (link->group[0]) cJSON_AddStringToObject(choice, "group", link->group);

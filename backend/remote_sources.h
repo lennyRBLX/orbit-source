@@ -88,6 +88,7 @@ typedef struct {
 } RemoteFileMetadata;
 const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
                                char *out, size_t cap, RemoteFileMetadata *metadata);
+bool remote_pspkg_provider_metadata(const char *url, atomic_bool *cancel, RemoteFileMetadata *metadata);
 bool remote_download_metadata(const Release *release, RemoteFileMetadata *metadata, cJSON **links);
 cJSON *remote_metadata_json_locked(const char *ids);
 int remote_release_parse(const cJSON *entry, Release *release);

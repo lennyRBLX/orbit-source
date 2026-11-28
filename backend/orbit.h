@@ -234,6 +234,7 @@ void browser_stop(void);
 cJSON *browser_status(void);
 cJSON *browser_diagnostics_locked(void);
 int browser_action(const cJSON *input, char *error, size_t cap);
+int browser_pspkg_pages(const cJSON *input, char *error, size_t cap);
 /* Under orbit.mutex. 1 = started, 0 = browser busy, -1 = cannot start. */
 int browser_start_queued_locked(Job *job, char *error, size_t cap);
 void browser_job_changed_locked(const char *id);

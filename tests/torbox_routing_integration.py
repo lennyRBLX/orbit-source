@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = os.environ.get("ORBIT_TEST_BINARY", ROOT / "build/orbit-test")
 FILE = b"\x7fFIH" + b"test" * 1023
 VIKING_PAGE = "/pspkg-provider/vikingfile.com/metadata"
+SECOND_PAGE = "/pspkg-provider/buzzheavier.com/metadata"
+FILE_REDIRECT = "/pspkg-provider/vikingfile.com/file-redirect"
+GTA_SLUG = "grand-theft-auto-vi-14552"
+GTA_HANDOFFS = ("86105", "86106", "86107")
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -98,7 +102,14 @@ class Fixture(BaseHTTPRequestHandler):
         elif path == "/webdl/requestdl":
             self.api(self.server.base + "/torbox-file")
         elif path == "/ps5/ps5-games-list":
-            self.reply(b'<a href="/ps5/cyberpunk-2077-ultimate-edition-13811.html">Cyberpunk 2077 Ultimate Edition</a>')
+            if self.server.pspkg_mode == "pages":
+                self.reply(f'<a href="/ps5/{GTA_SLUG}.html">Grand Theft Auto VI (GTA 6)</a>'.encode())
+            else:
+                self.reply(b'<a href="/ps5/cyberpunk-2077-ultimate-edition-13811.html">Cyberpunk 2077 Ultimate Edition</a>')
+        elif path == f"/ps5/download-{GTA_SLUG}.html":
+            self.reply(b'<h3 class="dpx-edition-title">PPSA38500 01.002.001 PKG</h3>'
+                       b'<div class="dpx-gate" data-field-id="29356">Awaiting verification</div>',
+                       headers={"Content-Type": "text/html"})
         elif path == "/ps5/download-cyberpunk-2077-ultimate-edition-13811.html":
             if getattr(self.server, "pspkg_missing", False):
                 self.reply(b"<title>Missing</title>", 404, {"Content-Type": "text/html"})
@@ -117,7 +128,9 @@ class Fixture(BaseHTTPRequestHandler):
                 "2": "http://127.0.0.2/file.pkg",
                 "3": "/pspkg-provider/buzzheavier.com/file.pkg",
             }
-            if self.path.endswith("route=expired"):
+            if self.server.pspkg_mode == "pages":
+                self.reply(b'<button>Continue to Download</button>', headers={"Content-Type": "text/html"})
+            elif self.path.endswith("route=expired"):
                 self.reply(b"<p>Verification required</p>", 403, {"Content-Type": "text/html"})
             else:
                 self.reply(b"", 302, {"Location": routes[self.path.rsplit("=", 1)[-1]]})
@@ -140,9 +153,17 @@ class Fixture(BaseHTTPRequestHandler):
             if self.headers.get("Range"):
                 self.reply(b"", 416)
                 return
-            self.reply(b'<div id="file-information"><h2 id="filename">fixture-release.7z</h2>'
-                       b'<p id="size">199.55 GB</p></div>',
+            name = "CODENAME-VICE-Compressed.7z" if self.server.pspkg_mode == "pages" else "fixture-release.7z"
+            self.reply(f'<div id="file-information"><h2 id="filename">{name}</h2>'
+                       '<p id="size">199.55 GB</p></div>'.encode(),
                        headers={"Content-Type": "text/html"})
+        elif path == SECOND_PAGE:
+            self.server.calls.append(path)
+            self.reply(b'<h1 id="filename">backup-fixture.7z</h1><p id="size">1 GB</p>',
+                       headers={"Content-Type": "text/html"})
+        elif path == FILE_REDIRECT:
+            self.server.calls.append(path)
+            self.reply(b"", 302, {"Location": "/original"})
         elif path in ("/original", "/torbox-file", "/mirror-1.pkg", "/mirror-2.pkg") or path.startswith("/pspkg-provider/"):
             self.server.calls.append(path)
             if (path == "/original" and self.server.original_fails) or path == self.server.dead_mirror:
@@ -238,6 +259,10 @@ class TorBoxRouting(unittest.TestCase):
                     reveal["fields"]["999"] = '<a href="download.php?route=not-this-listing">Unrelated</a>'
                     if pspkg == "metadata":
                         reveal["fields"]["1"] = f'<a href="{fixture.base}{VIKING_PAGE}">Viki</a>'
+                    if pspkg == "pages":
+                        reveal["fields"] = {"29356": "".join(
+                            f'<a href="download.php?game_id=14552&amp;edition_id=29356&amp;link_id={link_id}">Provider</a>'
+                            for link_id in GTA_HANDOFFS)}
                     env.update(ORBIT_TEST_PSPKG_PS5_URL=fixture.base + "/ps5/",
                                ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
                     if pspkg == "cancel":
@@ -297,6 +322,33 @@ class TorBoxRouting(unittest.TestCase):
             call("/browser", {"action": "cancel", "id": status["id"]})
         status = wait_for(lambda: result if not (result := call("/browser"))["active"] else None)
         self.assertEqual(status["pspkgGameId"], release["gameId"])
+        if mode == "pages":
+            self.assertIn("Grand Theft Auto VI", release["title"])
+            self.assertEqual(status["pspkgStatus"], "verify-required")
+            self.assertEqual([link["handoffId"] for link in status["pspkgLinks"]], list(GTA_HANDOFFS))
+            pages = [{"handoffId": link_id, "providerUrl": fixture.base + path}
+                     for link_id, path in zip(GTA_HANDOFFS, (VIKING_PAGE, SECOND_PAGE, FILE_REDIRECT))]
+            request = {"id": status["id"], "releaseId": release["id"], "pages": pages}
+            endpoint = "/browser/pspkg-pages"
+            for invalid, code in ((dict(request, id="stale"), 409),
+                                  (dict(request, pages=[dict(pages[0], providerUrl=fixture.base + "/original")]), 400),
+                                  (dict(request, pages=[pages[0], pages[0]]), 400)):
+                with self.assertRaises(HTTPError) as rejected:
+                    call(endpoint, invalid)
+                self.assertEqual(rejected.exception.code, code)
+                rejected.exception.close()
+            call(endpoint, request)
+            result = wait_for(lambda: value if not (value := call("/browser"))["active"] else None)
+            self.assertEqual(result["pspkgStatus"], "partial", result)
+            first, second, redirect = result["pspkgLinks"]
+            self.assertEqual((first["filename"], first["sizeBytes"], first["sizeExact"], first["torboxAvailable"]),
+                             ("CODENAME-VICE-Compressed.7z", 199_550_000_000, False, True))
+            self.assertEqual((second["filename"], second["sizeBytes"]), ("backup-fixture.7z", 1_000_000_000))
+            self.assertEqual(redirect["reason"], "verify-required")
+            self.assertNotIn("providerHost", redirect)
+            self.assertEqual(call("/downloads"), [])
+            self.assertEqual(list((drive / "homebrew").iterdir()), [])
+            return
         if mode in ("cancel", "expire", "empty", "missing"):
             expected = {"cancel": "cancelled", "expire": "expired", "empty": "no-anchors", "missing": "missing-page"}
             self.assertEqual(status["pspkgStatus"], expected[mode])
@@ -366,6 +418,13 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual(calls.count(VIKING_PAGE), 1)
         self.assertNotIn("create", calls)
         self.assertNotIn("/original", calls)
+
+    def test_pspkg_accepts_gta_vi_browser_handoffs_without_downloading(self):
+        calls = self.run_download([{"domains": ["vikingfile.com"], "status": True}], pspkg="pages")
+        for path in (VIKING_PAGE, SECOND_PAGE, FILE_REDIRECT):
+            self.assertEqual(calls.count(path), 1)
+        self.assertNotIn("/original", calls)
+        self.assertNotIn("create", calls)
 
     def check_download(self, port, fixture, original_url, cached, explicit, drive, interrupt):
         token = ""

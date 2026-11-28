@@ -1,6 +1,7 @@
 #include "assets.h"
 #include "orbit.h"
 #include "remote_sources.h"
+#include "pspkg.h"
 #include "catalog_view.h"
 #include "packages.h"
 #include "archive_account.h"
@@ -37,6 +38,8 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+
+#define PSPKG_PAGES_BODY (PSPKG_LINK_LIMIT * 512 + 1024)
 #ifdef ORBIT_TEST
 #define ORBIT_PLATFORM "fixture"
 #else
@@ -1067,6 +1070,12 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         }
         if (get && !strcmp(url, "/api/v1/browser"))
             return json_response(c, 200, browser_status());
+        if (post && !strcmp(url, "/api/v1/browser/pspkg-pages")) {
+            char e[256] = {0};
+            int code = browser_pspkg_pages(input, e, sizeof e);
+            cJSON_Delete(input);
+            return code == 202 ? json_response(c, 202, browser_status()) : error(c, (unsigned)code, e);
+        }
         if (post && !strcmp(url, "/api/v1/browser")) {
             char e[256] = {0};
             int code = browser_action(input, e, sizeof e);
@@ -1272,6 +1281,8 @@ static enum MHD_Result handle(void *cls, struct MHD_Connection *c, const char *u
             r->large = true; large_requests++; r->limit = ORBIT_RECEIVE_CHUNK;
         } else if (!strcmp(url, "/api/v1/links") && authorized(c)) {
             r->limit = ORBIT_LINKS_BODY; /* Up to 20 pasted links. */
+        } else if (!strcmp(url, "/api/v1/browser/pspkg-pages") && authorized(c)) {
+            r->limit = PSPKG_PAGES_BODY;
         } else if (!strcmp(url, "/api/v1/space") && authorized(c)) {
             r->limit = SPACE_BODY; /* Up to 128 items to delete. */
         }
