@@ -134,7 +134,7 @@ static bool version_size_suffix(const char *end) {
     return false;
 }
 
-static bool find_version(const char *text, bool filename, char *out, size_t cap) {
+static bool find_version(const char *text, bool filename, bool display, char *out, size_t cap) {
     enum { BARE_FILENAME = 1, PADDED_FILENAME, MARKED_VERSION, TITLE_VERSION, MARKED_TITLE_VERSION };
     const char *id = pspkg_title_id(text);
     unsigned best = 0;
@@ -157,10 +157,12 @@ static bool find_version(const char *text, bool filename, char *out, size_t cap)
         const char *token = start;
         // Skip the whole numeric token, including invalid versions and title years.
         start = end - 1;
-        if (parts > 3 || width[0] > 3 || width[1] > 3 || width[2] > 3 ||
-            isalnum((unsigned char)*end) || version_size_suffix(end)) continue;
+        if (isalnum((unsigned char)*end) || version_size_suffix(end)) continue;
 
         bool adjacent = parts > 1 && version_next_to_id(token, end, id);
+        bool extended = parts > 3 || width[0] > 3 || width[1] > 3 || width[2] > 3;
+        // Longer values need a version prefix or a neighboring title ID.
+        if (extended && !(display && parts > 1 && (prefixed || adjacent))) continue;
         unsigned rank = 0;
         if (adjacent) rank = prefixed ? MARKED_TITLE_VERSION : TITLE_VERSION;
         else if (prefixed) rank = MARKED_VERSION;
@@ -168,9 +170,11 @@ static bool find_version(const char *text, bool filename, char *out, size_t cap)
             rank = width[0] == 2 && width[1] == 3 ? PADDED_FILENAME : BARE_FILENAME;
         if (rank <= best) continue;
 
-        while (*number == '0' && isdigit((unsigned char)number[1])) number++;
-        // Sony's two-component PS5 form pads the minor version to three digits.
-        if (parts == 2 && width[1] == 3 && end[-1] == '0') end--;
+        if (!display) {
+            // Keep the existing version string used to identify queued choices.
+            while (*number == '0' && isdigit((unsigned char)number[1])) number++;
+            if (parts == 2 && width[1] == 3 && end[-1] == '0') end--;
+        }
         size_t length = (size_t)(end - number);
         if (length >= cap) continue;
         memcpy(out, number, length);
@@ -180,10 +184,18 @@ static bool find_version(const char *text, bool filename, char *out, size_t cap)
     return best > 0;
 }
 
-void pspkg_version(const char *edition, const char *filename, char *out, size_t cap) {
+static void read_version(const char *edition, const char *filename, bool display, char *out, size_t cap) {
     if (!cap) return;
     out[0] = 0;
-    if (!find_version(edition, false, out, cap)) find_version(filename, true, out, cap);
+    if (!find_version(edition, false, display, out, cap)) find_version(filename, true, display, out, cap);
+}
+
+void pspkg_version(const char *edition, const char *filename, char *out, size_t cap) {
+    read_version(edition, filename, false, out, cap);
+}
+
+void pspkg_display_version(const char *edition, const char *filename, char *out, size_t cap) {
+    read_version(edition, filename, true, out, cap);
 }
 
 static bool read_char(const unsigned char *bytes, size_t length, size_t *at,

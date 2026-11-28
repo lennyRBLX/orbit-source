@@ -1341,7 +1341,9 @@ cJSON *browser_status(void) {
             }
             if (link->archive_password[0]) cJSON_AddTrueToObject(choice, "hasArchivePassword");
             cJSON_AddStringToObject(choice, "titleId", link->title_id);
-            cJSON_AddStringToObject(choice, "version", link->version);
+            char version[sizeof link->version];
+            pspkg_display_version(link->edition, link->filename, version, sizeof version);
+            cJSON_AddStringToObject(choice, "version", version[0] ? version : link->version);
             cJSON_AddStringToObject(choice, "region", link->region);
             cJSON_AddStringToObject(choice, "format", link->format);
             cJSON_AddStringToObject(choice, "compression", link->compression);

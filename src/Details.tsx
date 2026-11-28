@@ -552,7 +552,7 @@ export function Details({
                   <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
                     link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
                   {(link.version || link.filename || link.sizeBytes || link.hasArchivePassword) ? (
-                    <small>{[link.version && t("version {version}", { version: link.version }),
+                    <small>{[link.version && `v${link.version.replace(/^v/i, "")}`,
                       link.filename, link.sizeBytes && `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}`,
                       link.hasArchivePassword && t("Archive password")].filter(Boolean).join(" · ")}</small>
                   ) : null}

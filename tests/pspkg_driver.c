@@ -26,24 +26,29 @@ int main(int argc, char **argv) {
     assert(pspkg_page_identity(page, platform, sizeof platform, game_id, sizeof game_id));
     assert(!strcmp(platform, "ps4") && !strcmp(game_id, "14441"));
 
-    const struct { const char *edition, *filename, *version; } versions[] = {
-        {"", "Cyberpunk 2077 02.120 PPSA04029.rar", "2.12"},
-        {"PPSA04029 PKG", "02.120 PPSA04029-[DLPSGAME.COM].rar", "2.12"},
-        {"PPSA04029 v02.120 EUR PKG", "Cyberpunk 2077 v2.30.rar", "2.12"},
-        {"02.120 [PPSA04029] PKG", "Cyberpunk 2077 v2.30.rar", "2.12"},
-        {"", "Cyberpunk 2077 v2.30 02.120 PPSA04029.rar", "2.12"},
-        {"PPSA38500 01.002.001 PKG", "Game 2.30.rar", "1.002.001"},
-        {"Game v2.31 EUR PKG", "game.rar", "2.31"},
-        {"PPSA04029 54.25 GB PKG", "Cyberpunk 2077 02.120.rar", "2.12"},
-        {"", "Cyberpunk 2077 02.120.7z", "2.12"},
-        {"PPSA04029 54.25 GB PKG", "Cyberpunk 2077 54.25 GB.rar", ""},
-        {"PPSA04029 PKG", "Cyberpunk 2077 PPSA04029.rar", ""},
-        {"CUSA12345 v01.00 FPKG", "game.pkg", "1.00"},
+    const struct { const char *edition, *filename, *version, *display; } versions[] = {
+        {"", "Cyberpunk 2077 02.120 PPSA04029.rar", "2.12", "02.120"},
+        {"PPSA04029 PKG", "02.120 PPSA04029-[DLPSGAME.COM].rar", "2.12", "02.120"},
+        {"PPSA04029 v02.120 EUR PKG", "Cyberpunk 2077 v2.30.rar", "2.12", "02.120"},
+        {"02.120 [PPSA04029] PKG", "Cyberpunk 2077 v2.30.rar", "2.12", "02.120"},
+        {"", "Cyberpunk 2077 v2.30 02.120 PPSA04029.rar", "2.12", "02.120"},
+        {"PPSA38500 01.002.001 PKG", "Game 2.30.rar", "1.002.001", "01.002.001"},
+        {"Game v2.31 EUR PKG", "game.rar", "2.31", "2.31"},
+        {"PPSA04029 54.25 GB PKG", "Cyberpunk 2077 02.120.rar", "2.12", "02.120"},
+        {"", "Cyberpunk 2077 02.120.7z", "2.12", "02.120"},
+        {"PPSA04029 54.25 GB PKG", "Cyberpunk 2077 54.25 GB.rar", "", ""},
+        {"PPSA04029 PKG", "Cyberpunk 2077 PPSA04029.rar", "", ""},
+        {"CUSA12345 v01.00 FPKG", "game.pkg", "1.00", "01.00"},
+        {"Game V01.0002.001.004 PKG", "game.pkg", "", "01.0002.001.004"},
+        {"", "Game 01.0002.001.004 PPSA38500.7z", "", "01.0002.001.004"},
+        {"", "Game 01.0002.001.004.7z", "", ""},
     };
     char version[32];
     for (size_t i = 0; i < sizeof versions / sizeof *versions; i++) {
         pspkg_version(versions[i].edition, versions[i].filename, version, sizeof version);
         assert(!strcmp(version, versions[i].version));
+        pspkg_display_version(versions[i].edition, versions[i].filename, version, sizeof version);
+        assert(!strcmp(version, versions[i].display));
     }
 
     /* PSPKG's successful reveal response contains relative links in HTML,
