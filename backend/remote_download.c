@@ -192,6 +192,9 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Orbit-Store/" ORBIT_VERSION);
+    /* BuzzHeavier can challenge HTTP/2 requests for its public landing pages. */
+    if (r->collect_page && !r->range && !strcmp(remote_browser_provider(url), "buzzheavier"))
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     if (r->collect_page && !r->range) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
     if (!r->collect_page || r->range) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body);
@@ -510,7 +513,8 @@ static bool response_challenge(const Response *response) {
 
 static bool page_has_download(const char *html);
 static bool element_text(const char *tag, const char *end, char *out, size_t cap);
-static void page_size(const char *html, const char *anchor, const char *name, RemoteFileMetadata *file);
+static void page_size(const char *html, const char *anchor, const char *name, bool buzzheavier,
+                      RemoteFileMetadata *file);
 
 static bool page_message_missing(const char *body, size_t length, bool json_body, bool buzzheavier) {
     char *text = malloc(length + 1);
@@ -564,7 +568,7 @@ static bool page_message_missing(const char *body, size_t length, bool json_body
     free(text);
     if (!missing || page_has_download(body)) return false;
     RemoteFileMetadata file = {0};
-    page_size(body, NULL, "", &file);
+    page_size(body, NULL, "", buzzheavier, &file);
     return !file.confidence;
 }
 
@@ -814,8 +818,10 @@ static bool download_label(const char *label) {
     return phrase(label, "download") || phrase(label, "fileinfo") || phrase(label, "file-info");
 }
 
-static void page_size(const char *html, const char *anchor, const char *name, RemoteFileMetadata *file) {
-    SizeChoice best = {0};
+static void page_size(const char *html, const char *anchor, const char *name, bool buzzheavier,
+                      RemoteFileMetadata *file) {
+    SizeChoice best = {0}, button_size = {0};
+    const char *button_end = NULL;
     const char *first_tag = strchr(html, '<');
     if (!first_tag) offer_size(&best, file, html, 1, false, false);
     const char *fields[] = {"data-size-bytes", "data-size", "data-filesize", "data-file-size", "contentSize"};
@@ -844,6 +850,11 @@ static void page_size(const char *html, const char *anchor, const char *name, Re
             continue;
         }
         bool specific = size_label(label) || size_label(id);
+        if (buzzheavier && tag_is(current + 1, "a") && phrase(label, "download-btn"))
+            button_end = element_end(current, end);
+        if (button_end && current < button_end && has_content &&
+            tag_is(current + 1, "span") && phrase(label, "size"))
+            offer_size(&button_size, file, content, 3, false, true);
         bool bound = current == anchor || download_label(label) || download_label(id);
         bool nearby = anchor && current > anchor && current - anchor < 256;
         if (tag_value(current, end, "itemprop", property, sizeof property) && size_label(property)) {
@@ -910,6 +921,8 @@ static void page_size(const char *html, const char *anchor, const char *name, Re
         }
         cJSON_Delete(json);
     }
+    /* Prefer the file's badge to estimates in surrounding page text. */
+    if (button_size.rank && !best.exact) best = button_size;
     file->status = best.ambiguous ? REMOTE_METADATA_AMBIGUOUS : best.rank ? REMOTE_METADATA_FOUND : REMOTE_METADATA_NO_SIZE;
     file->confidence = best.rank;
     if (!best.ambiguous) {
@@ -1326,7 +1339,7 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
             named = true;
         }
     }
-    page_size(page->body, anchor, name, metadata);
+    page_size(page->body, anchor, name, !strcmp(remote_browser_provider(page->url), "buzzheavier"), metadata);
     const char *title = find_text(page->body, "<title>");
     char title_text[512];
     if (title && element_text(title, title + 6, title_text, sizeof title_text) &&

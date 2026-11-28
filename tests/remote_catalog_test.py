@@ -990,6 +990,42 @@ class RemoteCatalogueTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_buzzheavier_metadata_uses_the_download_button_size(self):
+        with FixtureServer() as server:
+            base = server.url.removesuffix("/catalogue.json")
+            path = "/pspkg-provider/buzzheavier.com/fixture12345"
+            other = "/metadata/other"
+            html = {"Content-Type": "text/html"}
+            page = (b'<title>Game.rar</title><p class="file-name">Game.rar</p>'
+                    b'<div class="download-row"><a class="download-btn gay-button" '
+                    b'hx-get="/fixture12345/download?t=fixture">Download File '
+                    b'<span class="size">118.4GB</span></a><a>Slow? Try mirror 2</a></div>'
+                    b'<p>Note: File size of the previous version was 20 GB.</p>')
+            server.downloads.update({
+                path: (200, html, page),
+                path + "-exact": (200, html, page + b'<span data-size-bytes="118400012345"></span>'),
+                path + "-challenge": (403, {**html, "cf-mitigated": "challenge"}, page),
+                other: (200, html, page),
+            })
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
+                    cases = (
+                        (path, "found", 118_400_000_000, False),
+                        (path + "-exact", "found", 118_400_012_345, True),
+                        (path + "-challenge", "challenge", 0, False),
+                        (other, "ambiguous-size", 0, False),
+                    )
+                    for url, status, size, exact in cases:
+                        with self.subTest(url=url):
+                            self.assertEqual(service.command("metadata-page", url=base + url),
+                                             {"status": status, "sizeBytes": size, "exact": exact})
+                    self.assertEqual(server.ranges, [(url, None) for url, *_ in cases])
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_buzzheavier_recovery_notice_marks_the_file_missing(self):
         server = FixtureServer()
         base = server.url.removesuffix("/catalogue.json")
