@@ -933,6 +933,18 @@ class RemoteCatalogueTests(unittest.TestCase):
             "data": ('<p>1.5 tb</p>', 1_500_000_000_000),
             "filekeeper": ('<span>5 MiB</span>', 5_242_880),
             "datavaults": ('<p>8.5 mB</p>', 8_500_000),
+            "datavaults-download": (
+                '<title>Download Fixture</title>'
+                '<div class="d-none">'
+                '<div><div>Max upload file size</div><div><b>1 GB</b></div></div>'
+                '<div><div>Max upload file size</div><div><b>5 GB</b></div></div>'
+                '</div>'
+                '<form method="POST"><h1><span>Downloading</span><br /><span>Fixture.7z</span></h1>'
+                '<div><p>Fixture.7z</p>'
+                '<p><span>Size:</span> 109.7 GB<br /><span>Uploaded:</span> 2026-08-27<br /></p>'
+                '</div></form>',
+                109_700_000_000,
+            ),
         }
         for name, (body, _) in cases.items():
             server.downloads[f"/metadata/{name}"] = (200, html, body.encode())
@@ -961,6 +973,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 for name, (_, expected) in cases.items():
                     result = service.command("metadata-page", url=f"{base}/metadata/{name}")
                     self.assertEqual(result, {"status": "found", "exact": False, "sizeBytes": expected}, name)
+                self.assertIn(("/metadata/datavaults-download", None), server.ranges)
                 self.assertEqual(service.command("metadata-page", url=f"{base}/metadata/exact"),
                                  {"status": "found", "exact": True, "sizeBytes": 54321})
                 for name, status in (("ambiguous", "ambiguous-size"), ("challenge", "challenge"),

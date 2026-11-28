@@ -774,7 +774,8 @@ static bool size_label(const char *label) {
 
 static bool unrelated_size(const char *text) {
     const char *terms[] = {"premium", "plan", "plans", "pricing", "quota", "storage", "speed",
-        "bandwidth", "demo", "example", "maximum", "upload limit", "transfer limit", "daily limit", "per day", "per second", "advertisement", "traffic"};
+        "bandwidth", "demo", "example", "maximum", "max upload", "upload limit", "transfer limit",
+        "daily limit", "per day", "per second", "advertisement", "traffic"};
     for (size_t i = 0; i < sizeof terms / sizeof *terms; i++)
         if (phrase(text, terms[i])) return true;
     return false;
@@ -869,8 +870,12 @@ static void page_size(const char *html, const char *anchor, const char *name, Re
             const char *file_size = find_text(content, "file size");
             bool named = *name && find_text(content, name);
             bool download = download_label(content);
-            if (file_size) offer_size(&best, file, file_size, 3, false, false);
-            else if (specific || bound || named || nearby || download)
+            if (!strncasecmp(content, "size:", 5)) {
+                content[strcspn(content, "\n")] = 0;
+                offer_size(&best, file, content + 5, 3, false, false);
+            } else if (file_size && !unrelated_size(content)) {
+                offer_size(&best, file, file_size, 3, false, false);
+            } else if (specific || bound || named || nearby || download)
                 offer_size(&best, file, content, bound || named || nearby ? 3 : 2, false, false);
             else if (!anchor && !*name) offer_size(&best, file, content, 1, false, true);
         }
