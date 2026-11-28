@@ -93,13 +93,13 @@ def option(row):
         return None, 'unsupported_category'
     filename = row.get('filename')
     if (row.get('volume') or row.get('part') or row.get('multipart')
-            or PART_LABEL.search(row.get('label') or '')
+            or any(PART_LABEL.search(str(row.get(key) or '')) for key in ('label', 'edition', 'provider'))
             or (isinstance(filename, str) and (VOLUME.search(filename) or PART_LABEL.search(filename)))):
         return None, 'multipart'
     if row.get('unavailableReason') or row.get('health') in ('dead', 'broken', 'unavailable'):
         return None, 'unavailable'
     if any(UNSUPPORTED_COMPRESSION.search(str(row.get(key, ''))) for key in
-           ('assetCompression', 'compression', 'format', 'source', 'label', 'filename', 'url', 'browserUrl')):
+           ('assetCompression', 'compression', 'format', 'source', 'label', 'edition', 'filename', 'url', 'browserUrl')):
         return None, 'unsupported_compression'
 
     requires_browser = row.get('requiresBrowser')
@@ -141,7 +141,7 @@ def option(row):
         return None, rejection or 'invalid_url_or_filename'
 
     result = {'url': url, 'name': row.get('provider') or 'Padrino Store'}
-    for key, cap in (('label', 128), ('version', 32), ('region', 32),
+    for key, cap in (('label', 128), ('edition', 128), ('version', 32), ('region', 32),
                      ('assetCompression', 8), ('compression', 8)):
         value = row.get(key)
         if isinstance(value, str) and value.isprintable() and len(value.encode()) < cap:
@@ -199,7 +199,7 @@ def convert(checkout, show_skips=False):
             for row in json.loads(path.read_text()):
                 link, reason = option(row)
                 if link:
-                    links.setdefault((link['url'], link.get('version'), link.get('region')), link)
+                    links.setdefault((link['url'], link.get('version'), link.get('region'), link.get('edition'), link.get('format'), link.get('compression')), link)
                 else:
                     skipped[reason] += 1
                     if show_skips:

@@ -69,8 +69,10 @@ static const char *api_base(void) {
 }
 static bool halted(Job *job) {
     pthread_mutex_lock(&orbit.mutex);
+    const Release *mirror = job && job->mirror_id[0] ? release_find(job->mirror_id) : NULL;
     bool stop = orbit.stop || debrid.stop || (job && (job->pause || job->cancel ||
-                !source_enabled_locked(&job->release)));
+                !debrid_job_account_locked(job) || !source_enabled_locked(&job->release) ||
+                (job->mirror_id[0] && (!mirror || !source_enabled_locked(mirror)))));
     pthread_mutex_unlock(&orbit.mutex);
     return stop;
 }
@@ -106,13 +108,14 @@ static size_t headers(char *data, size_t a, size_t b, void *ctx) {
     }
     return n;
 }
-#define SOURCE_REMOVED "The source no longer has this file. Choose another download option if there is one."
+#define REMOTE_FILE_REMOVED "The source no longer has this file. Choose another download option if there is one."
 #define TORBOX_STALLED "TorBox could not download this file from its source. The source may be offline or the file removed. Choose another download option."
 /* TorBox says that a link's source has taken the file down only in prose.
  * Classify that text without relaying it. */
 static bool source_removed(const char *text) {
     static const char *const signs[] = {"not found", "404", "410", "no longer exists", "no longer available",
-                                        "does not exist", "doesn't exist", "dead link", "taken down"};
+                                        "does not exist", "doesn't exist", "dead link", "taken down",
+                                        "deleted", "file removed", "source unavailable"};
     char lower[512];
     size_t n = 0;
     for (; text && text[n] && n < sizeof lower - 1; n++) lower[n] = (char)tolower((unsigned char)text[n]);
@@ -131,7 +134,8 @@ static bool state_has(const char *state, const char *word) {
 /* TorBox reports a failed web download as "error", "failed" or a variant
  * such as "failed (...)". */
 static bool failed_state(const char *state) {
-    return state_has(state, "fail") || state_has(state, "error");
+    return state_has(state, "fail") || state_has(state, "error") || state_has(state, "cancel") ||
+           state_has(state, "unavailable") || state_has(state, "unsupported");
 }
 static time_t stall_limit(void) {
 #ifdef ORBIT_TEST
@@ -174,10 +178,10 @@ static void message(const cJSON *json, long status, char *err, size_t cap) {
     copy_text(err, cap, text);
 }
 static cJSON *call(const char *key, const char *path, const char *link, bool bearer,
-                   Job *job, time_t *retry, char *err, size_t cap, bool *rejected) {
-    if (rejected) *rejected = false;
+                   Job *job, time_t *retry, char *err, size_t cap, DebridResult *outcome) {
+    if (outcome) *outcome = DEBRID_TRANSIENT;
     const char *base = api_base();
-    if (!base || halted(job)) { if (rejected) *rejected = true; copy_text(err, cap, "TorBox request stopped."); return NULL; }
+    if (!base || halted(job)) { if (outcome) *outcome = DEBRID_FAILED; copy_text(err, cap, "TorBox request stopped."); return NULL; }
     char url[4096], authorization[KEY_CAP + 32];
     if (snprintf(url, sizeof url, "%s%s", base, path) >= (int)sizeof url) return NULL;
     Reply reply = {.job = job};
@@ -194,7 +198,7 @@ static cJSON *call(const char *key, const char *path, const char *link, bool bea
             curl_easy_setopt(curl, CURLOPT_MIMEPOST, form)) {
             curl_easy_cleanup(curl);
             curl_mime_free(form);
-            if (rejected) *rejected = true;
+            if (outcome) *outcome = DEBRID_FAILED;
             copy_text(err, cap, "Could not prepare the TorBox request.");
             return NULL;
         }
@@ -245,15 +249,29 @@ static cJSON *call(const char *key, const char *path, const char *link, bool bea
     if (rc != CURLE_OK || !success_status || !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "success"))) {
         /* A complete rejection can be retried. A lost response or server failure
            may have created a remote item, so the queue must reconcile first. */
-        bool removed = rejected && rc == CURLE_OK && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success")) &&
-                       strcmp(json_text(json, "error"), "ENDPOINT_NOT_FOUND") && source_removed(json_text(json, "detail"));
-        if (rejected && rc == CURLE_OK &&
-            (removed || reply.status == 400 || reply.status == 401 || reply.status == 403 || reply.status == 404 ||
-             reply.status == 410 || reply.status == 422 || reply.status == 429 ||
-             (success_status && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success")) &&
-              strcmp(json_text(json, "error"), "DUPLICATE_ITEM")))) *rejected = true;
+        const char *code = json_text(json, "error");
+        bool refused = rc == CURLE_OK && cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(json, "success"));
+        bool removed = link && refused && strcmp(code, "ENDPOINT_NOT_FOUND") &&
+                       (source_removed(json_text(json, "detail")) || !strcmp(code, "SOURCE_NOT_FOUND") ||
+                        !strcmp(code, "FILE_NOT_FOUND"));
+        bool invalid_key = rc == CURLE_OK &&
+            (reply.status == 401 || !strcmp(code, "BAD_TOKEN") || !strcmp(code, "NO_AUTH"));
+        if (invalid_key && job) {
+            pthread_mutex_lock(&orbit.mutex);
+            if (!strcmp(key, debrid.key)) debrid.checked = 0;
+            pthread_mutex_unlock(&orbit.mutex);
+        }
+        if (outcome) {
+            if (removed) *outcome = DEBRID_MISSING;
+            else if (reply.status == 429 || (*retry > time(NULL) && !invalid_key))
+                *outcome = DEBRID_PROCESSING;
+            else if (rc == CURLE_OK && (invalid_key || reply.status == 400 || reply.status == 403 ||
+                     reply.status == 404 || reply.status == 410 || reply.status == 422 ||
+                     (success_status && refused && strcmp(code, "DUPLICATE_ITEM"))))
+                *outcome = DEBRID_FAILED;
+        }
         if (rc != CURLE_OK) copy_text(err, cap, halted(job) ? "TorBox request stopped." : "Could not reach TorBox. Check your connection and retry.");
-        else if (removed) copy_text(err, cap, SOURCE_REMOVED);
+        else if (removed) copy_text(err, cap, REMOTE_FILE_REMOVED);
         else message(json, reply.status, err, cap);
         cJSON_Delete(json); return NULL;
     }
@@ -548,11 +566,11 @@ bool debrid_job_account_locked(const Job *job) {
 }
 static bool covered_option(const Release *r) {
     if (!r || !current_account()) return false;
-    if (covered_limit(r) >= 0) return true;
+    if (!remote_link_missing_locked(r) && covered_limit(r) >= 0) return true;
     Release mirror;
     char after[sizeof mirror.id] = "";
     while (remote_next_mirror_locked(r, after, &mirror)) {
-        if (covered_limit(&mirror) >= 0) return true;
+        if (!remote_link_missing_locked(&mirror) && covered_limit(&mirror) >= 0) return true;
         copy_text(after, sizeof after, mirror.id);
     }
     return false;
@@ -568,41 +586,83 @@ int debrid_prepare_locked(const Release *r, Job *job, char *err, size_t cap) {
     }
     copy_text(job->delivery, sizeof job->delivery, "torbox");
     copy_text(job->debrid_account, sizeof job->debrid_account, debrid.account);
-    job->debrid_id = job->debrid_file = -1; return 200;
+    job->debrid_id = job->debrid_file = -1;
+    job->debrid_submitted = false;
+    job->debrid_submitted_at = job->debrid_watch = 0;
+    job->debrid_progress = 0;
+    job->debrid_retries = 0;
+    return 200;
+}
+bool debrid_resume_after_missing_locked(Job *job, const Release *route) {
+    if (job->direct_missing || job->debrid_fallback == DEBRID_MISSING ||
+        job->debrid_fallback == DEBRID_FAILED || orbit.state_failed ||
+        !source_enabled_locked(route) || debrid.busy ||
+        !debrid_link_covered_locked(route) ||
+        job_delete_partial_locked(job, job->error, sizeof job->error) ||
+        debrid_prepare_locked(route, job, job->error, sizeof job->error) != 200)
+        return false;
+    job->direct_missing = true;
+    job->browser_pending = false;
+    job->attempts = 0;
+    job->retry_at = 0;
+    job->error[0] = job->delivery_phase[0] = 0;
+    copy_text(job->status, sizeof job->status, "queued");
+    return true;
+}
+static bool item_ready(const cJSON *item) {
+    return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "download_present")) &&
+           cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "download_finished"));
+}
+static bool item_failed(const cJSON *item) {
+    const char *state = json_text(item, "download_state");
+    return failed_state(state) || source_removed(state) || *json_text(item, "error");
 }
 static cJSON *find_item(cJSON *reply, Job *job, const char *original_url) {
     cJSON *data = cJSON_GetObjectItemCaseSensitive(reply, "data");
     if (!cJSON_IsArray(data)) return cJSON_IsObject(data) ? data : NULL;
-    cJSON *item;
+    cJSON *item, *match = NULL;
     cJSON_ArrayForEach(item, data) {
         int64_t id;
-        if (!identifier(item, "id", &id)) continue;
-        if (job->debrid_id >= 0 ? id == job->debrid_id : !strcmp(json_text(item, "original_url"), original_url)) return item;
+        if (!identifier(item, "id", &id) || strcmp(json_text(item, "original_url"), original_url)) continue;
+        if (job->debrid_id >= 0) {
+            if (id == job->debrid_id) return item;
+        } else {
+            if (item_ready(item)) return item;
+            if (!match || (item_failed(match) && !item_failed(item))) match = item;
+        }
     }
-    return NULL;
+    return match;
 }
-int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at, char *err, size_t cap) {
+DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *retry_at, char *err, size_t cap) {
     const char *original_url = provider_torbox_url(route);
-    const bool using_mirror = route != &job->release;
-    char key[KEY_CAP], path[2048]; int result = -1;
+    const bool using_mirror = strcmp(route->id, job->release.id) != 0;
+    char key[KEY_CAP], path[2048];
+    DebridResult result = DEBRID_FAILED;
     pthread_mutex_lock(&orbit.mutex);
     bool account = debrid_job_account_locked(job);
     bool checking = debrid.busy && debrid.key[0] && !strcmp(job->debrid_account, debrid.account);
-    bool covered = debrid_link_covered_locked(route);
+    bool covered = source_enabled_locked(route) && debrid_link_covered_locked(route);
     copy_text(key, sizeof key, account ? debrid.key : "");
     pthread_mutex_unlock(&orbit.mutex);
-    if (!account && checking) { *retry_at = time(NULL) + 5; result = 0; goto end; }
+    if (!account && checking) { *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end; }
     if (!account) { copy_text(err, cap, "Reconnect the original TorBox account before resuming this download."); goto end; }
     if (!covered) {
-        if (checking) { *retry_at = time(NULL) + 5; result = 0; goto end; }
+        if (checking) { *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end; }
         copy_text(err, cap, "TorBox is unavailable for this option. Choose the original source or check App settings.");
         goto end;
     }
     if (halted(job)) goto end;
     snprintf(path, sizeof path, job->debrid_id >= 0 ? "/webdl/mylist?id=%lld&bypass_cache=true" : "/webdl/mylist?limit=1000&bypass_cache=true", (long long)job->debrid_id);
-    cJSON *list = call(key, path, NULL, true, job, retry_at, err, cap, NULL);
-    if (!list) { if (*retry_at > time(NULL)) result = 0; goto end; }
+    DebridResult outcome;
+    cJSON *list = call(key, path, NULL, true, job, retry_at, err, cap, &outcome);
+    if (!list) { result = outcome; goto end; }
     cJSON *item = find_item(list, job, original_url);
+    if (job->direct_missing && job->debrid_fallback == DEBRID_TRANSIENT && !item) {
+        cJSON_Delete(list);
+        copy_text(err, cap, "TorBox does not have a download for this source.");
+        result = DEBRID_TRANSIENT;
+        goto end;
+    }
     if (job->debrid_id < 0 && item) {
         int64_t id;
         if (identifier(item, "id", &id)) {
@@ -635,30 +695,34 @@ int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *re
             }
         }
         pthread_mutex_unlock(&orbit.mutex);
-        if (listing) { *retry_at = listed_by; result = 0; goto end; }
+        if (listing) { *retry_at = listed_by; result = DEBRID_PROCESSING; goto end; }
         if (!saved) { copy_text(err, cap, "Could not save the TorBox submission state."); goto end; }
-        if (time(NULL) < next) { *retry_at = next; result = 0; goto end; }
-        bool rejected = false;
-        cJSON *created = call(key, "/webdl/createwebdownload", original_url, true, job, retry_at, err, cap, &rejected);
+        if (time(NULL) < next) { *retry_at = next; result = DEBRID_PROCESSING; goto end; }
+        cJSON *created = call(key, "/webdl/createwebdownload", original_url, true, job, retry_at, err, cap, &outcome);
         int64_t id = -1;
         bool valid = created && identifier(cJSON_GetObjectItemCaseSensitive(created, "data"), "webdownload_id", &id);
         cJSON_Delete(created);
         if (!valid) {
-            if (rejected) {
+            if (outcome != DEBRID_TRANSIENT) {
                 pthread_mutex_lock(&orbit.mutex);
                 job->debrid_submitted = false;
                 if (*retry_at > orbit.debrid_next_create) orbit.debrid_next_create = *retry_at;
                 int saved_rejection = state_save_locked();
                 pthread_mutex_unlock(&orbit.mutex);
                 if (saved_rejection) { copy_text(err, cap, "Could not save the TorBox retry state."); goto end; }
-                if (*retry_at > time(NULL)) result = 0;
             }
+            result = outcome;
             if (!err[0]) copy_text(err, cap, "TorBox did not return a download identity. Retry to check the account.");
             goto end;
         }
         pthread_mutex_lock(&orbit.mutex); job->debrid_id = id; int rc = state_save_locked(); pthread_mutex_unlock(&orbit.mutex);
         if (rc) { copy_text(err, cap, "Could not save the TorBox download identity."); goto end; }
-        *retry_at = time(NULL) + 5; result = 0; goto end;
+        *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end;
+    }
+    if (!item && job->debrid_submitted_at && time(NULL) < job->debrid_submitted_at + SUBMIT_GRACE) {
+        cJSON_Delete(list);
+        result = DEBRID_PROCESSING;
+        goto end;
     }
     int64_t item_id = -1;
     if (!item || !identifier(item, "id", &item_id) || item_id != job->debrid_id ||
@@ -666,18 +730,18 @@ int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *re
         cJSON_Delete(list); copy_text(err, cap, "TorBox returned a different download identity."); goto end;
     }
     const char *state = json_text(item, "download_state");
-    if (failed_state(state) || *json_text(item, "error")) {
+    if (!item_ready(item) && item_failed(item)) {
         bool removed = source_removed(json_text(item, "error")) || source_removed(state);
         cJSON_Delete(list);
-        copy_text(err, cap, removed ? SOURCE_REMOVED : "TorBox could not prepare this file. Check its status in your TorBox account.");
+        copy_text(err, cap, removed ? REMOTE_FILE_REMOVED : "TorBox could not prepare this file. Check its status in your TorBox account.");
+        result = removed ? DEBRID_MISSING : DEBRID_FAILED;
         goto end;
     }
-    if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "download_present")) ||
-        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "download_finished"))) {
+    if (!item_ready(item)) {
         bool stuck = stalled(job, item, state);
         cJSON_Delete(list);
         if (stuck) { copy_text(err, cap, TORBOX_STALLED); goto end; }
-        *retry_at = time(NULL) + 5; result = 0; goto end;
+        *retry_at = time(NULL) + 5; result = DEBRID_PROCESSING; goto end;
     }
     const cJSON *files = cJSON_GetObjectItemCaseSensitive(item, "files");
     const cJSON *file = cJSON_GetArrayItem(files, 0); int64_t file_id = -1, size = 0;
@@ -722,18 +786,18 @@ int debrid_resolve(Job *job, const Release *route, Release *resolved, time_t *re
      * the canonical address without this optional query value. Keep URL and
      * redirect validation strict, including rejecting unescaped whitespace. */
     snprintf(path, sizeof path, "/webdl/requestdl?token=%s&web_id=%lld&file_id=%lld&redirect=false&zip_link=false&append_name=false", escaped, (long long)job->debrid_id, (long long)file_id); curl_free(escaped);
-    cJSON *download = call(key, path, NULL, false, job, retry_at, err, cap, NULL);
+    cJSON *download = call(key, path, NULL, false, job, retry_at, err, cap, &outcome);
     OPENSSL_cleanse(path, sizeof path);
     const char *address = json_text(download, "data");
     if (download && strlen(address) < sizeof resolved->url && debrid_transfer_url_allowed(address)) {
-        copy_text(resolved->url, sizeof resolved->url, address); result = 1;
+        copy_text(resolved->url, sizeof resolved->url, address); result = DEBRID_READY;
     } else if (download) copy_text(err, cap, "TorBox returned an unsupported download address.");
-    else if (*retry_at > time(NULL)) result = 0;
+    else result = outcome;
     cJSON *secret = cJSON_GetObjectItemCaseSensitive(download, "data");
     if (cJSON_IsString(secret)) OPENSSL_cleanse(secret->valuestring, strlen(secret->valuestring));
     cJSON_Delete(download);
 end:
     OPENSSL_cleanse(key, sizeof key); OPENSSL_cleanse(path, sizeof path);
-    if (result == 0 && *retry_at < time(NULL) + 5) *retry_at = time(NULL) + 5;
+    if (result == DEBRID_PROCESSING && *retry_at < time(NULL) + 5) *retry_at = time(NULL) + 5;
     return result;
 }

@@ -616,6 +616,14 @@ static enum MHD_Result route(struct MHD_Connection *c, const char *url, const ch
         pthread_mutex_unlock(&orbit.mutex);
         return o ? json_response(c, 200, o) : error(c, 400, "Choose a community source and package.");
     }
+    if (get && !strcmp(url, "/api/v1/community-title")) {
+        if (!authorized(c)) return error(c, 401, "Pair this device first.");
+        const char *id = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "release");
+        pthread_mutex_lock(&orbit.mutex);
+        cJSON *o = remote_title_options_locked(id ? release_find(id) : NULL);
+        pthread_mutex_unlock(&orbit.mutex);
+        return o ? json_response(c, 200, o) : error(c, 404, "This download option is no longer available.");
+    }
     if (get && !strcmp(url, "/api/v1/community-metadata")) {
         if (!authorized(c)) return error(c, 401, "Pair this device first.");
         const char *ids = MHD_lookup_connection_value(c, MHD_GET_ARGUMENT_KIND, "ids");

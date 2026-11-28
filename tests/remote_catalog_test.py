@@ -30,6 +30,8 @@ class SourceHandler(http.server.BaseHTTPRequestHandler):
             self.server.requests.append(validator)
             self.server.paths.append(self.path)
             self.server.ranges.append((self.path, self.headers.get("Range")))
+            if self.path.startswith("/api/files/"):
+                self.server.page_tokens.append((self.path, self.headers.get("X-Page-Token")))
             extra = self.server.downloads.get(self.path)
             if extra:
                 status, headers, body = extra
@@ -59,6 +61,7 @@ class FixtureServer(http.server.ThreadingHTTPServer):
         self.requests = []
         self.paths = []
         self.ranges = []
+        self.page_tokens = []
         self.failure = None
         self.feed = None
         self.feeds = {}
@@ -376,12 +379,202 @@ class RemoteCatalogueTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertFalse(result["pending"])
                 self.assertCountEqual(
-                    [(row["sizeBytes"], row["exact"]) for row in result["files"]],
+                    [(row["sizeBytes"], row["exact"]) for row in result["files"] if row["status"] == "found"],
                     [(1480000000, False), (int(42.25 * 1024 ** 3), False), (43123456789, True)],
                 )
+                status = {row["id"]: row["status"] for row in result["files"]}
+                self.assertEqual(status[next(row["id"] for row in rows if row["provider"] == "unavailable")],
+                                 "missing")
                 self.assertEqual(service.command("metadata", ids=ids), result)
                 self.assertEqual(sum(path.startswith("/metadata/") for path in server.paths), 4)
                 self.assertEqual({row["status"] for row in result["options"]}, {"found", "missing"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_provider_layouts_and_confirmed_deletions(self):
+        server = FixtureServer()
+        address = server.url.removesuffix("/catalogue.json")
+        html = {"Content-Type": "text/html"}
+        pages = {
+            "akira": (200, b'<title>Fixture.rar \xc2\xb7 AkiraBox</title>'
+                           b'<meta name="description" content="RAR file \xc2\xb7 118.40 GB \xe2\x80\x94 download it free on AkiraBox.">'),
+            "1fichier": (200, b'<div><span id="file-title" class="heading tier-name">Fixture.fpkg</span>'
+                              b'<span class="tier-feat"><strong>127.13 GB</strong></span></div>'),
+            "rapidgator": (200, b'<title>Download Fixture.rar - Rapidgator</title>'
+                                b'<p>Maximum file size: <strong>900 TB</strong></p>'
+                                b'<table><tr><td>File size:</td><td><strong>118.4 GB</strong></td></tr></table>'),
+            "buzz": (200, b'<h1>Fixture.zip</h1><button><span>Download File</span>'
+                          b'<strong>(3.75 GiB)</strong></button>'),
+            "buzz-sibling": (200, b'<h1>Fixture.zip</h1><div><button>Download File</button>'
+                                  b'<span><strong>42 MiB</strong></span></div>'),
+            "data": (200, b'<h1>Fixture.pkg</h1><span id="filesize">1 GB</span>'
+                           b'<span data-file-size="1323456789"></span>'),
+            "other": (200, b'<title>Fixture.zip</title><div data-size="99999999999">Premium plan</div>'
+                            b'<p>Upload limit: 10 TB</p><p>Page 24</p><p>Cloud storage 50 GB</p>'
+                            b'<span data-size-bytes="4321000000">Premium quota</span>'
+                            b'<script>var plans = {"sizeBytes": 245000000};</script>'),
+            "keeper": (200, b'<h1>Fixture.rar</h1><p>File <span>size:</span> <b>71 KiB</b></p>'),
+            "mediafire": (200, b'<div class="filename">Fixture.zip</div><p><span>File size:</span> '
+                                  b'<strong>13.04 MB</strong></p>'),
+            "unsupported-title": (200, b'<title>Fixture.rar - ZSTD</title>'),
+            "gofile": (200, b'<h1>Fixture.pkg</h1><script type="application/ld+json">'
+                               b'{"name":"Fixture.pkg","contentSize":"345678901"}</script>'),
+            "bytes": (200, b'<p>File size: <b>123 B</b></p>'),
+            "kb": (200, b'<p>File size: <b>1.2 KB</b></p>'),
+            "tb": (200, b'<p>File size: <b>1.2 TB</b></p>'),
+            "tib": (200, b'<p>File size: <b>1.5 TiB</b></p>'),
+            "viking": (404, b'<title>VikingFile</title><h1 id="filename">File not found</h1>'),
+            "no-type": (410, b'<h1>File removed</h1>'),
+            "not-found": (200, b'<h1>Fixture.pkg</h1><p>FiLe<br><b>not</b> \n\t found</p>'),
+            "deleted": (200, b'<h1 class="filename"> \n DeLeTeD \t</h1><p>File size: 118 GB</p>'),
+            "removed": (200, b'<title>Fixture.rar</title><p>  FiLe&nbsp; <b>removed</b> </p>'),
+            "data-passive-cf": (404, b'<h1>File not found</h1><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'),
+            "archive-404": (404, b'<h1>This item is no longer available.</h1>'),
+            "challenge": (403, b'<title>Just a moment...</title><p>File not found</p>'),
+            "challenge-ok": (200, b'<script>window._cf_chl_opt = {};</script><h1>File removed</h1>'),
+            "provider-error": (503, b'<h1>File not found</h1>'),
+            "fake-name": (200, b'<script>const message = "File not found";</script>'
+                               b'<span data-filename="Deleted"></span>'),
+            "live": (200, b'<title>Mirror.pkg</title><p>File size: 1.2 MB</p>'),
+            "rootz/active": (200, b'<script>const shortId = "active"; const pageToken = "rootz-fixture-token";</script>'
+                                  b'<span data-file-size="9 GB"></span>'),
+            "rootz/dead": (200, b'<script>var data = {"shortId":"dead","pageToken":"rootz-fixture-token"};</script>'
+                                b'<title>Former File.rar</title>'),
+        }
+        for key, (status, body) in pages.items():
+            server.downloads["/metadata/" + key] = (status, {} if key == "no-type" else html, body)
+        for key in ("active", "dead"):
+            obj = {"fileName": "Fixture.rar", "size": 118401234567, "mimeType": "application/vnd.rar",
+                   "status": "active" if key == "active" else "deleted", "downloadAllowed": key == "active"}
+            server.downloads[f"/api/files/download-by-short?shortId={key}"] = (
+                200, {"Content-Type": "application/json"}, json.dumps(obj).encode())
+        server.feed = {"packages": [{"title": "Metadata fixture", "titleId": "PPSA12345",
+                        "downloadLinks": [{"name": key, "url": address + "/metadata/" + key} for key in pages]}]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
+                self.assertEqual(service.command("start"), 0)
+                service.idle()
+                rows = {row["provider"]: row["id"] for row in service.command("view", sourcePrefix="rs-dlps-")["remote"]}
+
+                def metadata(keys):
+                    ids = ",".join(rows[key] for key in keys)
+                    deadline = time.monotonic() + 8
+                    while time.monotonic() < deadline:
+                        result = service.command("metadata", ids=ids)
+                        if not result["pending"]:
+                            return {row["id"]: row for row in result["files"]}
+                        time.sleep(0.02)
+                    self.fail("Metadata worker did not complete")
+
+                results = metadata(pages)
+                self.assertEqual(len(results), len(pages))
+                for key, filename, fmt, compression, size, exact in (
+                    ("akira", "Fixture.rar", "Game folder", "rar", 118400000000, False),
+                    ("1fichier", "Fixture.fpkg", "FPKG", None, 127130000000, False),
+                    ("rapidgator", "Fixture.rar", "Game folder", "rar", 118400000000, False),
+                    ("buzz", "Fixture.zip", "Game folder", "zip", int(3.75 * 1024 ** 3), False),
+                    ("buzz-sibling", "Fixture.zip", "Game folder", "zip", 42 * 1024 ** 2, False),
+                    ("data", "Fixture.pkg", "PKG", None, 1323456789, True),
+                    ("keeper", "Fixture.rar", "Game folder", "rar", 71 * 1024, False),
+                    ("rootz/active", "Fixture.rar", "Game folder", "rar", 118401234567, True),
+                    ("other", "Fixture.zip", "Game folder", "zip", 0, False),
+                    ("mediafire", "Fixture.zip", "Game folder", "zip", 13040000, False),
+                    ("gofile", "Fixture.pkg", "PKG", None, 345678901, True),
+                ):
+                    with self.subTest(page=key):
+                        row = results[rows[key]]
+                        self.assertEqual(row["status"], "found" if size else "parse-no-size")
+                        self.assertEqual((row["filename"], row["format"], row.get("compression"),
+                                          row["sizeBytes"], row["exact"]), (filename, fmt, compression, size, exact))
+                for key in ("viking", "no-type", "not-found", "deleted", "removed", "rootz/dead",
+                            "challenge", "challenge-ok", "provider-error", "fake-name", "unsupported-title", "data-passive-cf", "archive-404"):
+                    with self.subTest(page=key):
+                        row = results[rows[key]]
+                        expected = {"challenge": "challenge", "challenge-ok": "challenge",
+                                    "provider-error": "http-error", "fake-name": "parse-no-size",
+                                    "unsupported-title": "unsupported-format"}.get(key, "missing")
+                        self.assertEqual(row["status"], expected)
+                        self.assertNotIn("filename", row)
+                        self.assertEqual(row["sizeBytes"], 0)
+                for key, size in (("bytes", 123), ("kb", 1200), ("tb", 1200000000000),
+                                  ("tib", int(1.5 * 1024 ** 4))):
+                    self.assertEqual((results[rows[key]]["sizeBytes"], results[rows[key]]["exact"]),
+                                     (size, False))
+                self.assertCountEqual(server.page_tokens, [
+                    (f"/api/files/download-by-short?shortId={key}", "rootz-fixture-token")
+                    for key in ("active", "dead")
+                ])
+                by_id = {row["id"]: row for row in service.command("view")["remote"]}
+                self.assertTrue(by_id[rows["viking"]]["providerMissing"])
+                self.assertNotIn("providerMissing", by_id[rows["challenge"]])
+
+                self.assertTrue(service.command("mirror-fixture", ids=[rows["viking"], rows["live"]]))
+                group, = [row for row in service.command("view")["remote"] if row.get("mirrorCount") == 1]
+                self.assertNotIn("providerMissing", group)
+                metadata_row = metadata(["viking"])[rows["viking"]]
+                self.assertEqual((metadata_row["status"], metadata_row["mirrorCount"], metadata_row["filename"]),
+                                 ("found", 1, "Mirror.pkg"))
+                self.assertEqual(server.paths.count("/metadata/viking"), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_details_recovers_overflow_without_starving_another_title(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        first = {"title": "Crowded fixture", "titleId": "PPSA98765"}
+        other = {"title": "Overflow fixture", "titleId": "PPSA98766"}
+        server.feed = {"packages": [
+            *[dict(first, downloadLinks=[{"url": base + f"/crowd-{i}.pkg", "name": f"Choice {i}"}])
+              for i in range(2050)],
+            dict(other, downloadLinks=[{"url": base + "/overflow-a.pkg", "name": "Overflow A"},
+                                       {"url": base + "/overflow-b.pkg", "name": "Overflow B"}]),
+        ]}
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
+                self.assertEqual(service.command("start"), 0)
+                service.idle()
+                rows = service.command("view", sourcePrefix="rs-dlps-")["remote"]
+                overflow = [row for row in rows if row["titleId"] == other["titleId"]]
+                self.assertEqual([row["provider"] for row in overflow], ["Overflow A"])
+                details = service.command("title-options", id=overflow[0]["id"])
+                self.assertEqual({row["provider"] for row in details["releases"]}, {"Overflow A", "Overflow B"})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_direct_metadata_range_preserves_exact_length(self):
+        server = FixtureServer()
+        base = server.url.removesuffix("/catalogue.json")
+        server.feed = {"packages": [{"title": "Direct fixture", "titleId": "CUSA98765",
+                        "downloadLinks": [{"url": base + "/Direct.pkg", "name": "Direct"}]}]}
+        server.downloads["/Direct.pkg"] = (206, {"Content-Type": "application/octet-stream",
+                                               "Content-Range": "bytes 0-7/2000"}, b"\x7fFIHtest")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
+                self.assertEqual(service.command("start"), 0)
+                service.idle()
+                row, = service.command("view", sourcePrefix="rs-dlps-")["remote"]
+                self.assertTrue(row["providerMetadata"])
+                deadline = time.monotonic() + 5
+                while True:
+                    result = service.command("metadata", ids=row["id"])
+                    if not result["pending"] or time.monotonic() >= deadline:
+                        break
+                    time.sleep(.02)
+                file, = result["files"]
+                self.assertEqual((file["status"], file["sizeBytes"], file["exact"]), ("found", 2000, True))
+                self.assertIn(("/Direct.pkg", "bytes=0-7"), server.ranges)
         finally:
             server.shutdown()
             server.server_close()
@@ -551,13 +744,14 @@ class RemoteCatalogueTests(unittest.TestCase):
             title = "Cyberpunk 2077 Ultimate Edition" if platform == "ps5" else "Cyberpunk 2077"
             entries = "".join(f'<a href="/{platform}/old-game-{i}.html">{i} Game {i} 2026/01/02</a>'
                               for i in range(1, 270))
-            entries += (f'<a href="/{platform}/cyberpunk-fixture-999.html">270 {title} 2025/11/22</a>'
+            entries += (f'<a href="/{platform}/cyberpunk-fixture-999.html"><span class="gl-n">270</span>'
+                        f'<span class="gl-t" dir="auto">{title}</span><span class="gl-d">2025/11/22</span></a>'
                         '<a href="/arabic-games/arabic-game-456.html">Arabic</a>'
                         '<a href="/ps3/not-this-game-456.html">Other platform</a>')
             server.downloads[f"/{platform}/{platform}-games-list"] = (200, html, entries.encode())
             response = (b'<h2>Game PKG</h2><p>Awaiting verification</p>' if platform == "ps5" else
                         b'<h2>Game FPKG</h2><p>Links will appear here.</p>')
-            server.downloads[f"/{platform}/download-cyberpunk-fixture-999.html?id=999"] = (200, html, response)
+            server.downloads[f"/{platform}/download-cyberpunk-fixture-999.html"] = (200, html, response)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -570,10 +764,10 @@ class RemoteCatalogueTests(unittest.TestCase):
                     packages = result["feed"]["packages"]
                     self.assertTrue(all(row["category"] == platform.upper() for row in packages))
                     game = packages[-1]
-                    self.assertTrue(game["title"].startswith("Cyberpunk 2077"))
+                    self.assertEqual(game["title"], title)
                     self.assertNotIn("2025", game["title"])
                     url = game["downloadLinks"][0]["url"]
-                    self.assertEqual(url, base + "download-cyberpunk-fixture-999.html?id=999")
+                    self.assertEqual(url, base + "download-cyberpunk-fixture-999.html")
                     self.assertEqual(len(service.command("parse", source=f"pspkg-{platform}",
                                                       feed={"packages": [game]})["releases"]), 1)
                     metadata = service.command("metadata-page", url=url)
@@ -743,9 +937,10 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertFalse(result["pending"])
                 self.assertEqual(len(result["options"]), 4)
                 self.assertEqual([row["status"] for row in result["options"]].count("challenge"), 2)
-                self.assertEqual([(row["sizeBytes"], row["exact"]) for row in result["files"]],
-                                 [(930_000_000, True)])
-                self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, first, second, third])
+                group = next(row for row in result["files"] if row.get("mirrorCount") == 3)
+                member = next(row for row in result["options"] if row["label"] == group["provider"] and row["visible"])
+                self.assertEqual((group["sizeBytes"], group["exact"]), (member["sizeBytes"], member["exact"]))
+                self.assertCountEqual(server.paths, ["/catalogue.json", "/second.json", first, second, third])
         finally:
             server.shutdown()
             server.server_close()

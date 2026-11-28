@@ -46,7 +46,7 @@ typedef struct Transfer {
     char etag[256], modified[128], type[128], error[256];
     time_t retry_at;
     bool accepted, probe, range_probe, unsupported_range;
-    bool capture_probe;
+    bool capture_probe, challenge;
     bool link_probe, link_answered; /* transfer_probe_link: stop at the file's headers. */
     atomic_bool *cancel_signal;
     CURL *handle;
@@ -212,7 +212,9 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
          * previous response's error or retry metadata describes the new one. */
         t->etag[0] = t->modified[0] = t->type[0] = t->error[0] = t->disposition[0] = 0;
         t->retry_at = 0;
-        t->accepted = false;
+        t->accepted = t->challenge = false;
+    } else if (n >= 13 && !strncasecmp(s, "cf-mitigated:", 13)) {
+        t->challenge = true;
     } else if (n > 15 && !strncasecmp(s, "Content-Length:", 15)) {
         t->length = strtoll(s + 15, NULL, 10);
     } else if (n > 14 && !strncasecmp(s, "Content-Range:", 14)) {
@@ -559,6 +561,8 @@ static int range_support(Transfer *owner, struct curl_slist *conditions, CURLcod
         return 1;
     }
     owner->status = probe.status;
+    owner->challenge = probe.challenge;
+    copy_text(owner->type, sizeof owner->type, probe.type);
     owner->retry_at = probe.retry_at;
     if (probe.error[0])
         copy_text(owner->error, sizeof owner->error, probe.error);
@@ -1250,25 +1254,32 @@ static int extract_job(Job *j, int dir, const char *partial, char *note, size_t 
     pthread_mutex_unlock(&orbit.mutex);
     return 0;
 }
-static int prepare_torbox(Transfer *t, const Release *route) {
+static DebridResult prepare_torbox(Transfer *t, const Release *route) {
     Job *j = t->job;
     pthread_mutex_lock(&orbit.mutex);
     copy_text(j->delivery_phase, sizeof j->delivery_phase, "Preparing with TorBox");
     pthread_mutex_unlock(&orbit.mutex);
-    int prepared = debrid_resolve(j, route, t->release, &t->retry_at, t->error, sizeof t->error);
-    if (prepared == 0 && t->error[0]) return -1;
-    if (prepared == 1) {
+    DebridResult result = debrid_resolve(j, route, t->release, &t->retry_at, t->error, sizeof t->error);
+    if (result == DEBRID_TRANSIENT && j->debrid_id >= 0 && j->debrid_retries < t->policy.retries) {
+        j->debrid_retries++;
+        t->retry_at = time(NULL) + (t->policy.delay > 5 ? t->policy.delay : 5);
+        result = DEBRID_PROCESSING;
+    } else if (result == DEBRID_PROCESSING) {
+        j->debrid_retries = 0;
+    }
+    if (result == DEBRID_READY) {
         t->limit = t->release->size;
+        j->debrid_retries = 0;
         pthread_mutex_lock(&orbit.mutex);
         copy_text(j->delivery_phase, sizeof j->delivery_phase, "Downloading via TorBox");
         pthread_mutex_unlock(&orbit.mutex);
     }
-    return prepared;
+    return result;
 }
 
-static bool fall_back_to_provider_locked(Job *j) {
-    bool browser = job_needs_browser(&j->release);
-    if ((!browser && !provider_supported(&j->release)) || orbit.state_failed ||
+static bool fall_back_to_provider_locked(Job *j, const Release *route, DebridResult result) {
+    if (j->direct_missing || orbit.state_failed || !source_enabled_locked(route) ||
+        (!job_needs_browser(route) && !provider_supported(route)) ||
         job_delete_partial_locked(j, j->error, sizeof j->error)) return false;
     copy_text(j->delivery, sizeof j->delivery, "direct");
     j->delivery_phase[0] = j->debrid_account[0] = 0;
@@ -1276,9 +1287,10 @@ static bool fall_back_to_provider_locked(Job *j) {
     j->debrid_submitted = false;
     j->debrid_submitted_at = 0;
     j->debrid_progress = 0;
-    j->mirror_id[0] = j->mirror_first[0] = 0;
-    j->mirror_torbox = false;
-    j->browser_pending = browser;
+    j->debrid_fallback = result;
+    j->mirror_torbox |= j->release.mirror_key[0] != 0;
+    j->mirror_verified = false;
+    j->browser_pending = job_needs_browser(route);
     j->attempts = 0;
     j->retry_at = 0;
     j->error[0] = 0;
@@ -1288,24 +1300,32 @@ static bool fall_back_to_provider_locked(Job *j) {
 
 /* The queued release keeps its original identity and output path. Only the
  * request URL changes, after rechecking the alternate against that file. */
-static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed) {
+static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed,
+                           bool *direct_missing) {
     Job *j = t->job;
     pthread_mutex_lock(&orbit.mutex);
     bool found = true;
-    if (j->mirror_id[0]) found = remote_mirror_locked(&j->release, j->mirror_id, candidate);
-    else *candidate = j->release;
+    if (j->mirror_id[0]) {
+        found = remote_mirror_locked(&j->release, j->mirror_id, candidate);
+    } else {
+        const Release *original = release_find(j->release.id);
+        *candidate = original ? *original : j->release;
+        if (!original && candidate->remote_page) candidate->url[0] = 0;
+    }
     pthread_mutex_unlock(&orbit.mutex);
     if (!found) {
         *source_failed = true;
         copy_text(t->error, sizeof t->error, "This mirror is no longer available.");
         return false;
     }
-    if (torbox(t)) return true;
+    if (torbox(t) || j->mirror_verified) return true;
     Release locator;
     int checked = remote_page_pending(candidate)
         ? remote_download_resolve(candidate, &locator, &j->cancel, t->error, sizeof t->error)
         : remote_download_verify(candidate, candidate->url, &j->cancel, t->error, sizeof t->error);
-    if (checked || !remote_mirror_file(t->release, candidate)) {
+    if (checked || !remote_mirror_file(t->release, candidate) ||
+        (!j->mirror_id[0] && t->release->filename[0] && strcmp(t->release->filename, candidate->filename))) {
+        *direct_missing = checked == REMOTE_DOWNLOAD_MISSING;
         *source_failed = true;
         if (!t->error[0]) copy_text(t->error, sizeof t->error, "The mirror did not return the selected file.");
         return false;
@@ -1330,12 +1350,14 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed)
 
 /* A partial file only belongs to the URL that wrote it. Clear its validators
  * and range map along with its bytes before switching mirrors. */
-static bool advance_mirror_locked(Job *j) {
+bool job_advance_mirror_locked(Job *j) {
     Release candidate;
     if (j->archive_ready) return false;
     bool original_next = j->mirror_first[0] && !strcmp(j->mirror_id, j->mirror_first);
     if (original_next) {
-        candidate = j->release;
+        const Release *original = release_find(j->release.id);
+        candidate = original ? *original : j->release;
+        if (!original && candidate.remote_page) candidate.url[0] = 0;
     } else {
         char after[sizeof j->mirror_id];
         copy_text(after, sizeof after, j->mirror_id);
@@ -1349,6 +1371,9 @@ static bool advance_mirror_locked(Job *j) {
     j->mirror_torbox |= !strcmp(j->delivery, "torbox");
     if (!j->mirror_torbox || debrid_prepare_locked(&candidate, j, j->error, sizeof j->error) != 200)
         copy_text(j->delivery, sizeof j->delivery, "direct");
+    j->browser_pending = strcmp(j->delivery, "torbox") && job_needs_browser(&candidate);
+    j->direct_missing = j->mirror_verified = false;
+    j->debrid_fallback = DEBRID_UNTRIED;
     j->debrid_submitted = false;
     j->debrid_submitted_at = 0;
     j->debrid_progress = 0;
@@ -1380,18 +1405,22 @@ static void run_job(Job *j) {
     CURLcode rc = CURLE_OK;
     CURL *c = NULL;
     struct curl_slist *conditions = NULL;
-    bool done = false, debrid_waiting = false, source_failed = false;
+    bool done = false, debrid_waiting = false, source_failed = false, direct_missing = false;
+    DebridResult debrid_result = DEBRID_UNTRIED;
+    Release mirror;
+    const Release *route = &j->release;
     int unpacked = -1; /* extract_job(): 3 when there was no room to unpack */
     if (controlled(&t)) goto finish;
     pthread_mutex_lock(&orbit.mutex);
     /* A drive the console remounted is recognised; an unmarked one gets its mark. */
     if (storage_rebind_locked(j) && storage_mark_locked(j)) (void)state_save_locked();
     pthread_mutex_unlock(&orbit.mutex);
-    Release mirror;
-    const Release *route = &j->release;
     if ((j->mirror_id[0] || j->mirror_first[0]) && !j->archive_ready) {
-        if (!prepare_mirror(&t, &mirror, &source_failed)) goto finish;
-        if (j->mirror_id[0]) route = &mirror;
+        if (!prepare_mirror(&t, &mirror, &source_failed, &direct_missing)) {
+            if (direct_missing) route = &mirror;
+            goto finish;
+        }
+        route = &mirror;
     }
     bool early_torbox = torbox(&t) && remote_transfer(&t) && (!r->filename[0] || !r->size);
     if (early_torbox) {
@@ -1399,9 +1428,9 @@ static void run_job(Job *j) {
             copy_text(t.error, sizeof t.error, "Destination is missing or not writable.");
             goto finish;
         }
-        int prepared = prepare_torbox(&t, route);
-        if (prepared != 1) {
-            debrid_waiting = prepared == 0;
+        debrid_result = prepare_torbox(&t, route);
+        if (debrid_result != DEBRID_READY) {
+            debrid_waiting = debrid_result == DEBRID_PROCESSING;
             source_failed = !debrid_waiting;
             goto finish;
         }
@@ -1534,9 +1563,9 @@ static void run_job(Job *j) {
         goto finish;
     }
     if (torbox(&t) && !early_torbox) {
-        int prepared = prepare_torbox(&t, route);
-        if (prepared != 1) {
-            debrid_waiting = prepared == 0;
+        debrid_result = prepare_torbox(&t, route);
+        if (debrid_result != DEBRID_READY) {
+            debrid_waiting = debrid_result == DEBRID_PROCESSING;
             source_failed = !debrid_waiting;
             goto finish;
         }
@@ -1552,8 +1581,12 @@ static void run_job(Job *j) {
         for (int tries = 1; checked == -2 && torbox(&t) && tries < TORBOX_SERVER_TRIES; tries++) {
             if (wait_controlled(&t, 3000)) goto finish;
             t.error[0] = 0;
-            int prepared = prepare_torbox(&t, route);
-            if (prepared != 1) { debrid_waiting = prepared == 0; source_failed = !debrid_waiting; goto finish; }
+            debrid_result = prepare_torbox(&t, route);
+            if (debrid_result != DEBRID_READY) {
+                debrid_waiting = debrid_result == DEBRID_PROCESSING;
+                source_failed = !debrid_waiting;
+                goto finish;
+            }
             checked = range_support(&t, NULL, &rc);
         }
         if (checked == -2 && torbox(&t)) copy_text(t.error, sizeof t.error, TORBOX_UNREACHABLE);
@@ -1814,19 +1847,44 @@ finish:
         pthread_mutex_unlock(&orbit.mutex);
         if (!stopping) archive_account_refusal(r->url, t.error, sizeof t.error);
     }
+    /* Check the error body on an eligible direct file endpoint. An expired
+     * signed URL does not establish that the provider page itself was deleted. */
+    bool stable_community_file = remote_transfer(&t) && !route->remote_page;
+    bool can_recover = !j->direct_missing && j->debrid_fallback != DEBRID_MISSING &&
+        j->debrid_fallback != DEBRID_FAILED;
+    bool verify_missing = !done && !torbox(&t) && !pasted_link(&t) && !direct_transfer(&t) &&
+        !direct_missing && !t.challenge && (stable_community_file || can_recover) &&
+        (t.status == 404 || t.status == 410 ||
+         (t.status == 200 && (strstr(t.type, "text/") || strstr(t.type, "json")))) && !controlled(&t);
+    if (verify_missing) {
+        pthread_mutex_lock(&orbit.mutex);
+        bool covered = debrid_link_covered_locked(route);
+        pthread_mutex_unlock(&orbit.mutex);
+        if ((stable_community_file || (can_recover && covered)) &&
+            remote_download_confirm_missing(r->url, &j->cancel)) {
+            direct_missing = true;
+            copy_text(t.error, sizeof t.error, REMOTE_FILE_REMOVED);
+        }
+    }
     pthread_mutex_lock(&orbit.mutex);
     j->speed = 0;
     /* The TorBox progress watch lasts only while the job keeps waiting. */
-    if (!debrid_waiting || j->cancel || j->pause || orbit.stop) j->debrid_watch = 0;
+    if (!debrid_waiting || j->cancel || j->pause || orbit.stop) {
+        j->debrid_watch = 0;
+        j->debrid_retries = 0;
+    }
     bool can_switch = !done && !j->cancel && !j->pause && !orbit.stop && !debrid_waiting &&
         !j->archive_ready && unpacked == -1;
     bool used_torbox = torbox(&t);
-    bool provider_switched = can_switch && used_torbox && source_failed && fall_back_to_provider_locked(j);
+    if (direct_missing && (!verify_missing || !route->remote_page)) remote_mark_missing_locked(route);
+    bool provider_switched = can_switch && used_torbox && source_failed && debrid_result != DEBRID_UNTRIED &&
+        fall_back_to_provider_locked(j, route, debrid_result == DEBRID_READY ? DEBRID_FAILED : debrid_result);
+    bool recovered = can_switch && !used_torbox && direct_missing && debrid_resume_after_missing_locked(j, route);
     /* An unavailable or rate-limited link should not cool down its other mirrors. */
-    bool mirror_switched = can_switch && !used_torbox &&
-        remote_transfer(&t) && (source_failed || t.status == 401 || t.status == 403 || t.status == 404 ||
-            t.status == 410 || t.status == 429 || t.status == 503) && advance_mirror_locked(j);
-    bool switched = provider_switched || mirror_switched;
+    bool mirror_switched = can_switch && !provider_switched && !recovered &&
+        remote_transfer(&t) && (source_failed || direct_missing || t.status == 401 || t.status == 403 ||
+            t.status == 404 || t.status == 410 || t.status == 429 || t.status == 503) && job_advance_mirror_locked(j);
+    bool switched = provider_switched || recovered || mirror_switched;
     if (!switched && (t.status == 429 || t.status == 503)) {
         time_t until = time(NULL) + orbit.download_policy.delay;
         if (t.retry_at > until) until = t.retry_at;
@@ -1854,7 +1912,7 @@ finish:
     } else if (debrid_waiting) {
         copy_text(j->status, sizeof j->status, "queued");
         j->retry_at = t.retry_at; j->error[0] = 0;
-    } else if (!switched && (retryable(t.status, rc) || (used_torbox && (t.status == 401 || t.status == 403 || t.status == 410)) ||
+    } else if (!switched && !(used_torbox && source_failed && j->direct_missing) && (retryable(t.status, rc) || (used_torbox && (t.status == 401 || t.status == 403 || t.status == 410)) ||
                 (t.stalled && rc != CURLE_WRITE_ERROR)) &&
                j->attempts < orbit.download_policy.retries &&
                (!j->received || j->etag[0] || j->modified[0])) {
@@ -1868,7 +1926,7 @@ finish:
         j->retry_worker = j->retry_at <= time(NULL) + 30 &&
                           orbit.source_retry_at[retry_source(j)] <= time(NULL) + 30;
     } else if (!switched && !(!used_torbox && remote_transfer(&t) && (t.status >= 400 || retryable(t.status, rc)) &&
-                                    advance_mirror_locked(j))) {
+                                    job_advance_mirror_locked(j))) {
         copy_text(j->status, sizeof j->status, "error");
         copy_text(j->error, sizeof j->error, t.error[0] ? t.error : "Transfer interrupted.");
     }

@@ -514,6 +514,7 @@ const char *provider_torbox_url(const Release *r) {
     /* Submit the stable provider page, including after browser capture. */
     if (r->remote_page && r->remote_provider_page[0]) return r->remote_provider_page;
     if (r->remote_page || ((!strcmp(r->source, "datanodes") || !strcmp(r->source, "1fichier") ||
-        !strcmp(r->source, "akirabox")) && provider_browser_supported(r))) return r->browser_url;
+        !strcmp(r->source, "akirabox") || !strcmp(r->source, "vikingfile")) &&
+        provider_browser_supported(r))) return r->browser_url;
     return r->url;
 }

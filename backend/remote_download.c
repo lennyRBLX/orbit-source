@@ -17,7 +17,8 @@ typedef struct {
     char *body;
     size_t used;
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
-    bool metadata_only, redirect_status;
+    bool metadata_only, redirect_status, range;
+    const char *page_token;
     const char *initial_url;
     CURLcode code;
     long status;
@@ -43,10 +44,19 @@ static bool resolve_href(const char *base, const char *href, char *out, size_t c
 static bool metadata_origin(const char *initial, const char *next) {
     if (!strcmp(initial, next)) return true;
     const char *provider = remote_browser_provider(initial);
-    if (*provider && !strcmp(provider, remote_browser_provider(next))) {
-        if (strcmp(provider, "pspkg")) return true;
+    if (!strcmp(provider, "pspkg")) {
+        if (strcmp(provider, remote_browser_provider(next))) return false;
         size_t length = strcspn(initial, "?");
         return length == strcspn(next, "?") && !memcmp(initial, next, length);
+    }
+    if (*provider && !strcmp(provider, remote_browser_provider(next))) return true;
+    const char *initial_host = strstr(initial, "://"), *next_host = strstr(next, "://");
+    if (initial_host && next_host && initial_host - initial == next_host - next &&
+        !strncasecmp(initial, next, (size_t)(initial_host - initial))) {
+        initial_host += 3;
+        next_host += 3;
+        size_t n = strcspn(initial_host, "/?");
+        if (n && n == strcspn(next_host, "/?") && !strncasecmp(initial_host, next_host, n)) return true;
     }
 #ifdef ORBIT_TEST
     if (!strncmp(initial, "http://127.0.0.1:", 17) && !strncmp(next, "http://127.0.0.1:", 17)) {
@@ -66,6 +76,13 @@ static int before_request(void *context, char *address, char *local, int port, i
                    (!r->metadata_only || metadata_origin(r->initial_url, url));
     if (!allowed) r->redirect_rejected = true;
     return allowed ? CURL_PREREQFUNC_OK : CURL_PREREQFUNC_ABORT;
+}
+
+static curl_socket_t response_socket(void *context, curlsocktype purpose, struct curl_sockaddr *address) {
+    Response *r = context;
+    curl_socket_t socket = provider_open_socket(NULL, purpose, address);
+    if (socket == CURL_SOCKET_BAD && r->redirect_status) r->redirect_rejected = true;
+    return socket;
 }
 
 static size_t headers(char *data, size_t a, size_t b, void *context) {
@@ -107,7 +124,8 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
         r->json = length >= 16 && !strncasecmp(data + offset, "application/json", 16);
         r->page = (length >= 9 && !strncasecmp(data + offset, "text/html", 9)) ||
                   (length >= 21 && !strncasecmp(data + offset, "application/xhtml+xml", 21)) ||
-                  (length >= 16 && !strncasecmp(data + offset, "application/json", 16));
+                  r->json ||
+                  (r->collect_page && length >= 10 && !strncasecmp(data + offset, "text/plain", 10));
     }
     return n;
 }
@@ -145,10 +163,18 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca);
     curl_easy_setopt(curl, CURLOPT_PROXY, "");
-    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, provider_open_socket);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, response_socket);
+    curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, r);
     curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, before_request);
     curl_easy_setopt(curl, CURLOPT_PREREQDATA, r);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    /* The Rootz page token belongs only to the origin that issued it. */
+    struct curl_slist *headers_out = NULL;
+    if (r->page_token) {
+        headers_out = curl_slist_append(NULL, r->page_token);
+        if (!headers_out) { curl_easy_cleanup(curl); r->handle = NULL; return false; }
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers_out);
+    }
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->page_token ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
 #ifndef ORBIT_TEST
     const char *protocols = r->direct && !strncasecmp(url, "http://", 7) ? "http,https" : "https";
@@ -162,8 +188,8 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Orbit-Store/" ORBIT_VERSION);
-    if (r->collect_page) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    if (!r->collect_page) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
+    if (r->collect_page && !r->range) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    if (!r->collect_page || r->range) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headers);
@@ -205,8 +231,11 @@ static bool fetch(const char *url, Response *r) {
             curl_off_t size = -1;
             if (!curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &size)) r->size = size;
         }
+        if (r->range && curl_easy_header(curl, "Content-Encoding", 0, CURLH_HEADER, -1, &header) == CURLHE_OK &&
+            strcasecmp(header->value, "identity")) r->size = 0;
     }
     curl_easy_cleanup(curl);
+    curl_slist_free_all(headers_out);
     r->handle = NULL;
     return ok;
 }
@@ -232,6 +261,8 @@ bool download_file_magic(const Release *r, const unsigned char *p, size_t length
     return suffix && !strcmp(suffix + 1, expected);
 }
 
+static bool safe_page_name(const char *name);
+
 static int file_from_response(Release *r, const Response *response, const char *url, const char *page_name) {
     char name[sizeof r->filename] = "";
     const char *actual = response->name;
@@ -248,6 +279,7 @@ static int file_from_response(Release *r, const Response *response, const char *
         }
     }
     if (!*actual) actual = name;
+    if (!response->direct && !safe_page_name(actual)) return -1;
     if (r->filename[0] && strcmp(r->filename, actual)) return -1;
     Release file = *r;
     const char *suffix = sample_suffix(response->sample, response->used);
@@ -264,10 +296,18 @@ static int file_from_response(Release *r, const Response *response, const char *
     return 0;
 }
 
+static bool response_missing(const Response *response);
+static bool safe_page_name(const char *name);
+
 int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, char *error, size_t cap) {
-    Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE)};
-    int code = fetch(url, &response) ? file_from_response(r, &response, url, NULL) : -1;
-    if (code) copy_text(error, cap, response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP, 7z or RAR with a filename and size."
+    Response response = {.cancel = cancel, .direct = !strcmp(r->source, ORBIT_DIRECT_SOURCE),
+                         .collect_page = !strcmp(r->source, "remote"), .range = true};
+    bool ok = fetch(url, &response);
+    int code = response_missing(&response) ? REMOTE_DOWNLOAD_MISSING :
+               ok ? file_from_response(r, &response, url, NULL) : -1;
+    free(response.body);
+    if (code) copy_text(error, cap, code == REMOTE_DOWNLOAD_MISSING ? REMOTE_FILE_REMOVED :
+                                      response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP, 7z or RAR with a filename and size."
                                       : code > 0 ? "This option uses an unsupported download format."
                                              : "The provider did not return a verifiable PKG, FPKG, RAR or ZIP.");
     return code;
@@ -424,7 +464,7 @@ static bool phrase(const char *text, const char *word) {
 static bool missing_text(const char *text) {
     const char *messages[] = {"file not found", "file removed", "file was removed", "file has been removed",
         "file deleted", "file was deleted", "file has been deleted", "file does not exist",
-        "file doesn't exist", "file is no longer available", "status: deleted", "no such key"};
+        "file doesn't exist", "file is no longer available", "this item is no longer available", "status: deleted", "no such key"};
     /* A standalone status is common, but 'deleted' in a filename or a
      * retention policy is not evidence that this file has been removed. */
     for (const char *p = text; *p; ) {
@@ -452,8 +492,7 @@ static bool missing_text(const char *text) {
 
 static bool response_challenge(const Response *response) {
     const char *body = response->body;
-    return response->challenge || (body && (find_text(body, "/cdn-cgi/challenge-platform/") ||
-           find_text(body, "_cf_chl_opt") || find_text(body, "<title>just a moment") ||
+    return response->challenge || (body && (find_text(body, "_cf_chl_opt") || find_text(body, "<title>just a moment") ||
            find_text(body, "<title>attention required")));
 }
 
@@ -490,6 +529,14 @@ static bool response_missing(const Response *response) {
         }
     }
     free(text);
+    return missing;
+}
+
+bool remote_download_confirm_missing(const char *url, atomic_bool *cancel) {
+    Response response = {.cancel = cancel, .collect_page = true};
+    fetch(url, &response);
+    bool missing = response_missing(&response);
+    free(response.body);
     return missing;
 }
 
@@ -601,8 +648,8 @@ static bool page_filename(const char *html, const Release *r, char *name, size_t
  * suffix after a nonzero integer can also be a thousands grouping. */
 static const char *size_value(const char *text, bool bytes_allowed, int64_t *size, bool *exact) {
     static const struct { const char *name; uint64_t factor; } units[] = {
-        {"MiB", 1048576}, {"GiB", 1073741824}, {"TiB", 1099511627776},
-        {"MB", 1000000}, {"GB", 1000000000}, {"TB", 1000000000000},
+        {"KiB", 1024}, {"MiB", 1048576}, {"GiB", 1073741824}, {"TiB", 1099511627776},
+        {"KB", 1000}, {"MB", 1000000}, {"GB", 1000000000}, {"TB", 1000000000000}, {"B", 1},
     };
     const char *p = text;
     if (!isdigit((unsigned char)*p)) return NULL;
@@ -642,7 +689,7 @@ static bool size_label(const char *label) {
 
 static bool unrelated_size(const char *text) {
     const char *terms[] = {"premium", "plan", "plans", "pricing", "quota", "storage", "speed",
-        "bandwidth", "transfer limit", "daily limit", "per day", "per second", "advertisement", "traffic"};
+        "bandwidth", "demo", "example", "maximum", "upload limit", "transfer limit", "daily limit", "per day", "per second", "advertisement", "traffic"};
     for (size_t i = 0; i < sizeof terms / sizeof *terms; i++)
         if (phrase(text, terms[i])) return true;
     return false;
@@ -695,7 +742,12 @@ static void page_size(const char *html, const char *anchor, const char *name, Re
         char label[160] = "", id[96] = "", value[512], property[64];
         tag_value(current, end, "class", label, sizeof label);
         tag_value(current, end, "id", id, sizeof id);
-        if (unrelated_size(label) || unrelated_size(id)) {
+        char content[512] = "";
+        bool has_content = element_text(current, end, content, sizeof content);
+        bool leaf_context = tag_is(current + 1, "p") || tag_is(current + 1, "span") ||
+            tag_is(current + 1, "td") || tag_is(current + 1, "li");
+        if (unrelated_size(label) || unrelated_size(id) ||
+            (has_content && (leaf_context || tag_value(current, end, "data-size", value, sizeof value)) && unrelated_size(content))) {
             const char *close = element_end(current, end);
             if (close) {
                 const char *after = strchr(close, '>');
@@ -722,39 +774,49 @@ static void page_size(const char *html, const char *anchor, const char *name, Re
                 offer_size(&best, file, value, size_label(property) ? 2 : 1, size_label(property), false);
         }
         bool text_element = tag_is(current + 1, "span") || tag_is(current + 1, "p") ||
-                            tag_is(current + 1, "dd") || tag_is(current + 1, "td") ||
+                            tag_is(current + 1, "dd") || tag_is(current + 1, "td") || tag_is(current + 1, "tr") ||
                             tag_is(current + 1, "li") || tag_is(current + 1, "b") ||
-                            tag_is(current + 1, "strong") || tag_is(current + 1, "div") ||
+                            tag_is(current + 1, "strong") || tag_is(current + 1, "div") || tag_is(current + 1, "main") ||
                             tag_is(current + 1, "a") || tag_is(current + 1, "button");
-        if ((specific || bound || text_element) && element_text(current, end, value, sizeof value)) {
-            const char *file_size = find_text(value, "file size");
-            bool named = *name && find_text(value, name);
-            if (file_size) offer_size(&best, file, file_size, 2, false, false);
-            offer_size(&best, file, value, bound || named || nearby ? 3 : specific ? 2 : 1, false, false);
+        if (has_content && (specific || bound || text_element)) {
+            const char *file_size = find_text(content, "file size");
+            bool named = *name && find_text(content, name);
+            bool download = download_label(content);
+            if (file_size) offer_size(&best, file, file_size, 3, false, false);
+            else if (specific || bound || named || nearby || download)
+                offer_size(&best, file, content, bound || named || nearby ? 3 : 2, false, false);
+            else if (!anchor && !*name) offer_size(&best, file, content, 1, false, true);
         }
         /* Text directly under body/main or split by formatting also serves
          * providers that don't put their size in a named element. */
         const char *next = strchr(tag, '<');
-        if ((!next || next - tag < (ptrdiff_t)sizeof value) &&
+        if ((specific || bound || nearby) && (!next || next - tag < (ptrdiff_t)sizeof value) &&
             html_text(tag, next ? (size_t)(next - tag) : strlen(tag), value, sizeof value))
             offer_size(&best, file, value, specific ? 2 : 1, false, false);
     }
     const char *json_fields[] = {"sizeBytes", "fileSize", "contentSize"};
-    for (size_t i = 0; i < sizeof json_fields / sizeof *json_fields; i++) {
-        char key[32];
-        snprintf(key, sizeof key, "\"%s\"", json_fields[i]);
-        const char *field = strstr(html, key);
-        if (!field || strstr(field + strlen(key), key)) continue;
-        field += strlen(key);
-        while (isspace((unsigned char)*field)) field++;
-        if (*field++ != ':') continue;
-        while (isspace((unsigned char)*field)) field++;
-        bool quoted = *field == '"';
-        if (quoted) field++;
-        char value[64];
-        size_t length = strcspn(field, quoted ? "\"" : ",}\r\n");
-        if (!quoted && field[length] == ',' && isdigit((unsigned char)field[length + 1])) continue;
-        if (html_text(field, length, value, sizeof value)) offer_size(&best, file, value, 2, true, true);
+    for (const char *script = html; (script = find_text(script, "<script")); script += 7) {
+        const char *end = strchr(script, '>');
+        char type[48];
+        if (!end || !tag_value(script, end, "type", type, sizeof type) ||
+            (strcasecmp(type, "application/ld+json") && strcasecmp(type, "application/json"))) continue;
+        const char *close = find_text(end + 1, "</script>");
+        if (!close || close - end > 32768) continue;
+        cJSON *json = cJSON_ParseWithLength(end + 1, (size_t)(close - end - 1));
+        const char *json_name = json_text(json, "name");
+        if (!*json_name || !*name || !strcmp(json_name, name)) {
+            for (size_t i = 0; i < sizeof json_fields / sizeof *json_fields; i++) {
+                const cJSON *field = cJSON_GetObjectItemCaseSensitive(json, json_fields[i]);
+                char value[32];
+                if (cJSON_IsString(field)) offer_size(&best, file, field->valuestring, 2, true, true);
+                else if (cJSON_IsNumber(field) && field->valuedouble > 0 &&
+                         field->valuedouble <= 9007199254740991.0 && floor(field->valuedouble) == field->valuedouble) {
+                    snprintf(value, sizeof value, "%.0f", field->valuedouble);
+                    offer_size(&best, file, value, 2, true, true);
+                }
+            }
+        }
+        cJSON_Delete(json);
     }
     file->status = best.ambiguous ? REMOTE_METADATA_AMBIGUOUS : best.rank ? REMOTE_METADATA_FOUND : REMOTE_METADATA_NO_SIZE;
     file->confidence = best.rank;
@@ -784,6 +846,8 @@ typedef struct {
 
 static int page_link(const Response *page, const Release *r, const Release *locator, PageLink *link) {
     for (const char *tag = page->body; (tag = strchr(tag, '<')); tag++) {
+        const char *next = skip_markup(tag);
+        if (next != tag) { tag = next - 1; continue; }
         if ((tag[1] != 'a' && tag[1] != 'A') || !isspace((unsigned char)tag[2])) continue;
         const char *end = strchr(tag, '>');
         if (!end) break;
@@ -821,10 +885,9 @@ static int page_link(const Response *page, const Release *r, const Release *loca
             if (format > 0) continue;
             candidate.recognized = !format;
             if (!download && !candidate.recognized) {
-                char label[16];
-                const char *close = strchr(end + 1, '<');
-                if (!close || !html_text(end + 1, (size_t)(close - end - 1), label, sizeof label) ||
-                    strcasecmp(label, "Download")) continue;
+                char label[96];
+                if (!element_text(tag, end, label, sizeof label) ||
+                    (strcasecmp(label, "Download") && strcasecmp(label, "Download file"))) continue;
             }
         }
         if (!safe_page_name(candidate.filename)) candidate.filename[0] = 0;
@@ -843,12 +906,121 @@ static void file_metadata(const Release *file, RemoteFileMetadata *metadata) {
     copy_text(metadata->compression, sizeof metadata->compression, file->compression);
 }
 
+static const char *mime_suffix(const char *mime) {
+    const struct { const char *mime, *suffix; } types[] = {
+        {"application/vnd.rar", ".rar"}, {"application/x-rar-compressed", ".rar"},
+        {"application/zip", ".zip"}, {"application/x-7z-compressed", ".7z"},
+    };
+    for (size_t i = 0; i < sizeof types / sizeof *types; i++)
+        if (!strcasecmp(mime, types[i].mime)) return types[i].suffix;
+    return NULL;
+}
+
+static bool page_value(const char *html, const char *key, char *out, size_t cap) {
+    for (const char *p = html; (p = find_text(p, key)); p += strlen(key)) {
+        const char *value = p + strlen(key);
+        if (*value == '"' || *value == '\'') value++;
+        value += strspn(value, " \t\r\n");
+        if (*value != ':' && *value != '=') continue;
+        value++;
+        value += strspn(value, " \t\r\n");
+        if (*value != '"' && *value != '\'') continue;
+        const char *end = strchr(value + 1, *value);
+        if (end && end - value > 1 && (size_t)(end - value) <= cap)
+            return html_text(value + 1, (size_t)(end - value - 1), out, cap);
+    }
+    for (const char *tag = html; (tag = strchr(tag, '<')); ) {
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        char name[32];
+        if (end - tag <= 2048 &&
+            (tag_is(tag + 1, "meta") || tag_is(tag + 1, "input")) &&
+            tag_value(tag, end, "name", name, sizeof name) && !strcasecmp(name, key) &&
+            (tag_value(tag, end, "content", out, cap) || tag_value(tag, end, "value", out, cap)))
+            return true;
+        tag = end + 1;
+    }
+    return false;
+}
+
+static bool rootz_page(const char *url) {
+#ifdef ORBIT_TEST
+    if (!strncmp(url, "http://127.0.0.1:", 17)) {
+        const char *path = strchr(url + 17, '/');
+        return path && !strncmp(path, "/metadata/rootz/", 16);
+    }
+#endif
+    return !strncasecmp(url, "https://rootz.so/", 17) || !strncasecmp(url, "https://www.rootz.so/", 21);
+}
+
+static void rootz_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {
+    char id[128], token[512], path[192], url[2048], header[sizeof token + 16];
+    if (!rootz_page(page->url) || !page->body ||
+        (!page_value(page->body, "shortId", id, sizeof id) &&
+         !page_value(page->body, "short-id", id, sizeof id) &&
+         !page_value(page->body, "short_id", id, sizeof id) &&
+         !remote_url_filename(page->url, id, sizeof id)) ||
+        (!page_value(page->body, "pageToken", token, sizeof token) &&
+         !page_value(page->body, "page-token", token, sizeof token) &&
+         !page_value(page->body, "page_token", token, sizeof token) &&
+         !page_value(page->body, "__page_token__", token, sizeof token) &&
+         !page_value(page->body, "X-Page-Token", token, sizeof token))) return;
+    if (strspn(id, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != strlen(id) ||
+        strspn(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.+/=") != strlen(token)) return;
+    snprintf(path, sizeof path, "/api/files/download-by-short?shortId=%s", id);
+    if (!resolve_href(page->url, path, url, sizeof url)) return;
+    snprintf(header, sizeof header, "X-Page-Token: %s", token);
+    Response api = {.cancel = page->cancel, .collect_page = true, .page_token = header};
+    bool ok = fetch(url, &api);
+    cJSON *json = api.body && !api.truncated && !response_challenge(&api) &&
+        (ok || api.status == 404 || api.status == 410) ? cJSON_Parse(api.body) : NULL;
+    const char *status = json_text(json, "status");
+    if (missing_text(status) || !strcasecmp(status, "removed") || !strcasecmp(status, "not_found") ||
+        !strcasecmp(status, "file_not_found") ||
+        response_missing(&api)) {
+        metadata->status = REMOTE_METADATA_MISSING;
+        metadata->size = 0;
+        metadata->filename[0] = 0;
+    } else if (ok && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json, "downloadAllowed"))) {
+        RemoteFileMetadata exact = {0};
+        const char *name = json_text(json, "fileName");
+        const char *mime = json_text(json, "mimeType");
+        Release file = *r;
+        if (strlen(name) < sizeof file.filename && safe_page_name(name) &&
+            !remote_file_detected_format(&file, name, mime_suffix(mime))) file_metadata(&file, &exact);
+        const cJSON *size = cJSON_GetObjectItemCaseSensitive(json, "size");
+        if (cJSON_IsNumber(size) && size->valuedouble > 0 && size->valuedouble <= 9007199254740991.0 &&
+            floor(size->valuedouble) == size->valuedouble) {
+            exact.size = (int64_t)size->valuedouble;
+            exact.exact = true;
+        } else if (cJSON_IsString(size) && *size->valuestring &&
+                   strspn(size->valuestring, "0123456789") == strlen(size->valuestring)) {
+            size_value(size->valuestring, true, &exact.size, &exact.exact);
+        }
+        if (exact.filename[0] || exact.size) {
+            if (!exact.size) { exact.size = metadata->size; exact.exact = metadata->exact; }
+            exact.attempted = metadata->attempted;
+            exact.http_status = metadata->http_status;
+            copy_text(exact.effective_host, sizeof exact.effective_host, metadata->effective_host);
+            exact.confidence = exact.exact ? 4 : metadata->confidence;
+            exact.status = exact.size ? REMOTE_METADATA_FOUND : REMOTE_METADATA_NO_SIZE;
+            *metadata = exact;
+        }
+
+
+    }
+    cJSON_Delete(json);
+    free(api.body);
+}
+
 /* Keep only stable, independently validated public provider pages. */
-cJSON *remote_pspkg_links(const char *html) {
+static cJSON *pspkg_page_links(const char *html, const char *page, const char *heading) {
     cJSON *links = cJSON_CreateArray();
     if (!links) return NULL;
     char edition[256] = "";
-    bool base = true;
+    if (heading) copy_text(edition, sizeof edition, heading);
+    bool base = !phrase(edition, "update") && !phrase(edition, "patch") &&
+                !phrase(edition, "backport") && !phrase(edition, "dlc");
     for (const char *tag = html; (tag = strchr(tag, '<')) && cJSON_GetArraySize(links) < PSPKG_LINK_LIMIT;) {
         const char *next = skip_markup(tag);
         if (next != tag) { tag = next; continue; }
@@ -865,9 +1037,22 @@ cJSON *remote_pspkg_links(const char *html) {
         if (!tag_is(current + 1, "a")) continue;
         char href[2048], label[128] = "";
         if (!tag_value(current, end, "href", href, sizeof href)) continue;
-        const char *provider = remote_browser_provider(href);
-        if (!*provider || !strcmp(provider, "pspkg")) continue;
         element_text(current, end, label, sizeof label);
+        char resolved[2048];
+        bool valid = !page || resolve_href(page, href, resolved, sizeof resolved);
+        if (page && valid) copy_text(href, sizeof href, resolved);
+        const char *provider = valid ? remote_browser_provider(href) : "";
+        bool file = valid && (strstr(href, ".pkg") || strstr(href, ".7z") ||
+            strstr(href, ".zip") || strstr(href, ".rar") || strstr(href, ".exfat") || strstr(href, ".ffpfsc"));
+        bool intermediate = page && valid && strstr(href, "/download.php?") &&
+            (!strncmp(href, "https://pspkg.com/", 18)
+#ifdef ORBIT_TEST
+             || (!strncmp(href, "http://127.0.0.1:", 17) && !strncmp(page, href, (size_t)(strchr(page + 17, '/') - page)))
+#endif
+            );
+        if ((!page && !*provider) || !strcmp(provider, "pspkg") ||
+            (page && !*edition && !intermediate)) continue;
+        if (page && !*provider && !file && !intermediate && !phrase(label, "download")) continue;
         cJSON *item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "url", href);
         cJSON_AddStringToObject(item, "name", provider);
@@ -914,7 +1099,10 @@ cJSON *remote_pspkg_links(const char *html) {
             part += strspn(part, " #._-");
             if (isdigit((unsigned char)*part)) cJSON_AddNumberToObject(item, "part", strtol(part, NULL, 10));
         }
-        if (unsupported) cJSON_AddStringToObject(item, "filterReason", "unsupported-format");
+        if (intermediate) cJSON_AddTrueToObject(item, "intermediate");
+        if (page && (!valid || (!*provider && !file && !intermediate)))
+            cJSON_AddStringToObject(item, "filterReason", "unsafe-url");
+        else if (unsupported) cJSON_AddStringToObject(item, "filterReason", "unsupported-format");
         else if (multipart) cJSON_AddStringToObject(item, "filterReason", "multipart");
         else if (!base) cJSON_AddStringToObject(item, "filterReason", "unsupported-category");
         else cJSON_AddStringToObject(item, "filterReason", "");
@@ -938,42 +1126,75 @@ cJSON *remote_pspkg_links(const char *html) {
     return links;
 }
 
-static void archive_metadata(const Release *release, RemoteFileMetadata *file) {
-    static const char prefix[] = "https://archive.org/details/";
-    if (strncmp(release->browser_url, prefix, sizeof prefix - 1)) return;
-    char url[256];
-    int n = snprintf(url, sizeof url, "https://archive.org/metadata/%s", release->browser_url + sizeof prefix - 1);
-    if (n < 0 || (size_t)n >= sizeof url) return;
-    Response api = {.collect_page = true, .metadata_only = true};
-    cJSON *json = fetch(url, &api) && !api.truncated && api.body ? cJSON_Parse(api.body) : NULL;
-    const cJSON *item, *files = cJSON_GetObjectItemCaseSensitive(json, "files");
-    Release selected = {0};
-    int64_t bytes = 0;
-    cJSON_ArrayForEach(item, files) {
-        const char *name = json_text(item, "name");
-        const cJSON *private_file = cJSON_GetObjectItemCaseSensitive(item, "private");
-        Release candidate = *release;
-        if (strcmp(json_text(item, "source"), "original") || cJSON_IsTrue(private_file) ||
-            !strcmp(json_text(item, "private"), "true") || remote_file_format(&candidate, name) ||
-            (release->remote_filename[0] && !release->remote_filename_synthetic && strcmp(release->remote_filename, name))) continue;
-        if (selected.filename[0]) { bytes = 0; break; }
-        selected = candidate;
-        const char *value = json_text(item, "size");
-        bool exact = false;
-        if (!size_value(value, true, &bytes, &exact) || !exact) bytes = 0;
-    }
-    if (bytes > 0) {
-        file_metadata(&selected, file);
-        file->size = bytes;
-        file->exact = true;
-        file->confidence = 4;
-        file->status = REMOTE_METADATA_FOUND;
-        if (file->candidate_count < sizeof file->candidates / sizeof *file->candidates)
-            file->candidates[file->candidate_count++] = bytes;
-    }
-    cJSON_Delete(json);
-    free(api.body);
+cJSON *remote_pspkg_links(const char *html) { return pspkg_page_links(html, NULL, NULL); }
+
+cJSON *remote_pspkg_session_links(const char *html, const char *page, const char *heading) {
+    return pspkg_page_links(html, page, heading);
 }
+
+static cJSON *pspkg_field_labels(const char *html) {
+    cJSON *fields = cJSON_CreateObject();
+    char edition[128] = "";
+    for (const char *tag = html; (tag = strchr(tag, '<')) && cJSON_GetArraySize(fields) < PSPKG_LINK_LIMIT;) {
+        const char *next = skip_markup(tag);
+        if (next != tag) { tag = next; continue; }
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        char label[96], id[32];
+        if (tag_value(tag, end, "class", label, sizeof label)) {
+            if (has_label(label, "dpx-edition-title")) element_text(tag, end, edition, sizeof edition);
+            else if (has_label(label, "dpx-gate") && *edition &&
+                     tag_value(tag, end, "data-field-id", id, sizeof id) &&
+                     strspn(id, "0123456789") == strlen(id) &&
+                     !cJSON_HasObjectItem(fields, id)) cJSON_AddStringToObject(fields, id, edition);
+        }
+        tag = end + 1;
+    }
+    return fields;
+}
+
+static bool response_interactive(const Response *page);
+
+/* For revealed URLs that are independently public, use the normal bounded
+ * redirect policy. A browser-only session is never copied into libcurl. */
+cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status, atomic_bool *cancel) {
+    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true};
+    bool ok = fetch(url, &page);
+    *status = REMOTE_METADATA_NETWORK;
+    if (response_challenge(&page)) *status = REMOTE_METADATA_CHALLENGE;
+    else if (page.status == 404 || page.status == 410 || response_missing(&page)) *status = REMOTE_METADATA_MISSING;
+    else if (response_interactive(&page)) *status = REMOTE_METADATA_INTERACTIVE;
+    else if (ok) *status = REMOTE_METADATA_NO_SIZE;
+    cJSON *fields = page.body && !page.truncated ? pspkg_field_labels(page.body) : NULL;
+    free(page.body);
+    return fields;
+}
+
+const char *remote_pspkg_route(const char *url, bool intermediate, atomic_bool *cancel,
+                               char *out, size_t cap) {
+    if (!remote_https_url(url)) return "unsafe-url";
+    Response response = {.cancel = cancel, .collect_page = true, .range = !intermediate};
+    bool ok = fetch(url, &response);
+    const char *status = "";
+    if (response.redirect_rejected || response.code == CURLE_TOO_MANY_REDIRECTS ||
+        response.code == CURLE_UNSUPPORTED_PROTOCOL || response.code == CURLE_URL_MALFORMAT ||
+        (response.status >= 300 && response.status < 400 && !ok)) status = "unsafe-url";
+    else if (response.status == 404 || response.status == 410 || response_missing(&response)) status = "missing-page";
+    else if (*remote_browser_provider(response.url) && strcmp(remote_browser_provider(response.url), "pspkg") &&
+             (ok || response_challenge(&response) || response_interactive(&response))) {
+        if (strlen(response.url) >= cap) status = "unsafe-url";
+        else copy_text(out, cap, response.url);
+    } else if (response_challenge(&response) || response_interactive(&response) ||
+               (intermediate && (response.status == 401 || response.status == 403 ||
+                strstr(response.url, "/download.php?")))) status = "verify-required";
+    else if (!ok || !response.url[0] || strlen(response.url) >= cap) status = "provider-unavailable";
+    else if (response.page && !*remote_browser_provider(response.url)) status = "unsupported-provider";
+    else copy_text(out, cap, response.url);
+    free(response.body);
+    return status;
+}
+
+static void archive_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata);
 
 const char *remote_metadata_status(RemoteMetadataStatus status) {
     static const char *const states[] = {
@@ -996,11 +1217,78 @@ static bool response_interactive(const Response *page) {
     return password && (find_text(page->body, "log in") || find_text(page->body, "sign in"));
 }
 
+/* Share only the public transport response. Each row still interprets it
+ * using its own filename, package format and compression policy. */
+static struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    struct {
+        char url[2048];
+        bool range, loading, ok;
+        time_t expires;
+        Response response;
+    } entries[8];
+} metadata_gets = {.mutex = PTHREAD_MUTEX_INITIALIZER, .changed = PTHREAD_COND_INITIALIZER};
+
+static bool metadata_get(const char *url, Response *response) {
+    const size_t count = sizeof metadata_gets.entries / sizeof *metadata_gets.entries;
+    if (strlen(url) >= sizeof metadata_gets.entries[0].url) return false;
+    pthread_mutex_lock(&metadata_gets.mutex);
+    size_t slot;
+    for (;;) {
+        size_t oldest = count, match = count;
+        time_t now = time(NULL);
+        for (size_t i = 0; i < count; i++) {
+            if (metadata_gets.entries[i].range == response->range &&
+                !strcmp(metadata_gets.entries[i].url, url) &&
+                (metadata_gets.entries[i].loading || metadata_gets.entries[i].expires > now)) {
+                match = i;
+                break;
+            }
+            if (!metadata_gets.entries[i].loading &&
+                (oldest == count || metadata_gets.entries[i].expires < metadata_gets.entries[oldest].expires))
+                oldest = i;
+        }
+        if (match == count) { slot = oldest; break; }
+        if (metadata_gets.entries[match].loading) {
+            pthread_cond_wait(&metadata_gets.changed, &metadata_gets.mutex);
+            continue;
+        }
+        *response = metadata_gets.entries[match].response;
+        response->body = response->body ? strdup(response->body) : NULL;
+        bool ok = metadata_gets.entries[match].ok;
+        pthread_mutex_unlock(&metadata_gets.mutex);
+        return ok;
+    }
+    if (slot < count) {
+        free(metadata_gets.entries[slot].response.body);
+        metadata_gets.entries[slot].response.body = NULL;
+        copy_text(metadata_gets.entries[slot].url, sizeof metadata_gets.entries[slot].url, url);
+        metadata_gets.entries[slot].range = response->range;
+        metadata_gets.entries[slot].loading = true;
+    }
+    pthread_mutex_unlock(&metadata_gets.mutex);
+    bool ok = fetch(url, response);
+    if (slot < count) {
+        pthread_mutex_lock(&metadata_gets.mutex);
+        metadata_gets.entries[slot].response = *response;
+        metadata_gets.entries[slot].response.body = response->body ? strdup(response->body) : NULL;
+        metadata_gets.entries[slot].ok = ok;
+        metadata_gets.entries[slot].expires = time(NULL) + 30;
+        metadata_gets.entries[slot].loading = false;
+        pthread_cond_broadcast(&metadata_gets.changed);
+        pthread_mutex_unlock(&metadata_gets.mutex);
+    }
+    return ok;
+}
+
 bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJSON **links) {
     memset(metadata, 0, sizeof *metadata);
     if (!remote_metadata_option(r)) return false;
-    Response page = {.collect_page = true, .metadata_only = true};
-    bool ok = fetch(r->browser_url, &page);
+    bool direct = !remote_page_pending(r);
+    const char *url = provider_torbox_url(r);
+    Response page = {.collect_page = true, .metadata_only = !direct, .range = direct};
+    bool ok = metadata_get(url, &page);
     metadata->http_status = page.status;
     metadata->attempted = true;
     copy_text(metadata->effective_host, sizeof metadata->effective_host, page.effective_host);
@@ -1017,14 +1305,17 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     else if (page.truncated && page.page) metadata->status = REMOTE_METADATA_TOO_LARGE;
     else if (!page.page) {
         Release file = *r;
-        if (!file_from_response(&file, &page, r->browser_url, NULL)) {
+        if (!file_from_response(&file, &page, url, NULL)) {
             file_metadata(&file, metadata);
             metadata->size = file.size;
             metadata->exact = true;
             metadata->confidence = 4;
             metadata->status = REMOTE_METADATA_FOUND;
+        } else if (direct && page.size <= 0 && download_file_magic(r, page.sample, page.used)) {
+            metadata->status = REMOTE_METADATA_NO_SIZE;
         } else metadata->status = REMOTE_METADATA_UNSUPPORTED;
-    } else if (page.body) {
+    } else if (direct) metadata->status = REMOTE_METADATA_NO_SIZE;
+    else if (page.body) {
         Release file = *r;
         char name[sizeof file.filename] = "";
         const char *anchor = NULL;
@@ -1037,8 +1328,16 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
             }
         }
         page_size(page.body, anchor, name, metadata);
-        if (named) {
+        const char *title = find_text(page.body, "<title>");
+        char title_text[512];
+        if (title && element_text(title, title + 6, title_text, sizeof title_text) &&
+            (phrase(title_text, "LZ4") || phrase(title_text, "ZSTD") || phrase(title_text, "PFS"))) {
+            metadata->status = REMOTE_METADATA_UNSUPPORTED;
+            metadata->size = 0;
+            metadata->exact = false;
+        } else if (named) {
             int format = remote_file_format(&file, name);
+            if (!format && r->compression[0] && strcmp(r->compression, file.compression)) format = 1;
             if (!format) file_metadata(&file, metadata);
             else if (format > 0) {
                 metadata->status = REMOTE_METADATA_UNSUPPORTED;
@@ -1048,10 +1347,27 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
             } else if (safe_page_name(name)) copy_text(metadata->filename, sizeof metadata->filename, name);
         }
     } else metadata->status = REMOTE_METADATA_NO_SIZE;
+    if (ok && page.page && rootz_page(page.url)) rootz_metadata(&page, r, metadata);
     if (ok && (metadata->status == REMOTE_METADATA_FOUND || metadata->status == REMOTE_METADATA_NO_SIZE ||
                metadata->status == REMOTE_METADATA_AMBIGUOUS))
-        archive_metadata(r, metadata);
+        archive_metadata(&page, r, metadata);
     const bool pspkg = !strcmp(remote_browser_provider(r->browser_url), "pspkg");
+    if (pspkg && page.body && !page.truncated) {
+        cJSON *fields = pspkg_field_labels(page.body);
+        const cJSON *edition;
+        size_t count = 0;
+        cJSON_ArrayForEach(edition, fields) {
+            const char *label = edition->valuestring;
+            if (!label || count == sizeof metadata->pspkg_title_ids / sizeof *metadata->pspkg_title_ids) break;
+            for (const char *p = label; *p; p++) {
+                if (strncasecmp(p, "CUSA", 4) && strncasecmp(p, "PPSA", 4)) continue;
+                if (strspn(p + 4, "0123456789") != 5) continue;
+                snprintf(metadata->pspkg_title_ids[count++], 10, "%.9s", p);
+                break;
+            }
+        }
+        cJSON_Delete(fields);
+    }
     if (pspkg && links && page.body && !page.truncated && !response_challenge(&page) &&
         (ok || metadata->status == REMOTE_METADATA_INTERACTIVE)) {
         *links = remote_pspkg_links(page.body);
@@ -1075,9 +1391,11 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
     }
     free(page.body);
     return true;
+
 }
 
-static int archive_link(const Response *page, Release *r, char *url, size_t cap) {
+static int archive_file(const Response *page, const Release *r, char *url, size_t cap,
+                        RemoteFileMetadata *file_info) {
     const char prefix[] = "https://archive.org/details/";
     if (strncmp(page->url, prefix, sizeof prefix - 1)) return -1;
     const char *id = page->url + sizeof prefix - 1;
@@ -1088,7 +1406,9 @@ static int archive_link(const Response *page, Release *r, char *url, size_t cap)
         return -1;
     Response metadata = {.cancel = page->cancel, .collect_page = true};
     int result = -1;
-    if (fetch(path, &metadata) && metadata.body && !metadata.truncated) {
+    bool ok = fetch(path, &metadata);
+    if (response_missing(&metadata)) result = REMOTE_DOWNLOAD_MISSING;
+    else if (ok && metadata.body && !metadata.truncated) {
         cJSON *root = cJSON_Parse(metadata.body);
         const cJSON *files = cJSON_GetObjectItemCaseSensitive(root, "files"), *entry;
         cJSON_ArrayForEach(entry, files) {
@@ -1098,7 +1418,16 @@ static int archive_link(const Response *page, Release *r, char *url, size_t cap)
             if (strcmp(json_text(entry, "source"), "original") ||
                 cJSON_IsTrue(private_file) || !strcmp(json_text(entry, "private"), "true") ||
                 remote_file_format(&file, name)) continue;
-            if (result == 0) { result = -2; break; }
+            if (result == 0) { result = -3; break; }
+            if (file_info) {
+                file_metadata(&file, file_info);
+                const cJSON *size = cJSON_GetObjectItemCaseSensitive(entry, "size");
+                if (cJSON_IsString(size)) size_value(size->valuestring, true, &file_info->size, &file_info->exact);
+                file_info->confidence = file_info->size ? 4 : 0;
+                file_info->status = file_info->size ? REMOTE_METADATA_FOUND : REMOTE_METADATA_NO_SIZE;
+                result = 0;
+                continue;
+            }
             char *encoded = curl_easy_escape(NULL, name, 0);
             int length = encoded ? snprintf(url, cap, "https://archive.org/download/%.*s/%s", (int)n, id, encoded) : -1;
             if (length > 0 && (size_t)length < cap) result = 0;
@@ -1110,13 +1439,27 @@ static int archive_link(const Response *page, Release *r, char *url, size_t cap)
     return result;
 }
 
+static void archive_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {
+    RemoteFileMetadata file = {0};
+    int result = archive_file(page, r, NULL, 0, &file);
+    if (!result) {
+        file.attempted = metadata->attempted;
+        file.http_status = metadata->http_status;
+        copy_text(file.effective_host, sizeof file.effective_host, metadata->effective_host);
+        *metadata = file;
+    }
+    if (result == REMOTE_DOWNLOAD_MISSING) metadata->status = REMOTE_METADATA_MISSING;
+}
+
 /* 0: verified direct file, 1: continue with Orbit's supported provider browser,
  * -1: no supported file can be determined from the selected option. */
 int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, char *error, size_t cap) {
     Response page = {.cancel = cancel, .collect_page = true};
     int result = -1;
     const char *selected_page = provider_torbox_url(r);
-    if (!fetch(selected_page, &page) || response_challenge(&page) || response_interactive(&page)) {
+    bool ok = fetch(selected_page, &page);
+    if (response_missing(&page)) { result = REMOTE_DOWNLOAD_MISSING; goto done; }
+    if (!ok || response_challenge(&page) || response_interactive(&page)) {
         if (response_challenge(&page) || response_interactive(&page)) {
             const char *provider = remote_browser_provider(selected_page);
             if (provider_browser_source(provider) && strcmp(provider, "pspkg")) {
@@ -1135,6 +1478,11 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         goto done;
     }
     if (!page.body || !page.used) goto done;
+    if (rootz_page(page.url)) {
+        RemoteFileMetadata file = {0};
+        rootz_metadata(&page, r, &file);
+        if (file.status == REMOTE_METADATA_MISSING) { result = REMOTE_DOWNLOAD_MISSING; goto done; }
+    }
     const char *provider = remote_browser_provider(page.url);
     if (!provider_browser_source(provider)) provider = "";
     if (*provider) {
@@ -1153,16 +1501,20 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
     }
     if (!strncmp(page.url, "https://archive.org/details/", 28)) {
         char direct[sizeof r->url] = "";
-        int link = archive_link(&page, r, direct, sizeof direct);
-        if (!link && !remote_download_verify(r, direct, cancel, error, cap)) result = 0;
-        if (link == -2) copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
+        int link = archive_file(&page, r, direct, sizeof direct, NULL);
+        if (!link) {
+            int verified = remote_download_verify(r, direct, cancel, error, cap);
+            if (!verified || verified == REMOTE_DOWNLOAD_MISSING) result = verified;
+        }
+        if (link == REMOTE_DOWNLOAD_MISSING) result = link;
+        if (link == -3) copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
         goto done;
     }
     PageLink link = {0};
     int found = page.truncated ? -1 : page_link(&page, r, *provider ? locator : NULL, &link);
     if (!found) {
         Release file = *r;
-        Response response = {.cancel = cancel};
+        Response response = {.cancel = cancel, .collect_page = true, .range = true};
         char heading[sizeof file.filename];
         const char *name = NULL;
         if (link.pinned) {
@@ -1171,7 +1523,11 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         } else if (!*provider && !link.recognized && page_filename(page.body, r, heading, sizeof heading, NULL)) {
             name = heading;
         }
-        if (fetch(link.url, &response) && !file_from_response(&file, &response, link.url, name)) {
+        bool received = fetch(link.url, &response);
+        bool missing = response_missing(&response);
+        free(response.body);
+        if (missing) { result = REMOTE_DOWNLOAD_MISSING; goto done; }
+        if (received && !file_from_response(&file, &response, link.url, name)) {
             *r = file;
             result = 0;
             goto done;
@@ -1182,7 +1538,8 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
 done:
     free(page.body);
-    if (result < 0 && !error[0])
+    if (result == REMOTE_DOWNLOAD_MISSING) copy_text(error, cap, REMOTE_FILE_REMOVED);
+    else if (result < 0 && !error[0])
         copy_text(error, cap, "This option did not identify a supported PKG, FPKG, RAR or ZIP download.");
     return result;
 }

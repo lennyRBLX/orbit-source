@@ -30,8 +30,10 @@ typedef struct {
     char browser_url[256];
     char remote_catalog_id[25]; /* Empty for built-in download providers. */
     char remote_label[128]; /* Download link label from a community catalogue. */
-    char remote_version[32], remote_region[32], remote_filename[160], remote_source_page[256];
+    char remote_version[32], remote_region[32], remote_edition[128], remote_filename[160], remote_source_page[256];
     bool remote_filename_synthetic;
+    char remote_format_hint[12], remote_compression_hint[8];
+    char remote_choice[65]; /* Stable fingerprint of a revealed PSPKG choice. */
     char remote_provider_page[256]; /* Public provider selected for a PSPKG job. */
     char mirror_key[65]; /* Shared identity of verified community mirrors, when available. */
     bool remote_page; /* Stable catalogue identity is the selected provider page. */
@@ -62,6 +64,9 @@ typedef struct {
     char source[1100]; /* What a move or delete takes away, absolute; may be empty. */
 } StorageHold;
 enum { HOLD_FILES, HOLD_RECEIVE, HOLD_LIBRARY, HOLD_COUNT };
+typedef enum {
+    DEBRID_UNTRIED, DEBRID_PROCESSING, DEBRID_READY, DEBRID_MISSING, DEBRID_FAILED, DEBRID_TRANSIENT
+} DebridResult;
 typedef struct {
     Release release; /* Immutable download identity, independent of catalogue refreshes. */
     char id[24], release_id[24], storage_id[24], root[512], filename[256];
@@ -71,6 +76,9 @@ typedef struct {
     char mirror_id[24]; /* Current alternate, or empty while using the original link. */
     char mirror_first[24]; /* An alternate used before the original to enable TorBox. */
     bool mirror_torbox; /* Keep preferring TorBox after trying a direct-only mirror. */
+    DebridResult debrid_fallback; /* Result that sent this provider route to direct. */
+    bool direct_missing; /* A return to TorBox must not try this direct route again. */
+    bool mirror_verified; /* Current alternate's direct file is already pinned in release. */
     bool browser_pending; /* The original provider still needs to resolve a file URL. */
     int64_t debrid_id, debrid_file;
     bool debrid_submitted;
@@ -78,6 +86,7 @@ typedef struct {
     /* TorBox progress last seen while it prepares the file; memory only. */
     double debrid_progress;
     time_t debrid_watch;
+    unsigned debrid_retries;
     int64_t received, total;
     /* Equal partitions; persisted cursors advance only after the writer fsyncs. */
     int64_t range_received[ORBIT_MAX_RANGES];
@@ -256,6 +265,9 @@ int job_create_locked(const char *release_id, const char *storage_id, char *erro
                       Job **result);
 int job_create_delivery_locked(const char *release_id, const char *storage_id,
                                 const char *delivery, char *error, size_t cap, Job **result);
+bool job_advance_mirror_locked(Job *job);
+int job_create_torbox_recovery_locked(const Release *release, const Release *route, const Storage *storage,
+                                      char *error, size_t cap, Job **result);
 int job_check_capture_locked(const Release *release, const Storage *destination, char *error, size_t cap);
 bool job_assign_remote_file_locked(Job *job, const Release *file, char *error, size_t cap);
 bool job_needs_browser(const Release *release);

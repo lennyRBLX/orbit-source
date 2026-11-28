@@ -40,8 +40,7 @@ bool pspkg_download_page(const char *game, char *out, size_t cap) {
     const char *path, *platform, *name, *digits, *suffix;
     if (!origin(game, &path) || !section(path, &platform, &name) ||
         !game_name(name, &digits, &suffix) || !strncmp(name, "download-", 9)) return false;
-    int n = snprintf(out, cap, "%.*sdownload-%s?id=%.*s",
-                     (int)(name - game), game, name, (int)(suffix - digits), digits);
+    int n = snprintf(out, cap, "%.*sdownload-%s", (int)(name - game), game, name);
     return n > 0 && (size_t)n < cap;
 }
 
@@ -49,9 +48,12 @@ bool pspkg_page_matches(const char *game, const char *page) {
     char expected[2048];
     if (!page || !pspkg_download_page(game, expected, sizeof expected)) return false;
     if (!strcmp(expected, page)) return true;
-    char *query = strchr(expected, '?');
-    if (query) *query = 0;
-    return !strcmp(expected, page);
+    const char *path, *platform, *name, *digits, *suffix;
+    if (!origin(game, &path) || !section(path, &platform, &name) || !game_name(name, &digits, &suffix)) return false;
+    size_t length = strlen(expected);
+    return !strncmp(expected, page, length) && !strncmp(page + length, "?id=", 4) &&
+        strlen(page + length + 4) == (size_t)(suffix - digits) &&
+        !strncmp(page + length + 4, digits, (size_t)(suffix - digits));
 }
 
 bool pspkg_page_identity(const char *page, char *platform, size_t platform_cap,
@@ -135,6 +137,22 @@ void pspkg_scan_links(const unsigned char *bytes, size_t length, const char *pla
             size_t boundary = at;
             unsigned char next;
             if (read_char(bytes, length, &boundary, step, &next) && isdigit(next)) continue;
+            /* Preserve the remainder of the revealed href, including any
+             * query parameters. Never synthesize browser/session parameters. */
+            char tail[1800] = "";
+            size_t used = 0;
+            while (at + step <= length) {
+                size_t end = at;
+                unsigned char c;
+                if (!read_char(bytes, length, &end, step, &c) ||
+                    c <= 32 || c >= 127 || strchr("\"'<>`\\#", c)) break;
+                if (used + 1 >= sizeof tail) break;
+                size_t escaped = at;
+                if (c == '&' && literal(bytes, length, &escaped, step, "&amp;")) end = escaped;
+                tail[used++] = (char)c;
+                at = end;
+            }
+            if (used + 1 >= sizeof tail) continue;
             bool duplicate = false;
             for (size_t j = 0; j < *count; j++)
                 if (!strcmp(links[j].link_id, link) && !strcmp(links[j].edition_id, edition))
@@ -144,8 +162,10 @@ void pspkg_scan_links(const unsigned char *bytes, size_t length, const char *pla
             memcpy(target->edition_id, edition, strlen(edition) + 1);
             memcpy(target->link_id, link, strlen(link) + 1);
             snprintf(target->url, sizeof target->url,
-                     "https://pspkg.com/%s/download.php?game_id=%s&edition_id=%s&link_id=%s&browser_type=other",
-                     platform, game_id, edition, link);
+                     "https://pspkg.com/%s/download.php?game_id=%s&edition_id=%s&link_id=%s%s",
+                     platform, game_id, edition, link, tail);
+            target->intermediate = true;
+            snprintf(target->label, sizeof target->label, "PSPKG");
         }
     }
 }

@@ -67,6 +67,7 @@ enum MetadataState { META_EMPTY, META_QUEUED, META_LOADING, META_DONE };
 typedef struct {
     char id[24];
     enum MetadataState state;
+    unsigned sequence;
     time_t expires;
     RemoteFileMetadata file;
     cJSON *public_links;
@@ -76,8 +77,29 @@ static struct {
     pthread_cond_t changed;
     pthread_t threads[2];
     size_t count;
+    unsigned sequence;
+    time_t next_missing_expiry;
     MetadataRequest requests[METADATA_LIMIT];
 } metadata = {.changed = PTHREAD_COND_INITIALIZER};
+
+static MetadataRequest *metadata_request_locked(const char *id, time_t now);
+
+typedef struct {
+    char title_id[sizeof ((Release *)0)->title_id];
+    unsigned long generation, used;
+    Release *rows;
+    size_t count;
+} TitleOptions;
+
+static TitleOptions title_options[4];
+static unsigned long title_usage;
+
+Release *remote_title_find_locked(const char *id) {
+    for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++)
+        for (size_t i = 0; i < title_options[slot].count; i++)
+            if (!strcmp(title_options[slot].rows[i].id, id)) return &title_options[slot].rows[i];
+    return NULL;
+}
 
 static const char *const errors[] = {
     "", "network", "http", "too-large", "invalid-catalogue", "invalid-entries", "storage", "limit",
@@ -134,6 +156,15 @@ bool remote_next_mirror_locked(const Release *release, const char *after, Releas
             mirror_enabled(release, next))
             best = next;
     }
+    for (size_t slot = 0; slot < sizeof title_options / sizeof *title_options; slot++) {
+        const TitleOptions *options = &title_options[slot];
+        if (!release->mirror_key[0] || strcmp(options->title_id, release->title_id)) continue;
+        for (size_t i = 0; i < options->count; i++) {
+            const Release *next = &options->rows[i];
+            if (strcmp(next->id, after) > 0 && (!best || strcmp(next->id, best->id) <= 0) &&
+                mirror_enabled(release, next)) best = next;
+        }
+    }
     if (best) *mirror = *best;
     return best != NULL;
 }
@@ -162,6 +193,18 @@ static void invalidate_locked(void) {
 /* Retry empty catalogues between the regular refreshes. */
 void remote_sources_tick(void) {
     pthread_mutex_lock(&orbit.mutex);
+    time_t now = time(NULL);
+    if (metadata.next_missing_expiry && metadata.next_missing_expiry <= now) {
+        metadata.next_missing_expiry = 0;
+        for (size_t i = 0; i < METADATA_LIMIT; i++) {
+            const MetadataRequest *request = &metadata.requests[i];
+            if (request->state == META_DONE && request->file.status == REMOTE_METADATA_MISSING &&
+                request->expires > now &&
+                (!metadata.next_missing_expiry || request->expires < metadata.next_missing_expiry))
+                metadata.next_missing_expiry = request->expires;
+        }
+        catalog_view_invalidate_locked();
+    }
     if (remote.started && !remote.empty_pending && !remote.busy && refresh_clock() >= remote.empty_after) {
         for (size_t i = 0; i < SOURCE_COUNT; i++) {
             if (!needs_empty_retry(&remote.sources[i])) continue;
@@ -317,6 +360,123 @@ cJSON *remote_source_package_diagnostics_locked(const char *source, const char *
     return result;
 }
 
+static TitleOptions *load_title_options_locked(const char *title_id) {
+    TitleOptions *slot = &title_options[0];
+    for (size_t i = 0; i < sizeof title_options / sizeof *title_options; i++) {
+        TitleOptions *candidate = &title_options[i];
+        if (!strcmp(candidate->title_id, title_id)) {
+            slot = candidate;
+            if (slot->generation == remote.generation) {
+                slot->used = ++title_usage;
+                return slot;
+            }
+            break;
+        }
+        if (candidate->used < slot->used) slot = candidate;
+    }
+    free(slot->rows);
+    *slot = (TitleOptions){.generation = remote.generation, .used = ++title_usage};
+    copy_text(slot->title_id, sizeof slot->title_id, title_id);
+    for (size_t i = 0; i < SOURCE_COUNT; i++) {
+        const RemoteSource *source = &remote.sources[i];
+        if (!strcmp(source->id, PADRINO_SOURCE) || pspkg_source(source->id)) continue;
+        char name[32];
+        snprintf(name, sizeof name, "%s.json", source->id);
+        size_t length = 0;
+        char *body = read_file(remote.cache_fd, name, BODY_LIMIT, &length);
+        if (!body) continue;
+        size_t count = 0;
+        Release *rows = NULL;
+        if (!remote_catalog_title(body, length, source->id, title_id, &rows, &count) && count) {
+            Release *next = realloc(slot->rows, (slot->count + count) * sizeof *next);
+            if (next) {
+                slot->rows = next;
+                memcpy(next + slot->count, rows, count * sizeof *rows);
+                slot->count += count;
+            }
+        }
+        free(rows);
+        free(body);
+    }
+    return slot;
+}
+
+static void normalized_title(const char *name, char out[128]) {
+    size_t n = 0;
+    bool space = false;
+    for (const unsigned char *p = (const unsigned char *)name; *p && n < 125; p++) {
+        if (*p < 128 && !isalnum(*p)) { space = n > 0; continue; }
+        if (space) out[n++] = ' ';
+        space = false;
+        out[n++] = (char)tolower(*p);
+    }
+    out[n] = 0;
+}
+
+static bool pspkg_matches(const Release *selected, const Release *candidate) {
+    if (strcmp(selected->platform, candidate->platform)) return false;
+    if (!strcmp(selected->id, candidate->id) || !strcmp(selected->title_id, candidate->title_id)) return true;
+    if (strlen(candidate->title_id) == 9) return false;
+    char name[128], listing[128];
+    normalized_title(selected->title, name);
+    normalized_title(candidate->title, listing);
+    size_t n = strlen(name);
+    if (!n || strncmp(name, listing, n)) return false;
+    const char *edition = listing + n;
+    if (!*edition || !strcmp(edition, " ps4") || !strcmp(edition, " ps5") ||
+        !strcmp(edition, " ultimate edition") || !strcmp(edition, " deluxe edition") ||
+        !strcmp(edition, " complete edition") || !strcmp(edition, " game of the year edition")) return true;
+    const char *plus = strchr(candidate->title, '+');
+    if (!plus) return false;
+    char base[sizeof candidate->title];
+    snprintf(base, sizeof base, "%.*s", (int)(plus - candidate->title), candidate->title);
+    normalized_title(base, listing);
+    return !strcmp(name, listing);
+}
+
+cJSON *remote_title_options_locked(const Release *selected) {
+    if (!selected || selected->addon_id[0]) return NULL;
+    /* selected can itself belong to an earlier Details lookup. */
+    Release title = *selected;
+    cJSON *root = cJSON_CreateObject();
+    cJSON *options = cJSON_AddArrayToObject(root, "releases");
+    cJSON *pspkg = cJSON_AddArrayToObject(root, "pspkg");
+    if (!options || !pspkg) { cJSON_Delete(root); return NULL; }
+    TitleOptions *slot = load_title_options_locked(title.title_id);
+    for (size_t i = 0; i < slot->count; i++) {
+        const Release *row = &slot->rows[i];
+        const Release *members[128];
+        size_t count = 0;
+        for (size_t j = 0; row->mirror_key[0] && j < slot->count && count < 128; j++)
+            if (!strcmp(row->mirror_key, slot->rows[j].mirror_key)) members[count++] = &slot->rows[j];
+        if (count && members[0] != row) continue;
+        cJSON *entry = catalog_remote_choice_locked(row, members, count);
+        if (entry) cJSON_AddItemToArray(options, entry);
+    }
+    const RemoteSource *index = find(!strcmp(title.platform, "ps4") ? PSPKG_PS4_SOURCE : PSPKG_PS5_SOURCE);
+    cJSON_AddBoolToObject(root, "pspkgIndexed", index && index->entries);
+    bool pending = false;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < orbit.remote_release_count && cJSON_GetArraySize(pspkg) < 32; i++) {
+        const Release *r = &orbit.remote_releases[i];
+        if (!pspkg_source(r->remote_catalog_id) || !pspkg_matches(&title, r)) continue;
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddStringToObject(entry, "id", r->id);
+        cJSON_AddStringToObject(entry, "title", r->title);
+        bool match = !strcmp(title.title_id, r->title_id) && strlen(r->title_id) == 9;
+        if (!match && metadata.count && strlen(title.title_id) == 9) {
+            const MetadataRequest *request = metadata_request_locked(r->id, now);
+            if (!request || request->state != META_DONE) pending = true;
+            else for (size_t j = 0; j < sizeof request->file.pspkg_title_ids / sizeof *request->file.pspkg_title_ids; j++)
+                match |= !strcasecmp(title.title_id, request->file.pspkg_title_ids[j]);
+        }
+        cJSON_AddBoolToObject(entry, "titleIdMatch", match);
+        cJSON_AddItemToArray(pspkg, entry);
+    }
+    cJSON_AddBoolToObject(root, "pspkgPending", pending);
+    return root;
+}
+
 static void load_cache_metadata(const cJSON *row, RemoteSource *s) {
     const char *etag = json_text(row, "etag"), *hash = json_text(row, "cacheHash");
     if (valid_etag(etag)) copy_text(s->etag, sizeof s->etag, etag);
@@ -371,6 +531,10 @@ static void cache_load(RemoteSource *s) {
     snprintf(file, sizeof file, "%s.json", s->id);
     size_t length = 0, count, skipped;
     char *body = read_file(remote.cache_fd, file, BODY_LIMIT, &length);
+    if (body && pspkg_source(s->id) && !strstr(body, "\"pspkgIndexVersion\":2")) {
+        s->fetched = 0;
+        s->etag[0] = 0;
+    }
     if (!body) {
         s->etag[0] = s->cache_hash[0] = 0;
         s->fetched = 0;
@@ -404,7 +568,9 @@ int remote_sources_load(void) {
         const char *url = builtin_sources[i].url;
 #ifdef ORBIT_TEST
         const char *fixture = !strcmp(builtin_sources[i].id, "dlps") ? getenv("ORBIT_TEST_CATALOGUE_URL") :
-            !strcmp(builtin_sources[i].id, "pfs") ? getenv("ORBIT_TEST_SECOND_CATALOGUE_URL") : NULL;
+            !strcmp(builtin_sources[i].id, "pfs") ? getenv("ORBIT_TEST_SECOND_CATALOGUE_URL") :
+            !strcmp(builtin_sources[i].id, PSPKG_PS5_SOURCE) ? getenv("ORBIT_TEST_PSPKG_PS5_URL") :
+            !strcmp(builtin_sources[i].id, PSPKG_PS4_SOURCE) ? getenv("ORBIT_TEST_PSPKG_PS4_URL") : NULL;
         if (fixture && !strncmp(fixture, "http://127.0.0.1:", 17) && strlen(fixture) < sizeof source->url)
             url = fixture;
 #endif
@@ -639,6 +805,18 @@ static bool pspkg_game_url(const char *href, const char *platform, const char *b
     return size > 0 && (size_t)size < cap;
 }
 
+static bool pspkg_index_title(const char *start, const char *close, char *out, size_t cap) {
+    for (const char *span = start; (span = strstr(span, "<span")) && span < close; span += 5) {
+        const char *end = strchr(span, '>');
+        const char *text_end = end ? strstr(end, "</span>") : NULL;
+        char classes[64];
+        if (text_end && text_end < close &&
+            pspkg_attribute(span, end, "class", classes, sizeof classes) && !strcmp(classes, "gl-t"))
+            return pspkg_text(end + 1, (size_t)(text_end - end - 1), out, cap);
+    }
+    return pspkg_text(start, (size_t)(close - start), out, cap);
+}
+
 /* PSPKG's games-list pages contain the complete platform index in one
  * response. Save translated rows through the existing durable source cache.
  * The stable download page is inspected only when the title is selected. */
@@ -664,7 +842,7 @@ static const char *pspkg_scan(const RemoteSource *snapshot, Response *response, 
         if (!pspkg_attribute(tag, end, "href", href, sizeof href) ||
             !pspkg_game_url(href, platform, snapshot->url, game, sizeof game) ||
             !pspkg_download_page(game, download, sizeof download) ||
-            !pspkg_text(end + 1, (size_t)(close - end - 1), title, sizeof title)) continue;
+            !pspkg_index_title(end + 1, close, title, sizeof title)) continue;
         char *name = title;
         size_t n = strspn(name, "0123456789");
         size_t len = strlen(name);
@@ -715,6 +893,7 @@ static const char *pspkg_scan(const RemoteSource *snapshot, Response *response, 
         (*discovered)++;
     }
     if (!*discovered) { cJSON_Delete(root); return "invalid-catalogue"; }
+    cJSON_AddNumberToObject(root, "pspkgIndexVersion", 2);
     cJSON_AddBoolToObject(root, "truncated", *truncated);
     cJSON_AddNumberToObject(root, "discovered", *discovered);
     char *body = cJSON_PrintUnformatted(root);
@@ -796,6 +975,21 @@ static void refresh_one(const RemoteSource *snapshot) {
     free(response.data);
 }
 
+static const MetadataRequest *cached_metadata_locked(const char *id, time_t now) {
+    for (size_t i = 0; i < METADATA_LIMIT; i++) {
+        const MetadataRequest *request = &metadata.requests[i];
+        if (request->state == META_DONE && request->expires > now && !strcmp(id, request->id))
+            return request;
+    }
+    return NULL;
+}
+
+bool remote_link_missing_locked(const Release *r) {
+    if (!metadata.next_missing_expiry || strcmp(r->source, "remote")) return false;
+    const MetadataRequest *request = cached_metadata_locked(r->id, time(NULL));
+    return request && request->file.status == REMOTE_METADATA_MISSING;
+}
+
 static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
     MetadataRequest *entry = NULL;
     for (size_t i = 0; i < METADATA_LIMIT; i++) {
@@ -810,15 +1004,32 @@ static MetadataRequest *metadata_request_locked(const char *id, time_t now) {
     }
     if (!entry) return NULL;
     cJSON_Delete(entry->public_links);
-    *entry = (MetadataRequest){.state = META_QUEUED};
+    if (entry->file.status == REMOTE_METADATA_MISSING) catalog_view_invalidate_locked();
+    *entry = (MetadataRequest){.state = META_QUEUED, .sequence = ++metadata.sequence};
     copy_text(entry->id, sizeof entry->id, id);
     pthread_cond_signal(&metadata.changed);
     return entry;
 }
 
-static int file_rank(const RemoteFileMetadata *file) {
-    if (file->size) return 2 + file->confidence;
-    return file->filename[0] ? 1 : 0;
+static void metadata_done_locked(MetadataRequest *request, const RemoteFileMetadata *file) {
+    request->file = *file;
+    request->expires = time(NULL) + (file->size || file->filename[0] || file->status == REMOTE_METADATA_MISSING ? 1800 : 300);
+    request->state = META_DONE;
+    if (file->status == REMOTE_METADATA_MISSING) {
+        if (!metadata.next_missing_expiry || request->expires < metadata.next_missing_expiry)
+            metadata.next_missing_expiry = request->expires;
+        catalog_view_invalidate_locked();
+    }
+}
+
+void remote_mark_missing_locked(const Release *r) {
+    if (strcmp(r->source, "remote")) return;
+    MetadataRequest *request = metadata_request_locked(r->id, time(NULL));
+    if (!request || (request->state == META_DONE && request->file.status == REMOTE_METADATA_MISSING)) return;
+    cJSON_Delete(request->public_links);
+    request->public_links = NULL;
+    const RemoteFileMetadata file = {.status = REMOTE_METADATA_MISSING};
+    metadata_done_locked(request, &file);
 }
 
 static void metadata_snapshot(cJSON *views, cJSON *record, const Release *r, const MetadataRequest *request,
@@ -873,45 +1084,65 @@ cJSON *remote_metadata_json_locked(const char *ids) {
         const Release *candidate = release;
         Release alternate;
         char after[sizeof alternate.id] = "";
-        RemoteFileMetadata best = {0};
+        RemoteFileMetadata file = {0};
+        Release route = {0};
         cJSON *row = cJSON_CreateObject();
         if (!row) continue;
         cJSON_AddStringToObject(row, "id", id);
-        unsigned mirrors = 0;
-        bool conflicting_size = false, group_pending = false;
+        cJSON *hosts = cJSON_AddArrayToObject(row, "torboxHosts");
+        unsigned mirrors = 0, available = 0;
+        bool unsupported = false;
+        bool group_pending = false, conflicting_size = false;
         do {
             mirrors++;
-            if (!remote_metadata_option(candidate)) continue;
-            const MetadataRequest *request = metadata_request_locked(candidate->id, now);
-            if (!request || request->state != META_DONE) group_pending = true;
-            if (!request) continue;
-            metadata_snapshot(views, row, candidate, request, release->mirror_key, candidate == release);
-            if (request->state == META_DONE) {
-                int rank = file_rank(&request->file);
-                if (rank > file_rank(&best)) {
-                    best = request->file;
-                    conflicting_size = false;
-                } else if (rank == file_rank(&best) && request->file.size != best.size) {
-                    conflicting_size = true;
-                }
+            const MetadataRequest *request = cached_metadata_locked(candidate->id, now);
+            if (!request && remote_metadata_option(candidate)) {
+                request = metadata_request_locked(candidate->id, now);
+                group_pending = true;
             }
+            if (request) metadata_snapshot(views, row, candidate, request, release->mirror_key, candidate == release);
+            const RemoteFileMetadata *current = request && request->state == META_DONE ? &request->file : NULL;
+            if (current && current->status == REMOTE_METADATA_UNSUPPORTED) unsupported = true;
+            if (current && (current->status == REMOTE_METADATA_MISSING ||
+                            current->status == REMOTE_METADATA_UNSUPPORTED)) continue;
+            available++;
+            char host[254];
+            if (hosts && remote_link_host(candidate, host, sizeof host)) {
+                const cJSON *item;
+                bool duplicate = false;
+                cJSON_ArrayForEach(item, hosts) duplicate |= !strcmp(item->valuestring, host);
+                if (!duplicate) cJSON_AddItemToArray(hosts, cJSON_CreateString(host));
+            }
+            if (!route.id[0]) {
+                route = *candidate;
+                if (current) file = *current;
+            } else if (current && file.size && current->size && file.size != current->size &&
+                       file.confidence == current->confidence) conflicting_size = true;
         } while (remote_next_mirror_locked(release, after, &alternate) &&
                  (copy_text(after, sizeof after, alternate.id), candidate = &alternate, true));
         pending |= group_pending;
-        if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", mirrors);
-        if (conflicting_size) {
-            best.size = 0;
-            best.exact = false;
-            cJSON_AddBoolToObject(row, "mirrorSizeConflict", true);
+        cJSON_DeleteItemFromObjectCaseSensitive(row, "status");
+        cJSON_AddStringToObject(row, "status", group_pending ? "fetching" :
+            !available ? (unsupported ? "unsupported-format" : "missing") : remote_metadata_status(file.status));
+        if (mirrors > 1) cJSON_AddNumberToObject(row, "mirrorCount", available);
+        if (conflicting_size) cJSON_AddBoolToObject(row, "mirrorSizeConflict", true);
+        if (route.id[0]) {
+            cJSON_AddStringToObject(row, "provider", route.remote_label);
+            cJSON_AddBoolToObject(row, "browserAvailable", remote_page_pending(&route));
+            cJSON_AddBoolToObject(row, "directAvailable", !remote_page_pending(&route));
+            if (route.remote_filename[0]) cJSON_AddStringToObject(row, "filenameHint", route.remote_filename);
+            if (route.display_size) cJSON_AddNumberToObject(row, "sizeEstimateBytes", (double)route.display_size);
         }
-        if (!group_pending && file_rank(&best)) {
-            cJSON_AddNumberToObject(row, "sizeBytes", (double)best.size);
-            cJSON_AddBoolToObject(row, "exact", best.exact);
-            if (best.filename[0]) cJSON_AddStringToObject(row, "filename", best.filename);
-            if (best.format[0]) cJSON_AddStringToObject(row, "format", best.format);
-            if (best.compression[0]) cJSON_AddStringToObject(row, "compression", best.compression);
-            cJSON_AddItemToArray(files, row);
-        } else cJSON_Delete(row);
+        cJSON_AddNumberToObject(row, "sizeBytes", (double)(conflicting_size ? 0 : file.size));
+        cJSON_AddBoolToObject(row, "exact", !conflicting_size && file.exact);
+        if (file.filename[0]) cJSON_AddStringToObject(row, "filename", file.filename);
+        else if (route.filename[0]) cJSON_AddStringToObject(row, "filename", route.filename);
+        if (file.format[0]) cJSON_AddStringToObject(row, "format", file.format);
+        else if (route.format[0] && strcmp(route.format, "Unknown")) cJSON_AddStringToObject(row, "format", route.format);
+        if (file.compression[0]) cJSON_AddStringToObject(row, "compression", file.compression);
+        else if (route.compression[0]) cJSON_AddStringToObject(row, "compression", route.compression);
+        if (file.size && !file.filename[0]) cJSON_AddBoolToObject(row, "sizeOnly", true);
+        cJSON_AddItemToArray(files, row);
     }
     cJSON_AddBoolToObject(root, "pending", pending);
     cJSON_AddBoolToObject(root, "truncated", ids && *ids);
@@ -933,6 +1164,7 @@ static void *metadata_worker(void *unused) {
             continue;
         }
         request->state = META_LOADING;
+        unsigned sequence = request->sequence;
         RemoteFileMetadata file = {0};
         cJSON *links = NULL;
         const Release *release = release_find(request->id);
@@ -942,10 +1174,12 @@ static void *metadata_worker(void *unused) {
             remote_download_metadata(&candidate, &file, &links);
             pthread_mutex_lock(&orbit.mutex);
         }
-        request->file = file;
+        if (request->state != META_LOADING || request->sequence != sequence) {
+            cJSON_Delete(links);
+            continue;
+        }
         request->public_links = links;
-        request->expires = time(NULL) + (file.size || file.filename[0] ? 1800 : 300);
-        request->state = META_DONE;
+        metadata_done_locked(request, &file);
     }
     pthread_mutex_unlock(&orbit.mutex);
     return NULL;
@@ -1012,6 +1246,8 @@ void remote_sources_stop(void) {
     if (remote.cache_fd >= 0) close(remote.cache_fd);
     pthread_mutex_lock(&orbit.mutex);
     free(orbit.remote_releases);
+    for (size_t i = 0; i < sizeof title_options / sizeof *title_options; i++) free(title_options[i].rows);
+    memset(title_options, 0, sizeof title_options);
     padrino_catalog_clear();
     orbit.remote_releases = NULL;
     orbit.remote_release_count = 0;

@@ -75,9 +75,12 @@ void random_hex(char *out, size_t n) {
         snprintf(out + 2 * i, 3, "%02x", b[i]);
 }
 Release *release_find(const char *id) {
-    if (!strncmp(id, "rs-", 3))
+    if (!strncmp(id, "rs-", 3)) {
+        Release *targeted = remote_title_find_locked(id);
+        if (targeted) return targeted;
         for (size_t i = 0; i < orbit.remote_release_count; i++)
             if (!strcmp(orbit.remote_releases[i].id, id)) return &orbit.remote_releases[i];
+    }
     for (size_t i = 0; i < orbit.release_count; i++)
         if (!strcmp(orbit.releases[i].id, id))
             return &orbit.releases[i];
@@ -191,6 +194,14 @@ static cJSON *job_json(const Job *j, bool private_fields) {
         if (j->mirror_first[0]) { S("mirrorFirst", mirror_first); }
         if (j->mirror_torbox) cJSON_AddTrueToObject(o, "mirrorTorBox");
         if (j->browser_pending) cJSON_AddTrueToObject(o, "browserPending");
+        if (j->mirror_verified) cJSON_AddTrueToObject(o, "mirrorVerified");
+        if (j->direct_missing) cJSON_AddTrueToObject(o, "directMissing");
+        if (j->debrid_fallback == DEBRID_MISSING)
+            cJSON_AddStringToObject(o, "debridFallback", "missing");
+        else if (j->debrid_fallback == DEBRID_FAILED)
+            cJSON_AddStringToObject(o, "debridFallback", "failed");
+        else if (j->debrid_fallback == DEBRID_TRANSIENT)
+            cJSON_AddStringToObject(o, "debridFallback", "indeterminate");
         cJSON_AddItemToObject(o, "release", release_json(&j->release));
         if (j->release.viking_context) {
             cJSON_AddNumberToObject(o, "vikingContext", j->release.viking_context);
@@ -512,7 +523,7 @@ int state_load(void) {
         }
         R("mirrorId", mirror_id);
         R("mirrorFirst", mirror_first);
-        j->mirror_torbox = (j->mirror_id[0] || j->mirror_first[0]) &&
+        j->mirror_torbox = r->mirror_key[0] &&
             cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "mirrorTorBox"));
         R("storageId", storage_id);
         R("root", root);
@@ -566,8 +577,16 @@ int state_load(void) {
         copy_text(j->install_after, sizeof j->install_after, after);
         const char *delivery = json_text(x, "delivery");
         if (*delivery && strcmp(delivery, "direct") && strcmp(delivery, "torbox")) { cJSON_Delete(o); return -1; }
-        j->browser_pending = strcmp(delivery, "torbox") && job_needs_browser(r) &&
+        j->browser_pending = strcmp(delivery, "torbox") &&
+            (job_needs_browser(r) || j->mirror_id[0] || j->mirror_first[0]) &&
             cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "browserPending"));
+        j->mirror_verified = j->mirror_id[0] && r->url[0] &&
+            cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "mirrorVerified"));
+        j->direct_missing = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(x, "directMissing"));
+        const char *fallback = json_text(x, "debridFallback");
+        j->debrid_fallback = !strcmp(fallback, "missing") ? DEBRID_MISSING :
+            !strcmp(fallback, "failed") ? DEBRID_FAILED :
+            !strcmp(fallback, "indeterminate") ? DEBRID_TRANSIENT : DEBRID_UNTRIED;
         if (!strcmp(delivery, "torbox")) {
             const cJSON *web = cJSON_GetObjectItemCaseSensitive(x, "debridId"),
                         *file = cJSON_GetObjectItemCaseSensitive(x, "debridFile");

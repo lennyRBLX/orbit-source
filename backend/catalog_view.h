@@ -1,5 +1,6 @@
 #ifndef ORBIT_CATALOG_VIEW_H
 #define ORBIT_CATALOG_VIEW_H
+#include "orbit.h"
 #include <stdbool.h>
 #include <stddef.h>
 /* The /api/v1/catalog and /api/v1/addons bodies, built once and shared by
@@ -25,4 +26,6 @@ size_t catalog_body_size(const CatalogBody *body);
 void catalog_body_release(void *body);
 /* Frees the cached bodies at shutdown. Responses being sent keep theirs. */
 void catalog_view_clear(void);
+cJSON *catalog_remote_choice_locked(const Release *r, const Release *const *group, size_t count);
+
 #endif

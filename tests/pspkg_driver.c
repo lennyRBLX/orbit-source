@@ -8,7 +8,7 @@ int main(int argc, char **argv) {
     char page[256], platform[4], game_id[13];
     const char *game = "https://pspkg.com/ps5/grand-theft-auto-vi-14552.html";
     assert(pspkg_download_page(game, page, sizeof page));
-    assert(!strcmp(page, "https://pspkg.com/ps5/download-grand-theft-auto-vi-14552.html?id=14552"));
+    assert(!strcmp(page, "https://pspkg.com/ps5/download-grand-theft-auto-vi-14552.html"));
     assert(pspkg_page_identity(page, platform, sizeof platform, game_id, sizeof game_id));
     assert(!strcmp(platform, "ps5") && !strcmp(game_id, "14552"));
     assert(!pspkg_download_page("https://pspkg.com/ps5-arabic/grand-theft-auto-vi-14552.html", page, sizeof page));
@@ -20,15 +20,15 @@ int main(int argc, char **argv) {
 
     /* PSPKG's successful reveal response contains relative links in HTML,
      * sometimes with HTML-escaped query separators. Reject other game IDs. */
-    const char *html = "<a href=\"download.php?game_id=14552&edition_id=29336&link_id=85873\">Viki</a>"
+    const char *html = "<a href=\"download.php?game_id=14552&edition_id=29336&link_id=85873&amp;route=browser\">Viki</a>"
                        "<a href=\"download.php?game_id=14552&amp;edition_id=29336&amp;link_id=85874\">File k</a>"
                        "<a href=\"download.php?game_id=14553&edition_id=29336&link_id=85875\">Other</a>";
     PspkgLink links[PSPKG_LINK_LIMIT] = {{0}};
     size_t count = 0;
     pspkg_scan_links((const unsigned char *)html, strlen(html), "ps5", "14552", links, &count, PSPKG_LINK_LIMIT);
     assert(count == 2);
-    assert(!strcmp(links[0].url, "https://pspkg.com/ps5/download.php?game_id=14552&edition_id=29336&link_id=85873&browser_type=other"));
-    assert(!strcmp(links[1].url, "https://pspkg.com/ps5/download.php?game_id=14552&edition_id=29336&link_id=85874&browser_type=other"));
+    assert(!strcmp(links[0].url, "https://pspkg.com/ps5/download.php?game_id=14552&edition_id=29336&link_id=85873&route=browser"));
+    assert(!strcmp(links[1].url, "https://pspkg.com/ps5/download.php?game_id=14552&edition_id=29336&link_id=85874"));
     pspkg_scan_links((const unsigned char *)html, strlen(html), "ps5", "14552", links, &count, PSPKG_LINK_LIMIT);
     assert(count == 2);
     unsigned char wide[512] = {0};

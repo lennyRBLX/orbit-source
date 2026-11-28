@@ -331,7 +331,7 @@ int history_clear_locked(const cJSON *input, char *err, size_t cap) {
 }
 static int create_locked(const Release *r, const char *sid, const Storage *pin,
                          const char *etag, const char *modified, bool dry_run, const char *delivery,
-                         char *err, size_t cap, Job **result) {
+                         const Release *recovery, char *err, size_t cap, Job **result) {
     const char *rid = r ? r->id : "";
     if (orbit.stop) {
         copy_text(err, cap, "Orbit is stopping. Reconnect after restarting it.");
@@ -353,12 +353,12 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
         copy_text(err, cap, "Choose direct or torbox delivery."); return 400;
     }
     if (torbox) {
-        const Release *route = r;
+        const Release *route = recovery ? recovery : r;
         Release mirror;
-        if (!debrid_link_covered_locked(r)) {
+        if (!recovery && (remote_link_missing_locked(r) || !debrid_link_covered_locked(r))) {
             char after[sizeof mirror.id] = "";
             while (remote_next_mirror_locked(r, after, &mirror)) {
-                if (debrid_link_covered_locked(&mirror)) {
+                if (!remote_link_missing_locked(&mirror) && debrid_link_covered_locked(&mirror)) {
                     route = &mirror;
                     copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, mirror.id);
                     copy_text(delivery_job.mirror_first, sizeof delivery_job.mirror_first, mirror.id);
@@ -368,11 +368,20 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
                 copy_text(after, sizeof after, mirror.id);
             }
         }
-        if (debrid_prepare_locked(route, &delivery_job, err, cap) != 200) {
+        if ((!recovery && remote_link_missing_locked(route)) ||
+            debrid_prepare_locked(route, &delivery_job, err, cap) != 200) {
+            if (recovery) return 409;
             torbox = false;
             delivery_job.mirror_id[0] = delivery_job.mirror_first[0] = 0;
             delivery_job.mirror_torbox = false;
             err[0] = 0;
+        }
+    }
+    if (recovery) {
+        delivery_job.direct_missing = true;
+        if (strcmp(r->id, recovery->id)) {
+            copy_text(delivery_job.mirror_id, sizeof delivery_job.mirror_id, recovery->id);
+            delivery_job.mirror_torbox = true;
         }
     }
     delivery_job.browser_pending = !torbox && !pin && job_needs_browser(r);
@@ -560,10 +569,15 @@ int job_create_delivery_locked(const char *rid, const char *sid, const char *del
     const Release *r = release_find(rid);
     const char *method = delivery && *delivery ? delivery :
                          debrid_default_locked(r) ? "torbox" : "direct";
-    return create_locked(r, sid, NULL, NULL, NULL, false, method, err, cap, result);
+    return create_locked(r, sid, NULL, NULL, NULL, false, method, NULL, err, cap, result);
+}
+int job_create_torbox_recovery_locked(const Release *r, const Release *route, const Storage *storage,
+                                      char *err, size_t cap, Job **result) {
+    if (!source_enabled_locked(route) || !debrid_link_covered_locked(route)) return 409;
+    return create_locked(r, storage->id, storage, NULL, NULL, false, "torbox", route, err, cap, result);
 }
 int job_check_capture_locked(const Release *r, const Storage *s, char *err, size_t cap) {
-    return create_locked(r, s->id, s, NULL, NULL, true, "direct", err, cap, NULL);
+    return create_locked(r, s->id, s, NULL, NULL, true, "direct", NULL, err, cap, NULL);
 }
 int job_create_captured_locked(const Release *r, const Storage *s, const char *etag,
                                const char *modified, char *err, size_t cap, Job **result) {
@@ -573,7 +587,7 @@ int job_create_captured_locked(const Release *r, const Storage *s, const char *e
         copy_text(err, cap, "The provider file has not been validated.");
         return 409;
     }
-    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+    return create_locked(r, s->id, s, etag, modified, false, "direct", NULL, err, cap, result);
 }
 int job_create_pspkg_torbox_locked(const Release *r, const Storage *s,
                                    char *err, size_t cap, Job **result) {
@@ -590,14 +604,14 @@ int job_create_pspkg_torbox_locked(const Release *r, const Storage *s,
      * provider page has no direct file yet, so reject that case up front. */
     Job prepared = {0};
     if (debrid_prepare_locked(r, &prepared, err, cap) != 200) return 409;
-    return create_locked(r, s->id, s, NULL, NULL, false, "torbox", err, cap, result);
+    return create_locked(r, s->id, s, NULL, NULL, false, "torbox", NULL, err, cap, result);
 }
 int job_create_link_locked(const Release *r, const Storage *s, const char *etag,
                            const char *modified, char *err, size_t cap, Job **result) {
     if (!link_release_valid(r)) {
         copy_text(err, cap, "This link didn't give Orbit a file it can save."); return 400;
     }
-    return create_locked(r, s->id, s, etag, modified, false, "direct", err, cap, result);
+    return create_locked(r, s->id, s, etag, modified, false, "direct", NULL, err, cap, result);
 }
 bool job_can_replace_link(const Job *j) {
     return j && !strcmp(j->release.source, "link") && !job_active(j) &&
@@ -830,7 +844,8 @@ int job_action_locked(Job *j, const char *action, bool remove, char *err, size_t
         j->remove = false;
         j->attempts = 0;
         j->retry_at = 0;
-        j->debrid_watch = 0; /* Resume gives TorBox a fresh five minutes. */
+        j->debrid_watch = 0;
+        j->debrid_retries = 0;
         j->error[0] = 0;
         copy_text(j->status, sizeof j->status, "queued");
     } else if (!strcmp(action, "cancel")) {

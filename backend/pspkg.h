@@ -9,7 +9,10 @@
 typedef struct {
     char edition_id[13];
     char link_id[13];
-    char url[192];
+    char url[2048], provider[256];
+    char label[128], edition[128], title_id[16], version[32], region[32], format[24], compression[16];
+    char reason[32];
+    bool intermediate;
 } PspkgLink;
 
 /* Only the general PS4/PS5 game paths are accepted. No Arabic paths. */

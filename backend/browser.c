@@ -1,8 +1,9 @@
 #include "orbit.h"
 #include "remote_sources.h"
+#include "debrid.h"
 #include "browser_platform.h"
 #include "browser_match.h"
-#include "debrid.h"
+#include "provider_network.h"
 #include "pspkg.h"
 #include "viking_session.h"
 #include "viking_pass.h"
@@ -25,7 +26,10 @@ static struct {
     char mirror_page[sizeof ((Release *)0)->browser_url];
     char native_failure[256];
     char pspkg_release_id[sizeof ((Release *)0)->id];
+    char pspkg_game[64], pspkg_status[32];
+    bool pspkg_torbox;
     PspkgLink pspkg_links[PSPKG_LINK_LIMIT], pspkg_selected;
+    size_t pspkg_selected_index;
     size_t pspkg_count;
     time_t pspkg_expires;
     Release release;
@@ -307,37 +311,95 @@ static void community_file(Release *selected, const Release *file) {
     selected->size = file->size;
 }
 
-static bool resolve_community(Release *selected, char *etag, char *modified, char *error, size_t cap) {
+static bool recover_community_locked(const Release *selected, const Release *route) {
+    if (orbit.stop || session.stop || atomic_load(&session.cancel) || !selected_locked() ||
+        !source_enabled_locked(route) || !debrid_link_covered_locked(route)) return false;
+    Job *j = session.queued_job_id[0] ? job_find(session.queued_job_id) : NULL;
+    if (j) {
+        if (!debrid_resume_after_missing_locked(j, route)) return false;
+        if (state_save_locked()) {
+            copy_text(j->status, sizeof j->status, "error");
+            state_locked("failed", "Could not persist the queue.");
+            return true;
+        }
+    } else {
+        char error[256] = "";
+        if (job_create_torbox_recovery_locked(selected, route, &session.storage, error, sizeof error, &j) != 201)
+            return false;
+    }
+    copy_text(session.job_id, sizeof session.job_id, j->id);
+    session.return_to_browser = false;
+    state_locked("queued", "Your verified file has been added to Downloads.");
+    session.queued_ms = milliseconds() - session.started_ms;
+    pthread_cond_broadcast(&orbit.changed);
+    return true;
+}
+
+typedef enum { COMMUNITY_FAILED, COMMUNITY_FOUND, COMMUNITY_ROUTED } CommunityResult;
+
+static CommunityResult resolve_community(Release *selected, char *etag, char *modified,
+                                         char *error, size_t cap) {
     Release candidate = *selected, interactive = {0}, interactive_locator = {0};
     char after[sizeof candidate.id] = "";
+    pthread_mutex_lock(&orbit.mutex);
+    const Job *j = session.queued_job_id[0] ? job_find(session.queued_job_id) : NULL;
+    bool queued = j != NULL;
+    bool found = !j || !j->mirror_id[0] || remote_mirror_locked(selected, j->mirror_id, &candidate);
+    if (j && !j->mirror_id[0]) {
+        const Release *original = release_find(selected->id);
+        if (original) candidate = *original;
+        else if (candidate.remote_page) candidate.url[0] = 0;
+    }
+    pthread_mutex_unlock(&orbit.mutex);
+    if (!found) {
+        copy_text(error, cap, "This mirror is no longer available.");
+        return COMMUNITY_FAILED;
+    }
+    bool all_missing = true;
     while (active()) {
         Release locator;
-        error[0] = 0;
+        char candidate_error[256] = "";
         bool primary = !strcmp(candidate.id, selected->id);
-        int result = remote_page_pending(&candidate)
-            ? remote_download_resolve(&candidate, &locator, &session.cancel, error, cap)
-            : remote_download_verify(&candidate, candidate.url, &session.cancel, error, cap);
+        pthread_mutex_lock(&orbit.mutex);
+        bool known_missing = remote_link_missing_locked(&candidate);
+        pthread_mutex_unlock(&orbit.mutex);
+        int result = known_missing ? REMOTE_DOWNLOAD_MISSING : remote_page_pending(&candidate)
+            ? remote_download_resolve(&candidate, &locator, &session.cancel, candidate_error, sizeof candidate_error)
+            : remote_download_verify(&candidate, candidate.url, &session.cancel, candidate_error, sizeof candidate_error);
+        if (result == REMOTE_DOWNLOAD_MISSING) {
+            pthread_mutex_lock(&orbit.mutex);
+            remote_mark_missing_locked(&candidate);
+            bool routed = recover_community_locked(selected, &candidate);
+            pthread_mutex_unlock(&orbit.mutex);
+            if (routed) return COMMUNITY_ROUTED;
+        } else {
+            all_missing = false;
+            if (candidate_error[0]) copy_text(error, cap, candidate_error);
+        }
         if (result == 1 && !strcmp(locator.source, "vikingfile") && active() &&
             viking_resolve_download(&locator, session.native_dialog, &session.cancel) &&
             !verify_community_capture(&candidate, &locator, locator.url, error, cap)) result = 0;
-        if (!result && (primary || remote_mirror_file(selected, &candidate))) {
+        if (!result && remote_mirror_file(selected, &candidate) &&
+            (!primary || !selected->filename[0] || !strcmp(selected->filename, candidate.filename))) {
             community_file(selected, &candidate);
             pthread_mutex_lock(&orbit.mutex);
             session.return_to_browser = false;
             pthread_mutex_unlock(&orbit.mutex);
-            return true;
+            return COMMUNITY_FOUND;
         }
         if (result == 1 && !interactive.id[0]) {
             interactive = candidate;
             interactive_locator = locator;
         }
+        if (queued) break;
         pthread_mutex_lock(&orbit.mutex);
         bool next = remote_next_mirror_locked(selected, after, &candidate);
         pthread_mutex_unlock(&orbit.mutex);
         if (!next) break;
         copy_text(after, sizeof after, candidate.id);
     }
-    if (!interactive.id[0] || !active()) return false;
+    if (all_missing) copy_text(error, cap, REMOTE_FILE_REMOVED);
+    if (!interactive.id[0] || !active()) return COMMUNITY_FAILED;
 
     pthread_mutex_lock(&orbit.mutex);
     session.resolving = false;
@@ -349,9 +411,9 @@ static bool resolve_community(Release *selected, char *etag, char *modified, cha
     bool validated = false;
     error[0] = 0;
     if (!capture(&interactive_locator, &interactive, etag, modified, &validated, error, cap) ||
-        (strcmp(interactive.id, selected->id) && !remote_mirror_file(selected, &interactive))) return false;
+        (strcmp(interactive.id, selected->id) && !remote_mirror_file(selected, &interactive))) return COMMUNITY_FAILED;
     community_file(selected, &interactive);
-    return true;
+    return COMMUNITY_FOUND;
 }
 
 static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
@@ -364,6 +426,7 @@ static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
     } else if (j->cancel || atomic_load(&session.cancel)) {
         status = "cancelled";
     } else if (ok) {
+        j->mirror_verified = j->mirror_id[0];
         j->browser_pending = false;
         copy_text(j->status, sizeof j->status, "queued");
         copy_text(j->etag, sizeof j->etag, etag);
@@ -376,7 +439,14 @@ static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
             return;
         }
         j->browser_pending = true;
+        j->mirror_verified = false;
         j->etag[0] = j->modified[0] = 0;
+    } else if (job_advance_mirror_locked(j)) {
+        copy_text(session.job_id, sizeof session.job_id, j->id);
+        state_locked("queued", "Trying another download option.");
+        (void)state_save_locked();
+        pthread_cond_broadcast(&orbit.changed);
+        return;
     }
     copy_text(j->status, sizeof j->status, status);
     if (!strcmp(status, "error")) {
@@ -391,15 +461,88 @@ static void finish_queued_locked(Job *j, const Release *resolved, bool ok,
 
 typedef struct {
     char platform[4], game_id[13];
+    const char *page;
+    cJSON *fields;
+    bool verified;
     PspkgLink links[PSPKG_LINK_LIMIT];
     size_t count;
 } PspkgCollection;
 
+static void collect_pspkg_html(PspkgCollection *found, const char *html, const char *edition) {
+    cJSON *rows = remote_pspkg_session_links(html, found->page, edition);
+    const cJSON *row;
+    cJSON_ArrayForEach(row, rows) {
+        const char *url = json_text(row, "url");
+        if (!*url || strlen(url) >= sizeof found->links[0].url) continue;
+        size_t i = 0;
+        for (; i < found->count; i++)
+            if (!strcmp(found->links[i].url, url) &&
+                (!found->links[i].edition[0] ||
+                 !strcmp(found->links[i].edition, json_text(row, "edition")))) break;
+        if (i == found->count && found->count == PSPKG_LINK_LIMIT) break;
+        PspkgLink *link = &found->links[i];
+        if (i == found->count) {
+            copy_text(link->url, sizeof link->url, url);
+            found->count++;
+        }
+        copy_text(link->label, sizeof link->label, json_text(row, "label"));
+        copy_text(link->edition, sizeof link->edition, json_text(row, "edition"));
+        copy_text(link->title_id, sizeof link->title_id, json_text(row, "titleId"));
+        copy_text(link->version, sizeof link->version, json_text(row, "version"));
+        copy_text(link->region, sizeof link->region, json_text(row, "region"));
+        copy_text(link->format, sizeof link->format, json_text(row, "format"));
+        copy_text(link->compression, sizeof link->compression, json_text(row, "compression"));
+        copy_text(link->reason, sizeof link->reason, json_text(row, "filterReason"));
+        link->intermediate = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row, "intermediate"));
+    }
+    cJSON_Delete(rows);
+}
+
+/* The landing page publishes field IDs. After the user's verification, its
+ * script replaces those elements with HTML from the browser's JSON response.
+ * Accept only fields belonging to this specific landing page. */
+static void collect_pspkg_reveal(PspkgCollection *found, const char *json, size_t length) {
+    cJSON *reply = cJSON_ParseWithLength(json, length);
+    const cJSON *fields = cJSON_GetObjectItemCaseSensitive(reply, "fields");
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "success")) && cJSON_IsObject(fields)) {
+        const cJSON *field;
+        cJSON_ArrayForEach(field, fields) {
+            const char *edition = json_text(found->fields, field->string);
+            if (!*edition || !cJSON_IsString(field)) continue;
+            found->verified = true;
+            collect_pspkg_html(found, field->valuestring, edition);
+        }
+    }
+    cJSON_Delete(reply);
+}
+
 #ifndef ORBIT_TEST
 static bool pspkg_match(void *context, const unsigned char *bytes, size_t length) {
     PspkgCollection *found = context;
-    pspkg_scan_links(bytes, length, found->platform, found->game_id,
-                     found->links, &found->count, PSPKG_LINK_LIMIT);
+    /* Search only for the shape of a successful reveal response. The parser
+     * checks its field IDs against the chosen game before admitting anchors. */
+    static const char success[] = "{\"success\":true";
+    for (size_t i = 0; i + sizeof success <= length; i++) {
+        if (bytes[i] != '{') continue;
+        if (!memcmp(bytes + i, success, sizeof success - 1))
+            collect_pspkg_reveal(found, (const char *)bytes + i, length - i);
+        if (i + 2 * sizeof success > length || bytes[i + 1]) continue;
+        size_t j = 0;
+        while (j < sizeof success - 1 && bytes[i + j * 2] == (unsigned char)success[j] &&
+               !bytes[i + j * 2 + 1]) j++;
+        if (j != sizeof success - 1) continue;
+        size_t cap = (length - i) / 2;
+        char *json = malloc(cap + 1);
+        if (!json) continue;
+        for (j = 0; j < cap && bytes[i + j * 2] && !bytes[i + j * 2 + 1]; j++)
+            json[j] = (char)bytes[i + j * 2];
+        json[j] = 0;
+        collect_pspkg_reveal(found, json, j);
+        free(json);
+    }
+    if (!found->verified && !cJSON_GetArraySize(found->fields))
+        pspkg_scan_links(bytes, length, found->platform, found->game_id,
+                         found->links, &found->count, PSPKG_LINK_LIMIT);
     return false; /* The whole response may contain many choices. */
 }
 #endif
@@ -412,11 +555,24 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
         copy_text(error, cap, "This PSPKG game has no valid download page.");
         return false;
     }
+    found->page = release->browser_url;
+    RemoteMetadataStatus public_status;
+    found->fields = remote_pspkg_public_fields(release->browser_url, &public_status, &session.cancel);
+    if (public_status == REMOTE_METADATA_MISSING) {
+        copy_text(error, cap, "missing-page");
+        return false;
+    }
 #ifdef ORBIT_TEST
     const char *html = getenv("ORBIT_TEST_PSPKG_HTML");
-    if (html) pspkg_scan_links((const unsigned char *)html, strlen(html),
-                               found->platform, found->game_id,
-                               found->links, &found->count, PSPKG_LINK_LIMIT);
+    const char *wait = getenv("ORBIT_TEST_PSPKG_DELAY_MS");
+    unsigned steps = wait ? (unsigned)strtoul(wait, NULL, 10) / 100 : 1;
+    for (unsigned i = 0; i < steps && i < 300 && active(); i++) delay();
+    if (!active()) return false;
+    if (html) {
+        if (*html == '{') collect_pspkg_reveal(found, html, strlen(html));
+        else collect_pspkg_html(found, html, NULL);
+        if (!found->count && !strstr(html, "Awaiting verification")) copy_text(error, cap, "no-anchors");
+    }
 #else
     if (session.native_dialog) {
         bool opened = false;
@@ -478,11 +634,12 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
         session.browser_processes = (unsigned)count;
         session.candidates = (unsigned)found->count;
         pthread_mutex_unlock(&orbit.mutex);
-        if (found->count && milliseconds() - last_new >= 1500) break;
+        if (found->verified || (found->count && milliseconds() - last_new >= 1500)) break;
         delay();
     }
 #endif
     if (found->count) return true;
+    if (found->verified && !error[0]) copy_text(error, cap, "no-anchors");
     if (!error[0]) copy_text(error, cap,
         "PSPKG did not reveal download links. Complete the check on that game's page and try again.");
     return false;
@@ -493,16 +650,39 @@ static bool collect_pspkg(const Release *release, PspkgCollection *found,
 static void download_pspkg(void) {
     Release selected = session.release;
     PspkgLink choice = session.pspkg_selected;
+    size_t selected_index = session.pspkg_selected_index;
     Storage storage = session.storage;
     pthread_mutex_unlock(&orbit.mutex);
     char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
     bool validated = false, ok = active();
+    const char *route_status = "";
     Release locator = selected;
     copy_text(locator.source, sizeof locator.source, "pspkg");
-    copy_text(locator.browser_url, sizeof locator.browser_url, choice.url);
     locator.url[0] = 0;
-    if (ok) ok = capture(&locator, NULL, etag, modified, &validated, error, sizeof error);
+    if (ok && choice.provider[0]) copy_text(locator.url, sizeof locator.url, choice.provider);
+    else if (ok) {
+        route_status = remote_pspkg_route(choice.url, choice.intermediate, &session.cancel,
+                                          locator.url, sizeof locator.url);
+        if (*route_status) {
+            ok = false;
+            if (!strcmp(route_status, "verify-required")) {
+                copy_text(error, sizeof error, "Open this PSPKG link and complete verification again.");
+#ifndef ORBIT_DESKTOP
+                if (active()) probe_browser_open(choice.url);
+#endif
+            } else copy_text(error, sizeof error, "The PSPKG provider link could not be resolved.");
+        }
+    }
     Release route = selected;
+    if (choice.format[0]) copy_text(route.format, sizeof route.format, choice.format);
+    if (choice.edition[0]) copy_text(route.remote_edition, sizeof route.remote_edition, choice.edition);
+    if (choice.version[0]) copy_text(route.remote_version, sizeof route.remote_version, choice.version);
+    if (choice.region[0]) copy_text(route.remote_region, sizeof route.remote_region, choice.region);
+    if (choice.compression[0]) {
+        copy_text(route.compression, sizeof route.compression, choice.compression);
+        for (char *p = route.compression; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 'a' - 'A';
+    }
+    remote_pspkg_identify_choice(&route, choice.url, selected_index);
     const char *provider = ok ? remote_browser_provider(locator.url) : "";
     if (ok) {
         if (*provider) {
@@ -518,7 +698,7 @@ static void download_pspkg(void) {
     }
     pthread_mutex_lock(&orbit.mutex);
     if (ok && *provider && !session.stop && !atomic_load(&session.cancel) && selected_locked() &&
-        debrid_link_covered_locked(&route)) {
+        session.pspkg_torbox && debrid_link_covered_locked(&route)) {
         Job *job = NULL;
         int code = job_create_pspkg_torbox_locked(&route, &storage, error, sizeof error, &job);
         if (code == 201 && job && !strcmp(job->delivery, "torbox")) {
@@ -534,14 +714,10 @@ static void download_pspkg(void) {
     pthread_mutex_unlock(&orbit.mutex);
     if (ok && *provider && !queued && active()) {
         Release provider_page = route;
-        if (provider_browser_source(provider)) {
-            copy_text(provider_page.source, sizeof provider_page.source, provider);
-            copy_text(provider_page.browser_url, sizeof provider_page.browser_url, route.remote_provider_page);
-            copy_text(provider_page.url, sizeof provider_page.url, route.remote_provider_page);
+        int result = remote_download_resolve(&route, &provider_page, &session.cancel, error, sizeof error);
+        validated = ok = result == 0;
+        if (result == 1 && active())
             ok = capture(&provider_page, &route, etag, modified, &validated, error, sizeof error);
-        } else {
-            validated = ok = !remote_download_resolve(&route, &provider_page, &session.cancel, error, sizeof error);
-        }
         if (ok && !validated) {
             copy_text(error, sizeof error, "The provider file could not be verified.");
             ok = false;
@@ -550,6 +726,9 @@ static void download_pspkg(void) {
     }
     pthread_mutex_lock(&orbit.mutex);
     if (!queued) {
+        if (*route_status && selected_index < session.pspkg_count)
+            copy_text(session.pspkg_links[selected_index].reason,
+                      sizeof session.pspkg_links[selected_index].reason, route_status);
         if (session.stop || atomic_load(&session.cancel))
             state_locked("cancelled", "PSPKG verification cancelled. No download was added.");
         else if (!selected_locked())
@@ -631,19 +810,61 @@ static void *worker(void *unused) {
             PspkgCollection found = {0};
             char error[256] = {0};
             bool ok = active() && collect_pspkg(&selected, &found, error, sizeof error);
+            for (size_t i = 0; ok && active() && i < found.count; i++) {
+                PspkgLink *link = &found.links[i];
+                if (link->reason[0]) continue;
+                char resolved[2048] = "";
+                const char *reason = remote_pspkg_route(link->url, link->intermediate, &session.cancel,
+                                                       resolved, sizeof resolved);
+                if (*reason) copy_text(link->reason, sizeof link->reason, reason);
+                else {
+                    const char *provider = remote_browser_provider(resolved);
+                    if (*provider && strlen(resolved) < sizeof link->provider)
+                        copy_text(link->provider, sizeof link->provider, resolved);
+                    else copy_text(link->url, sizeof link->url, resolved);
+                }
+            }
             pthread_mutex_lock(&orbit.mutex);
             if (ok && selected_locked() && !atomic_load(&session.cancel)) {
+                size_t usable = 0, waiting = 0;
+                for (size_t i = 0; i < found.count; i++) {
+                    usable += !found.links[i].reason[0];
+                    waiting += !strcmp(found.links[i].reason, "verify-required");
+                }
                 memcpy(session.pspkg_links, found.links, found.count * sizeof found.links[0]);
                 session.pspkg_count = found.count;
                 session.pspkg_expires = time(NULL) + 300;
+#ifdef ORBIT_TEST
+                const char *ttl = getenv("ORBIT_TEST_PSPKG_TTL");
+                if (ttl) session.pspkg_expires = time(NULL) + atoi(ttl);
+#endif
                 copy_text(session.pspkg_release_id, sizeof session.pspkg_release_id, selected.id);
-                state_locked("links-ready", "PSPKG download choices are ready. Select one to continue.");
+                copy_text(session.pspkg_status, sizeof session.pspkg_status, usable
+                    ? usable < found.count ? "partial" : "ready" : waiting ? "verify-required" : "rejected");
+                state_locked("links-ready", usable ? "PSPKG download choices are ready. Select one to continue."
+                    : "PSPKG links need verification or were rejected by download policy.");
             } else {
+                const char *status = atomic_load(&session.cancel) ? "cancelled" : !selected_locked() ? "scan-miss" :
+                    error[0] && !strcmp(error, "missing-page") ? "missing-page" :
+                    error[0] && !strcmp(error, "no-anchors") ? "no-anchors" : "verify-required";
+                copy_text(session.pspkg_status, sizeof session.pspkg_status, status);
                 state_locked(session.native_failure[0] ? "failed" :
                              atomic_load(&session.cancel) ? "cancelled" : "failed",
                              session.native_failure[0] ? session.native_failure :
+                             !strcmp(status, "missing-page") ? "The PSPKG download page is missing." :
+                             !strcmp(status, "no-anchors") ? "PSPKG verification completed without usable download links." :
                              error[0] ? error : "PSPKG verification stopped.");
             }
+#ifndef ORBIT_DESKTOP
+            if (ok && session.return_to_browser && !session.stop && !atomic_load(&session.cancel)) {
+                char home[144];
+                snprintf(home, sizeof home, "http://127.0.0.1:%d/?game=%s", ORBIT_HTTP_PORT, session.pspkg_game);
+                pthread_mutex_unlock(&orbit.mutex);
+                probe_browser_open(home);
+                pthread_mutex_lock(&orbit.mutex);
+            }
+#endif
+            cJSON_Delete(found.fields);
             memset(&found, 0, sizeof found);
             memset(&session.release, 0, sizeof session.release);
             session.finished_ms = milliseconds() - session.started_ms;
@@ -669,9 +890,11 @@ static void *worker(void *unused) {
         pthread_mutex_unlock(&orbit.mutex);
         char error[256] = {0}, etag[256] = {0}, modified[128] = {0};
         bool validated = false;
-        bool ok = false;
-        if (remote_page_pending(&resolved)) {
-            validated = ok = resolve_community(&resolved, etag, modified, error, sizeof error);
+        bool ok = false, routed = false;
+        if (remote_page_pending(&resolved) || (!strcmp(resolved.source, "remote") && session.queued_job_id[0])) {
+            CommunityResult result = resolve_community(&resolved, etag, modified, error, sizeof error);
+            validated = ok = result == COMMUNITY_FOUND;
+            routed = result == COMMUNITY_ROUTED;
         } else {
             ok = active() && viking_resolve_download(&resolved, session.native_dialog, &session.cancel);
             if (ok) {
@@ -696,9 +919,11 @@ static void *worker(void *unused) {
         pthread_mutex_unlock(&orbit.mutex);
         if (ok && !validated) ok = !validate_capture(&resolved, etag, modified, error, sizeof error);
         pthread_mutex_lock(&orbit.mutex);
-        if (session.queued_job_id[0]) {
+        if (!routed && session.queued_job_id[0]) {
             finish_queued_locked(job_find(session.queued_job_id), &resolved, ok,
                                  etag, modified, error, sizeof error);
+        } else if (routed) {
+            /* The existing or newly queued job now owns the download. */
         } else if (session.stop || atomic_load(&session.cancel)) {
             if (session.native_failure[0]) state_locked("failed", session.native_failure);
             else state_locked("cancelled", "Verification cancelled. No download was added.");
@@ -863,18 +1088,38 @@ cJSON *browser_status(void) {
     cJSON_AddStringToObject(o, "message", session.message);
     cJSON_AddStringToObject(o, "jobId", session.job_id);
     cJSON_AddStringToObject(o, "title", session.title);
-    if (session.pspkg_release_id[0] && time(NULL) < session.pspkg_expires) {
+    if (session.pspkg_release_id[0]) {
         cJSON_AddStringToObject(o, "pspkgReleaseId", session.pspkg_release_id);
+        cJSON_AddStringToObject(o, "pspkgGameId", session.pspkg_game);
+        bool expired = session.pspkg_expires && time(NULL) >= session.pspkg_expires;
+        cJSON_AddStringToObject(o, "pspkgStatus", expired ? "expired" : session.pspkg_status);
+        if (expired && session.pspkg_count) {
+            memset(session.pspkg_links, 0, sizeof session.pspkg_links);
+            session.pspkg_count = 0;
+        }
         cJSON *choices = cJSON_AddArrayToObject(o, "pspkgLinks");
-        for (size_t i = 0; choices && i < session.pspkg_count; i++) {
+        for (size_t i = 0; !expired && choices && i < session.pspkg_count; i++) {
+            const PspkgLink *link = &session.pspkg_links[i];
             cJSON *choice = cJSON_CreateObject();
-            char id[26];
-            snprintf(id, sizeof id, "%s:%s", session.pspkg_links[i].edition_id,
-                     session.pspkg_links[i].link_id);
-            if (!choice || !cJSON_AddStringToObject(choice, "id", id) ||
-                !cJSON_AddStringToObject(choice, "label", "PSPKG") ||
-                !cJSON_AddNumberToObject(choice, "number", (double)i + 1) ||
-                !cJSON_AddItemToArray(choices, choice)) cJSON_Delete(choice);
+            if (!choice) break;
+            char id[24];
+            snprintf(id, sizeof id, "%zu", i + 1);
+            cJSON_AddStringToObject(choice, "id", id);
+            cJSON_AddNumberToObject(choice, "number", (double)i + 1);
+            cJSON_AddStringToObject(choice, "label", link->label[0] ? link->label : "PSPKG");
+            cJSON_AddStringToObject(choice, "edition", link->edition);
+            cJSON_AddStringToObject(choice, "titleId", link->title_id);
+            cJSON_AddStringToObject(choice, "version", link->version);
+            cJSON_AddStringToObject(choice, "region", link->region);
+            cJSON_AddStringToObject(choice, "format", link->format);
+            cJSON_AddStringToObject(choice, "compression", link->compression);
+            cJSON_AddStringToObject(choice, "reason", link->reason);
+            if (link->provider[0]) {
+                Release route = {.remote_page = true};
+                copy_text(route.remote_provider_page, sizeof route.remote_provider_page, link->provider);
+                cJSON_AddBoolToObject(choice, "torboxAvailable", debrid_link_covered_locked(&route));
+            }
+            cJSON_AddItemToArray(choices, choice);
         }
     }
     /* Durations/counters only. Never disclose browser bytes, file URLs, process
@@ -1026,13 +1271,13 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
                     goto done;
                 }
                 for (size_t i = 0; i < session.pspkg_count; i++) {
-                    char id[26];
-                    snprintf(id, sizeof id, "%s:%s", session.pspkg_links[i].edition_id,
-                             session.pspkg_links[i].link_id);
+                    char id[24];
+                    snprintf(id, sizeof id, "%zu", i + 1);
                     if (!strcmp(id, json_text(input, "linkId")))
                         choice = &session.pspkg_links[i];
                 }
-                if (!choice || !storage) {
+                if (!choice || !storage ||
+                    (choice->reason[0] && strcmp(choice->reason, "verify-required"))) {
                     copy_text(error, cap, "Select a PSPKG link and connected drive."); code = 400;
                     goto done;
                 }
@@ -1046,10 +1291,21 @@ static int perform_action(const cJSON *input, const char *action, char *error, s
             session.pspkg_fetch = !download;
             session.pspkg_download = download;
             session.pspkg_selected = selected;
+            session.pspkg_selected_index = choice ? (size_t)(choice - session.pspkg_links) : 0;
+            session.pspkg_torbox = !strcmp(json_text(input, "delivery"), "torbox");
             if (!download) {
-                session.pspkg_count = 0;
-                session.pspkg_release_id[0] = 0;
-                session.pspkg_expires = 0;
+                const char *game = json_text(input, "gameId");
+                if (!*game || strlen(game) >= sizeof session.pspkg_game ||
+                    strspn(game, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_") != strlen(game))
+                    game = r->game_id;
+                if (strcmp(session.pspkg_release_id, r->id)) {
+                    memset(session.pspkg_links, 0, sizeof session.pspkg_links);
+                    session.pspkg_count = 0;
+                    session.pspkg_expires = 0;
+                }
+                copy_text(session.pspkg_status, sizeof session.pspkg_status, "verify-required");
+                copy_text(session.pspkg_release_id, sizeof session.pspkg_release_id, r->id);
+                copy_text(session.pspkg_game, sizeof session.pspkg_game, game);
                 state_locked("opening", "Opening this game's PSPKG download page…");
             } else state_locked("opening", "Opening the selected PSPKG link…");
             code = 202;

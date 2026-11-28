@@ -34,6 +34,7 @@ export interface Release extends AddonIdentity {
   torboxHosts?: string[];
   mirrorCount?: number;
   providerMetadata?: boolean;
+  providerMissing?: boolean;
   // An unresolved provider page can omit the file type.
   format: "FFPFSC" | "exFAT" | "FPKG" | "PKG" | "Game folder" | "Unknown";
   contentFormat?: "LZ4";
@@ -64,6 +65,13 @@ export interface Release extends AddonIdentity {
   requiredFirmware?: string;
   maxFirmware?: string;
   firmwareIssue?: "ps5-package" | "newer-firmware";
+  filenameHint?: string;
+  formatHint?: string;
+  compressionHint?: string;
+  hasArchivePassword?: boolean;
+  edition?: string;
+  metadataStatus?: string;
+  metadataSizeOnly?: boolean;
 }
 // Get everything's Download all (GET/POST /api/v1/bundles): one at a time, items added in order.
 export interface BundleItem {
@@ -389,9 +397,25 @@ export const bytes = (n: number) => {
   }
 };
 
+export interface PspkgChoice {
+  id: string;
+  label: string;
+  number: number;
+  edition: string;
+  titleId: string;
+  version: string;
+  region: string;
+  format: string;
+  compression: string;
+  reason: string;
+  torboxAvailable?: boolean;
+}
+
 export interface BrowserSession {
   pspkgReleaseId?: string;
-  pspkgLinks?: { id: string; label: "PSPKG"; number: number }[];
+  pspkgLinks?: PspkgChoice[];
+  pspkgGameId?: string;
+  pspkgStatus?: string;
   accountPage?: boolean;
   vikingAccountAvailable?: boolean;
   vikingBrowserState?: "signed-in" | "signed-out" | "unknown";

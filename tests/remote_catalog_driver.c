@@ -101,6 +101,10 @@ int main(int argc, char **argv) {
             puts("true");
         } else if (!strcmp(op, "provider-page")) {
             print_json(cJSON_CreateString(remote_browser_provider(json_text(request, "url"))));
+        } else if (!strcmp(op, "title-options")) {
+            pthread_mutex_lock(&orbit.mutex);
+            print_json(remote_title_options_locked(release_find(json_text(request, "id"))));
+            pthread_mutex_unlock(&orbit.mutex);
         } else if (!strcmp(op, "metadata-page")) {
             Release release = {.remote_page = true};
             copy_text(release.browser_url, sizeof release.browser_url, json_text(request, "url"));
@@ -206,6 +210,15 @@ int main(int argc, char **argv) {
                 print_json(remote_sources_test_status_locked());
             } else if (!strcmp(op, "jobs")) {
                 print_json(jobs_json_locked());
+            } else if (!strcmp(op, "mirror-fixture")) {
+                const cJSON *ids = cJSON_GetObjectItemCaseSensitive(request, "ids"), *id;
+                cJSON_ArrayForEach(id, ids) {
+                    Release *r = cJSON_IsString(id) ? release_find(id->valuestring) : NULL;
+                    if (r && !strcmp(r->source, "remote"))
+                        memset(r->mirror_key, 'a', sizeof r->mirror_key - 1);
+                }
+                catalog_view_invalidate_locked();
+                print_json(cJSON_CreateTrue());
             } else if (!strcmp(op, "metadata")) {
                 print_json(remote_metadata_json_locked(json_text(request, "ids")));
             } else if (!strcmp(op, "diagnostics")) {

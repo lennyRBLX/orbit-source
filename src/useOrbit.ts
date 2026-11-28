@@ -163,17 +163,17 @@ export function useOrbit() {
     await polling.current;
     await refresh();
   };
-  const fetchPspkgLinks = async (releaseId: string) => {
+  const fetchPspkgLinks = async (releaseId: string, gameId: string) => {
     const status = await api<BrowserSession>("/browser", {
-      action: "pspkg-links", releaseId, returnToOrbit: true,
+      action: "pspkg-links", releaseId, gameId, returnToOrbit: true,
     });
     if (alive.current) setBrowser(status);
     await polling.current;
     await refresh();
   };
-  const downloadPspkgLink = async (releaseId: string, linkId: string, storageId: string) => {
+  const downloadPspkgLink = async (releaseId: string, linkId: string, storageId: string, delivery: "direct" | "torbox") => {
     const status = await api<BrowserSession>("/browser", {
-      action: "pspkg-download", releaseId, linkId, storageId, returnToOrbit: true,
+      action: "pspkg-download", releaseId, linkId, storageId, delivery, returnToOrbit: true,
     });
     if (alive.current) setBrowser(status);
     await polling.current;

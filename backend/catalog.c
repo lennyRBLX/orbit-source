@@ -279,10 +279,14 @@ cJSON *release_json(const Release *r) {
     if (r->browser_url[0]) { FIELD("browserUrl", browser_url); }
     if (r->remote_catalog_id[0]) { FIELD("remoteCatalogId", remote_catalog_id); }
     if (r->remote_label[0]) { FIELD("remoteLabel", remote_label); }
+    if (r->remote_choice[0]) { FIELD("sourceChoice", remote_choice); }
     if (r->remote_provider_page[0]) { FIELD("providerPage", remote_provider_page); }
+    if (r->remote_edition[0]) { FIELD("edition", remote_edition); }
     if (r->remote_version[0]) { FIELD("version", remote_version); }
     if (r->remote_region[0]) { FIELD("region", remote_region); }
     if (r->remote_source_page[0]) { FIELD("sourcePage", remote_source_page); }
+    if (r->remote_format_hint[0]) { FIELD("formatHint", remote_format_hint); }
+    if (r->remote_compression_hint[0]) { FIELD("compressionHint", remote_compression_hint); }
     if (r->remote_filename[0]) { FIELD("filenameHint", remote_filename); }
     if (r->remote_filename_synthetic) cJSON_AddTrueToObject(o, "syntheticFilename");
     if (r->remote_page) cJSON_AddTrueToObject(o, "remotePage");
