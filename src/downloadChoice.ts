@@ -1,4 +1,4 @@
-import { formatVersion, releaseVersion, torboxSizeAllowed, type PspkgChoice, type Release } from "./types";
+import { formatLabel, formatVersion, releaseVersion, torboxSizeAllowed, type PspkgChoice, type Release } from "./types";
 import { filtersOptions, releaseFormat, releaseHasTorboxHost, releaseMatches, type BrowseFilters } from "./browse";
 
 const KEY = "orbit.download-choice.v1";
@@ -41,8 +41,30 @@ export function preferredRelease(releases: Release[], filters?: BrowseFilters, l
 }
 
 const versionOrder = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
-const versionKey = (version: string) => version.replace(/^(v\d+(?:\.\d+)*?)(?:\.0+)+$/, "$1");
+const versionKey = (version: string) => /^unknown$/i.test(version)
+  ? "" : version.replace(/^(v\d+(?:\.\d+)*?)(?:\.0+)+$/, "$1");
 const torboxRank = (available?: boolean, cached?: boolean) => available ? (cached ? 0 : 1) : 2;
+
+function filenameExtension(filename = "") {
+  return filename.slice(filename.lastIndexOf(".")).toLowerCase();
+}
+
+function archiveCompression(extension: string) {
+  switch (extension) {
+    case ".zip": return "zip";
+    case ".rar": return "rar";
+    case ".7z": return "7z";
+  }
+}
+
+export function downloadArchiveLabel({ filename }: { filename?: string }) {
+  const compression = archiveCompression(filenameExtension(filename));
+  return compression ? formatLabel({ format: "Game folder", compression }) : undefined;
+}
+
+export function downloadFormatLabel(link: Pick<Release, "filename" | "format" | "compression">) {
+  return downloadArchiveLabel(link) ?? formatLabel(link);
+}
 
 function formatRank(format: string) {
   switch (format.toUpperCase()) {
@@ -62,13 +84,17 @@ export function sortDownloadLinks<T extends Release | PspkgChoice>(
 ): T[] {
   return links.map((link) => {
     const catalogue = "sourceId" in link;
+    const extension = filenameExtension(link.filename);
+    const format = extension === ".pkg" || extension === ".ffpkg" ? "PKG" :
+      archiveCompression(extension) ? "Game folder" : catalogue ? releaseFormat(link) : link.format;
     return {
       link,
       version: versionKey(catalogue ? releaseVersion(link) : formatVersion(link.version)),
       torbox: torboxRank(torboxAvailable(link), link.torboxCached),
-      format: formatRank(catalogue ? releaseFormat(link) : link.format),
+      format: formatRank(format),
     };
   }).sort((a, b) => Number(!a.link.titleId?.trim()) - Number(!b.link.titleId?.trim()) ||
+    Number(!a.version) - Number(!b.version) ||
     versionOrder.compare(b.version, a.version) ||
     a.torbox - b.torbox || a.format - b.format).map(({ link }) => link);
 }

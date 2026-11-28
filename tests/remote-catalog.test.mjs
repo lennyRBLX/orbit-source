@@ -11,7 +11,7 @@ const { outputFiles } = await build({
       export { releaseMatches } from "./src/browse";
       export { releaseState } from "./src/collection";
       export { formatLabel, releaseSize, releaseVersion } from "./src/types";
-      export { preferredRelease, sortDownloadLinks } from "./src/downloadChoice";
+      export { downloadArchiveLabel, downloadFormatLabel, preferredRelease, sortDownloadLinks } from "./src/downloadChoice";
     `,
     resolveDir: fileURLToPath(new URL("..", import.meta.url)),
   },
@@ -20,7 +20,8 @@ const { outputFiles } = await build({
   format: "esm",
   platform: "node",
 });
-const { groupGames, releaseMatches, releaseState, formatLabel, releaseSize, releaseVersion, preferredRelease, sortDownloadLinks } = await import(
+const { groupGames, releaseMatches, releaseState, formatLabel, releaseSize, releaseVersion,
+  downloadArchiveLabel, downloadFormatLabel, preferredRelease, sortDownloadLinks } = await import(
   `data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString("base64")}`
 );
 
@@ -142,4 +143,29 @@ test("PSPKG download links use their own TorBox status and preserve link IDs", (
   ];
   assert.deepEqual(sortDownloadLinks(links, (link) => link.torboxAvailable).map(({ id }) => id),
     ["4", "5", "2", "1", "3"]);
+});
+
+test("package filename extensions outrank archive extensions in both download lists", () => {
+  const links = [
+    { id: "zip", filename: "game.pkg.ZiP", format: "PKG" },
+    { id: "rar", filename: "game.RAR", format: "FFPKG" },
+    { id: "7z", filename: "game.7Z" },
+    { id: "partial", filename: "game.PKG.part" },
+    { id: "ffpkg", filename: "game.FfPkG" },
+    { id: "pkg", filename: "game.PkG", version: "v03.0.0" },
+    { id: "newer-archive", filename: "game.zip", version: "3.1" },
+    { id: "cached-archive", filename: "game.rar", torboxCached: true },
+    { id: "unavailable-package", filename: "game.pkg", torboxAvailable: false },
+    { id: "unknown-archive", filename: "game.zip", version: "unknown" },
+    { id: "unknown-package", filename: "game.pkg", version: "" },
+  ].map((link) => ({ version: "3.0", format: "Unknown", torboxAvailable: true, ...link }));
+  const expected = ["newer-archive", "cached-archive", "ffpkg", "pkg", "zip", "rar", "7z", "partial",
+    "unavailable-package", "unknown-package", "unknown-archive"];
+  assert.deepEqual(sortDownloadLinks(links, (link) => link.torboxAvailable).map(({ id }) => id), expected);
+  const catalogue = links.map((link) => ({ ...curated, ...link }));
+  assert.deepEqual(sortDownloadLinks(catalogue, (link) => link.torboxAvailable).map(({ id }) => id), expected);
+  const labels = ["ZIP · Game folder", "RAR · Game folder", "7z · Game folder"];
+  assert.deepEqual(links.slice(0, 3).map(downloadArchiveLabel), labels);
+  assert.deepEqual(catalogue.slice(0, 3).map(downloadFormatLabel), labels);
+  assert.equal(downloadArchiveLabel({ filename: "game.zip.001" }), undefined);
 });

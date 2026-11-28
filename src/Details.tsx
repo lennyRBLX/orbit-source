@@ -9,7 +9,6 @@ import { GameSheet, PadSymbol, type SheetView } from "./GameSheet";
 import { useDebrid, torboxAvailable } from "./Debrid";
 import {
   bytes,
-  formatLabel,
   formatVersion,
   type Release,
   releaseProvider,
@@ -37,7 +36,7 @@ import { Glyph } from "./interfaces/Glyph";
 import { PnGroup, PnTile } from "./interfaces/PanoramaParts";
 import { menuKeys } from "./interfaces/menuKeys";
 import type { BrowseFilters } from "./browse";
-import { preferredRelease, rememberChoice, sortDownloadLinks } from "./downloadChoice";
+import { downloadArchiveLabel, downloadFormatLabel, preferredRelease, rememberChoice, sortDownloadLinks } from "./downloadChoice";
 import {
   CinemaEverything,
   CrossbarEverything,
@@ -278,6 +277,7 @@ export function Details({
     options.find((r) => r.id === releaseId) || options[0];
   const isPspkg = release.sourceId === "remote" && release.provider === "PSPKG";
   const version = releaseVersion(release);
+  const archiveLabel = downloadArchiveLabel(release);
   const pspkgHere = browser?.pspkgGameId === game.id || browser?.pspkgReleaseId === release.id ? browser : null;
   const listings = community?.pspkg.length ? community.pspkg : isPspkg ? [{ id: release.id, title: release.title, titleIdMatch: false }] : [];
   const listingId = pspkgListing || pspkgHere?.pspkgReleaseId ||
@@ -556,6 +556,8 @@ export function Details({
           {pspkgLinks.length > 0 && (
             <div className="pspkg-link-list">
               {pspkgLinks.map((link) => {
+                const archiveLabel = downloadArchiveLabel(link);
+                const format = archiveLabel ?? (!link.edition && [link.format, link.compression].filter(Boolean).join(" · "));
                 const size = pspkgDelivery === "torbox" && link.torboxAvailable && link.torboxSizeBytes
                   ? bytes(link.torboxSizeBytes)
                   : link.sizeBytes ? `${link.sizeExact ? "" : "≈"}${bytes(link.sizeBytes)}` : t("Unknown size");
@@ -566,7 +568,7 @@ export function Details({
                     <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
                     {(link.gameName || link.titleId || link.region) &&
                       <small>{[link.gameName, link.titleId, link.region].filter(Boolean).join(" · ")}</small>}
-                    <small>{[link.providerHost, link.edition || [link.format, link.compression].filter(Boolean).join(" · "),
+                    <small>{[link.providerHost, link.edition, format,
                       link.group, link.torboxAvailable && (link.torboxCached ? `TorBox ${t("Cached")}` : t("TorBox available")),
                       reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
                     <small>{[formatVersion(link.version), link.filename, size,
@@ -667,7 +669,7 @@ export function Details({
         <span>
           <small>{t("Source")}</small>
           <strong>
-            {releaseProvider(release)} · {formatLabel(release)}
+            {releaseProvider(release)} · {downloadFormatLabel(release)}
           </strong>
           <small>
             {version && `${t("version {version}", { version })} · `}
@@ -759,10 +761,10 @@ export function Details({
         </dl>
       )}
       <dl className="facts release-facts">
-        {(release.format !== "Unknown" || release.compression) && (
+        {(release.format !== "Unknown" || release.compression || archiveLabel) && (
           <div>
             <dt>{t("Format")}</dt>
-            <dd>{formatLabel(release)}</dd>
+            <dd>{downloadFormatLabel(release)}</dd>
           </div>
         )}
         {release.sourceId === "remote" && release.filename && (
@@ -939,7 +941,7 @@ export function Details({
             },
           ]
         : []),
-      valueRow("version", "layers", t("Version"), `${releaseProvider(release)} · ${formatLabel(release)}`, !pending && !browser?.active),
+      valueRow("version", "layers", t("Version"), `${releaseProvider(release)} · ${downloadFormatLabel(release)}`, !pending && !browser?.active),
       ...(showDownload && !isPspkg ? [valueRow("using", "cloud", t("Download using"), methodLabel, !pending && !browser?.active)] : []),
       ...(showDownload && system?.paired
         ? [valueRow("save", "drive", t("Save to"), drive ? placeName(drive.label) : t("Select storage"), !pending && !browser?.active)]
@@ -981,7 +983,7 @@ export function Details({
         ? releases.map((option) => ({
             key: option.id,
             on: release.id === option.id,
-            title: `${releaseProvider(option)} · ${formatLabel(option)}`,
+            title: `${releaseProvider(option)} · ${downloadFormatLabel(option)}`,
             sub: [
               displaySize(option),
               cacheLabel(option),
@@ -1280,7 +1282,7 @@ export function Details({
                   size="wide"
                   tone="dark"
                   kicker={releaseProvider(option)}
-                  title={`${formatLabel(option)} · ${displaySize(option)}`}
+                  title={`${downloadFormatLabel(option)} · ${displaySize(option)}`}
                   sub={[cacheLabel(option), releaseVersion(option) && t("version {version}", { version: releaseVersion(option) }), option.region, presence && t(presence.label), firmwareLabel(option)]
                     .filter(Boolean)
                     .join(" · ")}
@@ -1327,7 +1329,7 @@ export function Details({
       <section ref={page} className={`product native-game cn-game${sheetUp ? " cn-sheet-up" : ""}`} aria-labelledby="product-title">
         <div className="cn-game-page" inert={sheetUp || undefined}>
           <CinemaStage
-            kicker={[game.addonId && game.baseGameTitle, genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatformLabel(release), release.compression ? formatLabel(release).split(" · ")[0] : release.browserAvailable ? releaseProvider(release) : ""]
+            kicker={[game.addonId && game.baseGameTitle, genreName(game.genre || ""), game.releaseDate?.slice(0, 4), gamePlatformLabel(release), archiveLabel || release.compression ? downloadFormatLabel(release).split(" · ")[0] : release.browserAvailable ? releaseProvider(release) : ""]
               .filter(Boolean)
               .join(" · ")}
             title={game.title}
@@ -1489,7 +1491,7 @@ export function Details({
                           onClick={() => setReleaseId(option.id)}
                         >
                           <small>{releaseProvider(option)}</small>
-                          <strong>{formatLabel(option)}</strong>
+                          <strong>{downloadFormatLabel(option)}</strong>
                           <small>
                             {displaySize(option)}
                             {cacheLabel(option, " · ")}
@@ -1627,7 +1629,7 @@ export function Details({
           <p className="hub-release">
             {releaseProvider(release)}
             <span>·</span>
-            {formatLabel(release)}
+            {downloadFormatLabel(release)}
             <span>·</span>
             {displaySize(release)}
             <span>·</span>
@@ -1785,7 +1787,7 @@ export function Details({
                       </span>
                       <span>
                         <strong>
-                          {releaseProvider(option)} · {formatLabel(option)}
+                          {releaseProvider(option)} · {downloadFormatLabel(option)}
                         </strong>
                         <small>
                           {option.titleId}
