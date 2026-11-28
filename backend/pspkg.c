@@ -198,6 +198,54 @@ void pspkg_display_version(const char *edition, const char *filename, char *out,
     read_version(edition, filename, true, out, cap);
 }
 
+/* Compare numeric components without truncating long version strings. */
+int pspkg_compare_versions(const char *a, const char *b) {
+    if (!*a || !*b) return !!*a - !!*b;
+    while (*a || *b) {
+        a += strspn(a, "0");
+        b += strspn(b, "0");
+        size_t a_len = strspn(a, "0123456789"), b_len = strspn(b, "0123456789");
+        if (a_len != b_len) return a_len > b_len ? 1 : -1;
+        int order = strncmp(a, b, a_len);
+        if (order) return order;
+        a += a_len;
+        b += b_len;
+        if (*a && *a != '.') return 0;
+        if (*b && *b != '.') return 0;
+        if (*a) a++;
+        if (*b) b++;
+    }
+    return 0;
+}
+
+static size_t read_patch_components(const char *text, unsigned values[3], size_t widths[3]) {
+    for (size_t i = 0; i < 3; i++) {
+        widths[i] = strspn(text, "0123456789");
+        if (!widths[i] || widths[i] > 3) return 0;
+        for (size_t digit = 0; digit < widths[i]; digit++)
+            values[i] = values[i] * 10 + (unsigned)(text[digit] - '0');
+        text += widths[i];
+        if (!*text) return i + 1;
+        if (*text++ != '.') return 0;
+    }
+    return 0;
+}
+
+bool pspkg_patch_matches(const char *version, const char *patch, bool ps5) {
+    unsigned v[3] = {0}, p[3] = {0};
+    size_t widths[3], patch_widths[3];
+    size_t count = read_patch_components(version, v, widths);
+    size_t patch_count = read_patch_components(patch, p, patch_widths);
+    if (count < 2 || patch_count != (ps5 ? 3U : 2U) || v[0] != p[0]) return false;
+    if (count == patch_count) return v[1] == p[1] && v[2] == p[2];
+    if (!ps5 || count != 2) return false;
+    /* PS5 filenames sometimes shorten 02.120 to 2.12. The caller requires a
+     * unique match across patches before filling in the missing component. */
+    unsigned shortened = v[1];
+    for (size_t i = widths[1]; i < patch_widths[1]; i++) shortened *= 10;
+    return v[1] == p[1] || shortened == p[1];
+}
+
 static bool read_char(const unsigned char *bytes, size_t length, size_t *at,
                       size_t step, unsigned char *out) {
     if (*at + step > length || (step == 2 && bytes[*at + 1])) return false;

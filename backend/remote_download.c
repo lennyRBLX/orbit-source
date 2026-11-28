@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #define PAGE_LIMIT (1024U * 1024U)
 enum { ARCHIVE_FILE_LOGIN_REQUIRED = -4 };
@@ -23,6 +24,8 @@ typedef struct {
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
     bool metadata_only, redirect_status, range, plain_text, html_only, archive_session, use_http1;
     const char *page_token;
+    const char *json_post, *referer;
+    long timeout;
     const char *initial_url;
     CURLcode code;
     long status;
@@ -183,14 +186,28 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, r);
     curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, before_request);
     curl_easy_setopt(curl, CURLOPT_PREREQDATA, r);
-    /* The Rootz page token belongs only to the origin that issued it. */
+    /* Only send provider tokens and POST bodies to their original endpoint. */
     struct curl_slist *headers_out = NULL;
     if (r->page_token) {
         headers_out = curl_slist_append(NULL, r->page_token);
         if (!headers_out) { curl_easy_cleanup(curl); r->handle = NULL; return false; }
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers_out);
     }
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->page_token ? 0L : 1L);
+    if (r->json_post) {
+        headers_out = curl_slist_append(NULL, "Content-Type: application/x-www-form-urlencoded; charset=UTF-8");
+        struct curl_slist *with_accept = headers_out ? curl_slist_append(headers_out, "Accept: application/json") : NULL;
+        if (!with_accept) {
+            curl_slist_free_all(headers_out);
+            curl_easy_cleanup(curl);
+            r->handle = NULL;
+            return false;
+        }
+        headers_out = with_accept;
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers_out);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, r->json_post);
+        curl_easy_setopt(curl, CURLOPT_REFERER, r->referer);
+    }
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, r->page_token || r->json_post ? 0L : 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
 #ifndef ORBIT_TEST
     const char *protocols = r->direct && !strncasecmp(url, "http://", 7) ? "http,https" : "https";
@@ -201,7 +218,7 @@ static bool fetch(const char *url, Response *r) {
     curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
 #endif
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, r->timeout ? r->timeout : 12L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Orbit-Store/" ORBIT_VERSION);
     /* BuzzHeavier can challenge HTTP/2 requests, including after a PSPKG redirect. */
@@ -1436,6 +1453,157 @@ cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status,
         ? pspkg_field_labels(page.body) : NULL;
     free(page.body);
     return fields;
+}
+
+static bool patch_key(const char *tag, const char *end, const char *id, bool ps5, char key[65]) {
+    char value[16], title_id[10], candidate[65];
+    if (!tag_is(tag + 1, "div") || !tag_value(tag, end, "id", value, sizeof value) ||
+        strcmp(value, "dynpatch")) return false;
+    if (ps5) {
+        if (!tag_value(tag, end, "data-titleid", title_id, sizeof title_id) || strcmp(title_id, id) ||
+            !tag_value(tag, end, "data-key", candidate, sizeof candidate)) return false;
+    } else {
+        char params[128];
+        if (!tag_value(tag, end, "data-loadparams", params, sizeof params)) return false;
+        for (char *p = params; *p; p++) if (*p == '\'') *p = '"';
+        cJSON *data = cJSON_ParseWithOpts(params, NULL, true);
+        const char *value = json_text(data, "key");
+        bool ok = !strcmp(json_text(data, "titleid"), id) && strlen(value) == 64;
+        if (ok) copy_text(candidate, sizeof candidate, value);
+        cJSON_Delete(data);
+        if (!ok) return false;
+    }
+    if (strlen(candidate) != 64 || strspn(candidate, "0123456789abcdefABCDEF") != 64) return false;
+    copy_text(key, 65, candidate);
+    return true;
+}
+
+/* Read the current patch key from the public title page. */
+static void patch_title_page(const char *html, const char *id, bool ps5, char *name, size_t cap, char key[65]) {
+    for (const char *tag = html; (tag = strchr(tag, '<'));) {
+        const char *next = skip_markup(tag);
+        if (next != tag) { tag = next; continue; }
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        char title[256];
+        if (!*name && tag_is(tag + 1, "title") && element_text(tag, end, title, sizeof title) &&
+            !strncmp(title, id, 9) && !strncmp(title + 9, ": ", 2)) {
+            char *suffix = ps5 ? NULL : strstr(title + 11, " | ORBISPatches.com");
+            if (suffix) *suffix = 0;
+            if (strlen(title + 11) < cap) copy_text(name, cap, title + 11);
+        }
+        if (patch_key(tag, end, id, ps5, key)) break;
+        tag = end + 1;
+    }
+}
+
+static cJSON *patch_json(const char *url, const char *post, const char *referer, atomic_bool *cancel) {
+    Response response = {.cancel = cancel, .collect_page = true, .metadata_only = true,
+                         .json_post = post, .referer = referer, .timeout = 4};
+    cJSON *reply = fetch(url, &response) && !strcmp(response.url, url) &&
+        response.json && response.body && !response.truncated
+        ? cJSON_ParseWithOpts(response.body, NULL, true) : NULL;
+    free(response.body);
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(reply, "success"))) return reply;
+    cJSON_Delete(reply);
+    return NULL;
+}
+
+static void patch_search(const char *url, const char *id, atomic_bool *cancel, char *name, size_t cap,
+                         char region[5]) {
+    cJSON *reply = patch_json(url, NULL, NULL, cancel);
+    const cJSON *result;
+    cJSON_ArrayForEach(result, cJSON_GetObjectItemCaseSensitive(reply, "results")) {
+        if (strcmp(json_text(result, "titleid"), id)) continue;
+        const char *title = json_text(result, "name");
+        if (strlen(title) < cap) copy_text(name, cap, title);
+        const char *code = json_text(result, "region");
+        if (!strcmp(code, "US")) code = "USA";
+        else if (!strcmp(code, "EU")) code = "EUR";
+        else if (!strcmp(code, "JP")) code = "JPN";
+        else if (!strcmp(code, "AS")) code = "ASIA";
+        size_t length = strlen(code);
+        if (length >= 2 && length < 5 && strspn(code, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == length)
+            copy_text(region, 5, code);
+        break;
+    }
+    cJSON_Delete(reply);
+}
+
+static cJSON *patch_title(const char *id, bool ps5, atomic_bool *cancel, char *name, size_t cap, char region[5]) {
+    const char *origin = ps5 ? "https://prosperopatches.com" : "https://orbispatches.com";
+#ifdef ORBIT_TEST
+    origin = getenv(ps5 ? "ORBIT_TEST_PROSPEROPATCHES_URL" : "ORBIT_TEST_ORBISPATCHES_URL");
+    if (!origin || strncmp(origin, "http://127.0.0.1:", 17)) return NULL;
+#endif
+    char url[256], api[256], key[65] = "", post[128];
+    if (snprintf(url, sizeof url, "%s/%s", origin, id) >= (int)sizeof url ||
+        snprintf(api, sizeof api, "%s/api/internal/search?term=%s", origin, id) >= (int)sizeof api)
+        return NULL;
+    patch_search(api, id, cancel, name, cap, region);
+
+    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true,
+                     .html_only = true, .timeout = 4};
+    if (fetch(url, &page) && page.body && !page.truncated && !strcmp(page.url, url))
+        patch_title_page(page.body, id, ps5, name, cap, key);
+    free(page.body);
+    if (!*key || snprintf(api, sizeof api, "%s/api/internal/loadpatches", origin) >= (int)sizeof api)
+        return NULL;
+
+    snprintf(post, sizeof post, "{\"titleid\":\"%s\",\"key\":\"%s\"}", id, key);
+    cJSON *reply = patch_json(api, post, url, cancel);
+    if (!strcmp(json_text(reply, "titleid"), id) &&
+        cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(reply, "patches"))) return reply;
+    cJSON_Delete(reply);
+    return NULL;
+}
+
+void remote_pspkg_patch_metadata(PspkgLink *links, size_t count, bool ps5, atomic_bool *cancel) {
+    if (count > PSPKG_LINK_LIMIT) return;
+    char ids[PSPKG_LINK_LIMIT][10] = {{0}};
+    const char *prefix = ps5 ? "PPSA" : "CUSA";
+    for (size_t i = 0; i < count; i++) {
+        PspkgLink *link = &links[i];
+        link->game_name[0] = link->patch_version[0] = link->patch_title_id[0] = link->patch_region[0] = 0;
+        const char *filename_id = pspkg_title_id(link->filename);
+        const char *label_id = pspkg_title_id(link->label);
+        const char *id = link->title_id[0] ? link->title_id : filename_id ? filename_id : label_id;
+        if (!id || strncasecmp(id, prefix, 4) || strspn(id + 4, "0123456789") != 5 ||
+            (filename_id && strncasecmp(id, filename_id, 9)) ||
+            (label_id && strncasecmp(id, label_id, 9))) continue;
+        memcpy(ids[i], prefix, 4);
+        memcpy(ids[i] + 4, id + 4, 5);
+    }
+    struct timespec started = {0}, now = {0};
+    bool timed = !clock_gettime(CLOCK_MONOTONIC, &started);
+    for (size_t i = 0; i < count && !atomic_load(cancel); i++) {
+        if (!ids[i][0]) continue;
+        if (timed && !clock_gettime(CLOCK_MONOTONIC, &now) && now.tv_sec - started.tv_sec >= 12) break;
+        char name[sizeof links[0].game_name] = "", region[5] = "";
+        cJSON *reply = patch_title(ids[i], ps5, cancel, name, sizeof name, region);
+        const cJSON *patches = cJSON_GetObjectItemCaseSensitive(reply, "patches");
+        for (size_t j = i; j < count; j++) {
+            if (strcmp(ids[i], ids[j])) continue;
+            PspkgLink *link = &links[j];
+            if (j != i) ids[j][0] = 0;
+            if (*name) copy_text(link->game_name, sizeof link->game_name, name);
+            if (*region) copy_text(link->patch_region, sizeof link->patch_region, region);
+            copy_text(link->patch_title_id, sizeof link->patch_title_id, ids[i]);
+            char version[sizeof link->version];
+            if (!strcmp(link->reason, "unsupported-category")) continue;
+            pspkg_display_version(link->edition, link->filename, version, sizeof version);
+            const cJSON *patch;
+            const char *match = NULL;
+            cJSON_ArrayForEach(patch, patches) {
+                const char *candidate = json_text(patch, ps5 ? "content_ver" : "version");
+                if (!pspkg_patch_matches(version, candidate, ps5)) continue;
+                if (match && strcmp(match, candidate)) { match = NULL; break; }
+                match = candidate;
+            }
+            if (match) copy_text(link->patch_version, sizeof link->patch_version, match);
+        }
+        cJSON_Delete(reply);
+    }
 }
 
 static void download_page_metadata(const Response *page, const Release *r, RemoteFileMetadata *metadata) {

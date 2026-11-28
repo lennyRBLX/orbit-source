@@ -9,6 +9,7 @@
 #define METADATA_REQUEST_LIMIT 32
 
 #include "orbit.h"
+#include "pspkg.h"
 
 /* Startup loads the built-in catalogues and their cache before reading the queue. */
 int remote_sources_load(void);
@@ -86,6 +87,7 @@ typedef enum {
     REMOTE_METADATA_ARCHIVE_LOGIN,
 } RemoteMetadataStatus;
 const char *remote_metadata_status(RemoteMetadataStatus status);
+void remote_pspkg_patch_metadata(PspkgLink *links, size_t count, bool ps5, atomic_bool *cancel);
 cJSON *remote_pspkg_public_fields(const char *url, RemoteMetadataStatus *status, atomic_bool *cancel);
 typedef struct {
     RemoteMetadataStatus status;

@@ -559,6 +559,7 @@ export function Details({
                     disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
                     onClick={() => void selectPspkgLink(link.id)}>
                     <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
+                    {link.gameName && <small>{[link.gameName, link.titleId, link.region].filter(Boolean).join(" · ")}</small>}
                     <small>{[link.providerHost, link.edition || [link.titleId, link.region, link.format, link.compression].filter(Boolean).join(" · "),
                       link.group, link.torboxCached && t("Cached"), reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
                     {(link.version || link.filename || size || link.hasArchivePassword) ? (

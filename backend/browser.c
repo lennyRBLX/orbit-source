@@ -882,7 +882,18 @@ static void read_pspkg_pages_locked(void) {
         if (missing) copy_text(link.reason, sizeof link.reason, "missing-page");
         else if (requires_login) copy_text(link.reason, sizeof link.reason, "archive-login-required");
         else if (read && active()) {
+            char before[sizeof link.version], after[sizeof link.version], previous_id[10] = "";
+            const char *filename_id = pspkg_title_id(link.filename);
+            if (filename_id) snprintf(previous_id, sizeof previous_id, "%.9s", filename_id);
+            pspkg_display_version(link.edition, link.filename, before, sizeof before);
             update_pspkg_metadata(&link, &metadata);
+            pspkg_display_version(link.edition, link.filename, after, sizeof after);
+            filename_id = pspkg_title_id(link.filename);
+            if (strcmp(before, after) || strncmp(previous_id, filename_id ? filename_id : "", 9)) {
+                char platform[4], game_id[13];
+                if (pspkg_page_identity(session.release.browser_url, platform, sizeof platform, game_id, sizeof game_id))
+                    remote_pspkg_patch_metadata(&link, 1, !strcmp(platform, "ps5"), &session.cancel);
+            }
             update_pspkg_provider(&link, page.url);
             link.reason[0] = 0;
         }
@@ -1011,6 +1022,8 @@ static void *worker(void *unused) {
                 if (!atomic_load(&session.cancel)) session.pspkg_links[i] = *link;
                 pthread_mutex_unlock(&orbit.mutex);
             }
+            if (ok && active())
+                remote_pspkg_patch_metadata(found.links, found.count, !strcmp(found.platform, "ps5"), &session.cancel);
             pthread_mutex_lock(&orbit.mutex);
             if (ok && selected_locked() && !atomic_load(&session.cancel)) {
                 memcpy(session.pspkg_links, found.links, found.count * sizeof found.links[0]);
@@ -1338,7 +1351,25 @@ cJSON *browser_status(void) {
             session.pspkg_count = 0;
         }
         cJSON *choices = cJSON_AddArrayToObject(o, "pspkgLinks");
-        for (size_t i = 0; !expired && choices && i < session.pspkg_count; i++) {
+        /* Keep the original slot IDs stable for downloads and browser handoffs. */
+        size_t order[PSPKG_LINK_LIMIT];
+        char versions[PSPKG_LINK_LIMIT][sizeof session.pspkg_links[0].version];
+        for (size_t i = 0; i < session.pspkg_count; i++) {
+            const PspkgLink *link = &session.pspkg_links[i];
+            if (*link->patch_version) copy_text(versions[i], sizeof versions[i], link->patch_version);
+            else {
+                pspkg_display_version(link->edition, link->filename, versions[i], sizeof versions[i]);
+                if (!*versions[i]) copy_text(versions[i], sizeof versions[i], link->version);
+            }
+            size_t position = i;
+            while (position && pspkg_compare_versions(versions[order[position - 1]], versions[i]) < 0) {
+                order[position] = order[position - 1];
+                position--;
+            }
+            order[position] = i;
+        }
+        for (size_t position = 0; !expired && choices && position < session.pspkg_count; position++) {
+            size_t i = order[position];
             const PspkgLink *link = &session.pspkg_links[i];
             if (!strcmp(link->reason, "missing-page") || !strcmp(link->reason, "provider-unavailable") ||
                 !strcmp(link->reason, "archive-login-required") ||
@@ -1359,11 +1390,10 @@ cJSON *browser_status(void) {
                 cJSON_AddBoolToObject(choice, "sizeExact", link->size_exact);
             }
             if (link->archive_password[0]) cJSON_AddTrueToObject(choice, "hasArchivePassword");
-            cJSON_AddStringToObject(choice, "titleId", link->title_id);
-            char version[sizeof link->version];
-            pspkg_display_version(link->edition, link->filename, version, sizeof version);
-            cJSON_AddStringToObject(choice, "version", version[0] ? version : link->version);
-            cJSON_AddStringToObject(choice, "region", link->region);
+            cJSON_AddStringToObject(choice, "titleId", *link->patch_title_id ? link->patch_title_id : link->title_id);
+            if (link->game_name[0]) cJSON_AddStringToObject(choice, "gameName", link->game_name);
+            cJSON_AddStringToObject(choice, "version", versions[i]);
+            cJSON_AddStringToObject(choice, "region", *link->patch_region ? link->patch_region : link->region);
             cJSON_AddStringToObject(choice, "format", link->format);
             cJSON_AddStringToObject(choice, "compression", link->compression);
             cJSON_AddStringToObject(choice, "reason", link->reason);

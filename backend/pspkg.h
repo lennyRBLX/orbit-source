@@ -12,6 +12,7 @@ typedef struct {
     char link_id[13];
     char url[2048], provider[256];
     char label[128], edition[128], title_id[16], version[32], region[32], format[24], compression[16];
+    char game_name[128], patch_version[32], patch_title_id[10], patch_region[5];
     char group[128], filename[160], archive_password[129];
     char reason[32];
     int64_t size, torbox_size;
@@ -30,6 +31,8 @@ bool pspkg_link_matches(const char *url, const char *page, const char *platform,
 const char *pspkg_title_id(const char *text);
 void pspkg_version(const char *edition, const char *filename, char *out, size_t cap);
 void pspkg_display_version(const char *edition, const char *filename, char *out, size_t cap);
+bool pspkg_patch_matches(const char *version, const char *patch, bool ps5);
+int pspkg_compare_versions(const char *a, const char *b);
 /* Reads only PSPKG link IDs for the selected game from browser memory. */
 void pspkg_scan_links(const unsigned char *bytes, size_t length, const char *platform,
                       const char *game_id, PspkgLink *links, size_t *count, size_t cap);

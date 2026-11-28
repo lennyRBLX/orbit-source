@@ -51,6 +51,15 @@ int main(int argc, char **argv) {
         assert(!strcmp(version, versions[i].display));
     }
 
+    assert(pspkg_compare_versions("02.500.200", "02.500.100") > 0);
+    assert(pspkg_compare_versions("1.10", "1.9") > 0);
+    assert(pspkg_compare_versions("02.120.000", "2.120") == 0);
+    assert(pspkg_compare_versions("1.00", "") > 0);
+    assert(pspkg_patch_matches("2.12", "02.120.000", true));
+    assert(!pspkg_patch_matches("2.120.001", "02.120.000", true));
+    assert(pspkg_patch_matches("1.61", "01.61", false));
+    assert(!pspkg_patch_matches("1.6", "01.60", false));
+
     /* PSPKG's successful reveal response contains relative links in HTML,
      * sometimes with HTML-escaped query separators. Reject other game IDs. */
     const char *html = "<a href=\"download.php?game_id=14552&edition_id=29336&link_id=85873&amp;route=browser\">Viki</a>"

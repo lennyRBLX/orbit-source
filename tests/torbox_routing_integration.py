@@ -29,6 +29,12 @@ ARCHIVE_UNAVAILABLE = (b"<title>Item not available</title><h1>Item not available
 BUZZ_REMOVED = b"<p>Try <strong>recovering this file</strong>.</p><button>Download file</button>"
 GTA_SLUG = "grand-theft-auto-vi-14552"
 GTA_HANDOFFS = ("86105", "86106", "86107")
+PATCH_KEY = "a" * 64
+PATCH_TITLES = {
+    "PPSA03974": ("US", ["02.120.000", "02.500.200", "02.310.000", "02.310.100"]),
+    "PPSA04029": ("EU", ["02.500.200"]),
+    "CUSA16579": ("EU", ["01.09", "01.61"]),
+}
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -55,6 +61,19 @@ class Fixture(BaseHTTPRequestHandler):
                 "logged-in-user": "fixture-user", "logged-in-sig": "fixture-signature",
             }}}
             self.reply(json.dumps(result).encode(), headers={"Content-Type": "application/json"})
+            return
+        if self.path == "/api/internal/loadpatches":
+            request = json.loads(body)
+            title_id = request["titleid"]
+            self.server.calls.append("patches:" + title_id)
+            if request["key"] != PATCH_KEY or self.headers["Referer"] != self.server.base + "/" + title_id:
+                self.reply(b"", 400)
+                return
+            version_field = "content_ver" if title_id.startswith("PPSA") else "version"
+            versions = PATCH_TITLES[title_id][1]
+            self.reply(json.dumps({"success": True, "titleid": title_id,
+                                   "patches": [{version_field: v} for v in versions]}).encode(),
+                       headers={"Content-Type": "application/json"})
             return
         if self.path != "/webdl/createwebdownload":
             self.reply(b"", 404)
@@ -121,6 +140,22 @@ class Fixture(BaseHTTPRequestHandler):
             self.api(items)
         elif path == "/webdl/requestdl":
             self.api(self.server.base + "/torbox-file")
+        elif path == "/api/internal/search":
+            title_id = parse_qs(urlsplit(self.path).query)["term"][0]
+            self.server.calls.append("search:" + title_id)
+            results = [{"titleid": "PPSA99999", "name": "Unrelated result", "region": "JP"},
+                       {"titleid": title_id, "name": "Cyberpunk 2077", "region": PATCH_TITLES[title_id][0]}]
+            self.reply(json.dumps({"success": True, "results": results}).encode(),
+                       headers={"Content-Type": "application/json"})
+        elif path[1:] in PATCH_TITLES:
+            title_id = path[1:]
+            if title_id.startswith("PPSA"):
+                params = f'data-titleid="{title_id}" data-key="{PATCH_KEY}"'
+            else:
+                params = f"""data-loadparams="{{ 'titleid': '{title_id}', 'key': '{PATCH_KEY}' }}" """
+            self.reply(f'<div id="dynpatch" {params}></div>'.encode(), headers={"Content-Type": "text/html"})
+        elif path == "/ps4/ps4-games-list":
+            self.reply(b'<a href="/ps4/cyberpunk-2077-13811.html">Cyberpunk 2077</a>')
         elif path == "/ps5/ps5-games-list":
             if self.server.pspkg_mode in ("pages", "pages-missing"):
                 self.reply(f'<a href="/ps5/{GTA_SLUG}.html">Grand Theft Auto VI (GTA 6)</a>'.encode())
@@ -130,13 +165,19 @@ class Fixture(BaseHTTPRequestHandler):
             self.reply(b'<h3 class="dpx-edition-title">PPSA38500 01.002.001 PKG</h3>'
                        b'<div class="dpx-gate" data-field-id="29356">Awaiting verification</div>',
                        headers={"Content-Type": "text/html"})
-        elif path == "/ps5/download-cyberpunk-2077-ultimate-edition-13811.html":
+        elif path in ("/ps5/download-cyberpunk-2077-ultimate-edition-13811.html",
+                      "/ps4/download-cyberpunk-2077-13811.html"):
             if getattr(self.server, "pspkg_missing", False):
                 self.reply(b"<title>Missing</title>", 404, {"Content-Type": "text/html"})
             else:
                 headings = ["PPSA04029 v02.120 EUR PKG", "PPSA04029 v02.120 EUR PKG",
                             "PPSA04029 v02.120 EUR PKG", "PPSA04027 ZSTD", "PPSA04029 PKG"]
-                if self.server.pspkg_mode == "metadata":
+                if self.server.pspkg_mode == "patches-ps5":
+                    headings = ["PPSA03974 v2.12 PKG", "PPSA04029 02.500.200 PKG",
+                                "PPSA03974 02.310 PKG", "PPSA03974 PKG"]
+                elif self.server.pspkg_mode == "patches-ps4":
+                    headings = ["CUSA16579 v1.09 PKG", "CUSA16579 v1.61 PKG", "CUSA16579 PKG"]
+                elif self.server.pspkg_mode == "metadata":
                     headings[0] = "PPSA04029 EUR PKG"
                 if self.server.pspkg_mode == "unavailable":
                     headings.append("PPSA04029 PKG")
@@ -144,7 +185,7 @@ class Fixture(BaseHTTPRequestHandler):
                                 f'<div class="dpx-gate" data-field-id="{i}">Awaiting verification</div>'
                                 for i, heading in enumerate(headings, 1))
                 self.reply(gates.encode(), headers={"Content-Type": "text/html"})
-        elif path == "/ps5/download.php":
+        elif path in ("/ps5/download.php", "/ps4/download.php"):
             self.server.calls.append(self.path)
             routes = {
                 "1": "/pspkg-provider/vikingfile.com/file.pkg",
@@ -314,8 +355,17 @@ class TorBoxRouting(unittest.TestCase):
                         reveal["fields"] = {"29356": "".join(
                             f'<a href="download.php?game_id=14552&amp;edition_id=29356&amp;link_id={link_id}">Provider</a>'
                             for link_id in GTA_HANDOFFS)}
-                    env.update(ORBIT_TEST_PSPKG_PS5_URL=fixture.base + "/ps5/",
-                               ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
+                    if pspkg.startswith("patches-"):
+                        routes = ("1", "3", "2", "expired") if pspkg == "patches-ps5" else ("1", "3", "expired")
+                        reveal["fields"] = {str(i): anchor(link) for i, link in enumerate(routes, 1)}
+                    env.update(ORBIT_TEST_PSPKG_HTML=json.dumps(reveal))
+                    if pspkg == "patches-ps4":
+                        env.update(ORBIT_TEST_PSPKG_PS4_URL=fixture.base + "/ps4/",
+                                   ORBIT_TEST_ORBISPATCHES_URL=fixture.base)
+                    else:
+                        env["ORBIT_TEST_PSPKG_PS5_URL"] = fixture.base + "/ps5/"
+                    if pspkg == "patches-ps5":
+                        env["ORBIT_TEST_PROSPEROPATCHES_URL"] = fixture.base
                     if pspkg == "cancel":
                         env["ORBIT_TEST_PSPKG_DELAY_MS"] = "1500"
                     if pspkg == "expire":
@@ -420,6 +470,20 @@ class TorBoxRouting(unittest.TestCase):
             return
         self.assertEqual(status["pspkgStatus"], "partial")
         choices = status["pspkgLinks"]
+        if mode.startswith("patches-"):
+            expected = ([("2", "PPSA04029", "EUR", "02.500.200"),
+                         ("3", "PPSA03974", "USA", "02.310"),
+                         ("1", "PPSA03974", "USA", "02.120.000"),
+                         ("4", "PPSA03974", "USA", "")]
+                        if mode == "patches-ps5" else
+                        [("2", "CUSA16579", "EUR", "01.61"),
+                         ("1", "CUSA16579", "EUR", "01.09"),
+                         ("3", "CUSA16579", "EUR", "")])
+            self.assertEqual([(link["id"], link["titleId"], link["region"], link["version"]) for link in choices],
+                             expected)
+            self.assertEqual({link["gameName"] for link in choices}, {"Cyberpunk 2077"})
+            self.assertEqual(call("/downloads"), [])
+            return
         if mode == "unavailable":
             self.assertEqual([link["number"] for link in choices], [1, 4, 5, 6])
             self.assertEqual([link["number"] for link in choices if not link["reason"]], [1])
@@ -461,6 +525,14 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual(job["status"], "complete", job)
         self.assertEqual(job["delivery"], "torbox" if mode == "supported" else "direct")
         self.assertEqual((drive / "homebrew" / job["filename"]).read_bytes(), FILE)
+
+    def test_pspkg_labels_exact_regions_and_sorts_matched_versions(self):
+        for platform, title_ids in (("ps5", ["PPSA03974", "PPSA04029"]), ("ps4", ["CUSA16579"])):
+            with self.subTest(platform=platform):
+                calls = self.run_download([], pspkg="patches-" + platform)
+                for title_id in title_ids:
+                    self.assertEqual(calls.count("search:" + title_id), 1)
+                    self.assertEqual(calls.count("patches:" + title_id), 1)
 
     def test_pspkg_uses_resolved_provider_coverage_for_both_routes(self):
         hosts = [{"domains": ["buzzheavier.com"], "status": True}]

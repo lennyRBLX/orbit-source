@@ -410,6 +410,7 @@ export const bytes = (n: number) => {
 
 export interface PspkgChoice {
   id: string;
+  gameName?: string;
   label: string;
   number: number;
   edition: string;
