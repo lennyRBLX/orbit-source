@@ -3,6 +3,7 @@
 #include "browser_platform.h"
 #include "browser_match.h"
 #include "provider_network.h"
+#include "remote_sources.h"
 #include "ca.h"
 #include <ctype.h>
 #include <openssl/crypto.h>
@@ -17,6 +18,7 @@ typedef struct {
     size_t length;
     char location[2048], type[128];
     long status;
+    bool challenge;
     atomic_bool *cancel;
 } Page;
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -194,6 +196,11 @@ static size_t header(char *data, size_t a, size_t b, void *context) {
     if (a && b > SIZE_MAX / a) return 0;
     size_t n = a * b;
     if (n > 8192) return 0;
+    if (n > 13 && !strncasecmp(data, "cf-mitigated:", 13)) {
+        size_t offset = 13;
+        while (offset < n && (data[offset] == ' ' || data[offset] == '\t')) offset++;
+        page->challenge = n - offset >= 9 && !strncasecmp(data + offset, "challenge", 9);
+    }
     char *dest = NULL; size_t cap = 0, prefix = 0;
     if (n > 9 && !strncasecmp(data, "Location:", 9)) { dest = page->location; cap = sizeof page->location; prefix = 9; }
     if (n > 13 && !strncasecmp(data, "Content-Type:", 13)) { dest = page->type; cap = sizeof page->type; prefix = 13; }
@@ -211,7 +218,8 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
     if (a && b > SIZE_MAX / a) return 0;
     size_t n = a * b;
     /* Stop unexpected binary responses immediately, even if Range was ignored. */
-    if (strncasecmp(page->type, "text/html", 9) || n > PAGE_MAX - page->length) return 0;
+    if ((strncasecmp(page->type, "text/html", 9) && strncasecmp(page->type, "text/plain", 10)) ||
+        n > PAGE_MAX - page->length) return 0;
     char *next = realloc(page->body, page->length + n + 1);
     if (!next) return 0;
     page->body = next;
@@ -283,7 +291,8 @@ VikingState viking_pass_probe(const char *value, atomic_bool *cancel) {
     curl_easy_cleanup(curl);
     return state;
 }
-bool viking_resolve_download(Release *release, bool native, atomic_bool *cancel) {
+bool viking_resolve_download(Release *release, bool native, atomic_bool *cancel, bool *missing) {
+    *missing = false;
     if (strcmp(release->source, "vikingfile") || !provider_browser_supported(release)) return false;
     const char *path = strstr(release->browser_url, "/f/");
     if (!path || strlen(path) != 13) return false;
@@ -315,7 +324,10 @@ bool viking_resolve_download(Release *release, bool native, atomic_bool *cancel)
     bool ready = false;
     if (state == VIKING_SIGNED_IN && (!cancel || !atomic_load(cancel))) {
         Page page = {.cancel = cancel};
-        if (request(curl, path, &page)) {
+        bool fetched = request(curl, path, &page);
+        if (!cancel || !atomic_load(cancel))
+            *missing = remote_download_html_missing(page.status, fetched ? page.body : NULL, page.challenge);
+        if (fetched && !*missing) {
             char target[2048];
             if (page.location[0] == '/' && page.location[1] != '/')
                 snprintf(target, sizeof target, "%s%s", origin(), page.location);

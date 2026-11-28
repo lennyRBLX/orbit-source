@@ -6,7 +6,7 @@
  * Orbit. Only a foreground user's explicitly selected browser store is read. */
 typedef enum { VIKING_UNKNOWN, VIKING_SIGNED_OUT, VIKING_SIGNED_IN } VikingState;
 VikingState viking_check_session(bool native, atomic_bool *cancel);
-bool viking_resolve_download(Release *release, bool native, atomic_bool *cancel);
+bool viking_resolve_download(Release *release, bool native, atomic_bool *cancel, bool *missing);
 void viking_download_context(Release *release, bool native);
 bool viking_apply_download(CURL *curl, const Release *release);
 /* Kept separate for tests with synthetic databases, never exposed by HTTP. */

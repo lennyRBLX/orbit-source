@@ -487,7 +487,7 @@ static bool pspkg_file_candidate(const char *url) {
     if (!path || ((size_t)(path - host) == strlen("pspkg.com") &&
         !strncasecmp(host, "pspkg.com", strlen("pspkg.com")))) return false;
     size_t length = strcspn(path, "?");
-    const char *suffixes[] = {".pkg", ".zip", ".7z", ".rar", ".ffpfsc", ".exfat"};
+    const char *suffixes[] = {".pkg", ".fpkg", ".zip", ".7z", ".rar", ".ffpfsc", ".exfat"};
     for (size_t i = 0; i < sizeof suffixes / sizeof *suffixes; i++) {
         size_t n = strlen(suffixes[i]);
         if (length > n && !strncasecmp(path + length - n, suffixes[i], n)) return true;
@@ -498,6 +498,15 @@ static bool pspkg_file_candidate(const char *url) {
 bool provider_capture_url(const Release *release, const char *candidate) {
     if (!provider_browser_source(release->source) || !candidate || strlen(candidate) >= sizeof release->url) return false;
     if (!strcmp(release->source, "pspkg")) {
+        if (release->remote_choice[0]) {
+            /* A browser-only PSPKG step must stay tied to its advertised
+             * file. A provider URL from another tab is insufficient. */
+            char filename[160];
+            bool named = provider_disposition_name(candidate, filename, sizeof filename) ||
+                         remote_url_filename(candidate, filename, sizeof filename);
+            return named && (pspkg_file_candidate(candidate) || provider_transfer_url_allowed(candidate)) &&
+                   strlen(release->title_id) == 9 && strcasestr(filename, release->title_id);
+        }
         const char *provider = remote_browser_provider(candidate);
         if (!*provider) return pspkg_file_candidate(candidate);
         /* This is a stable landing page. Resolution or the existing

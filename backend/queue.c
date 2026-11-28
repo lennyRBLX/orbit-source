@@ -348,6 +348,13 @@ static int create_locked(const Release *r, const char *sid, const Storage *pin,
                   "This download option is no longer available.");
         return 409;
     }
+    if ((!pin || dry_run) && remote_link_missing_locked(r)) {
+        Release mirror;
+        if (!remote_next_mirror_locked(r, "", &mirror)) {
+            copy_text(err, cap, REMOTE_DOWNLOAD_REMOVED);
+            return 409;
+        }
+    }
     Job delivery_job = {0};
     if (delivery && *delivery && strcmp(delivery, "direct") && !torbox) {
         copy_text(err, cap, "Choose direct or torbox delivery."); return 400;

@@ -408,6 +408,7 @@ export interface PspkgChoice {
   format: string;
   compression: string;
   reason: string;
+  providerHost?: string;
   torboxAvailable?: boolean;
 }
 

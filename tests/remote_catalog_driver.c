@@ -214,8 +214,10 @@ int main(int argc, char **argv) {
                 const cJSON *ids = cJSON_GetObjectItemCaseSensitive(request, "ids"), *id;
                 cJSON_ArrayForEach(id, ids) {
                     Release *r = cJSON_IsString(id) ? release_find(id->valuestring) : NULL;
-                    if (r && !strcmp(r->source, "remote"))
+                    if (r && !strcmp(r->source, "remote")) {
+                        r->remote_group = r->remote_alias = 0;
                         memset(r->mirror_key, 'a', sizeof r->mirror_key - 1);
+                    }
                 }
                 catalog_view_invalidate_locked();
                 print_json(cJSON_CreateTrue());

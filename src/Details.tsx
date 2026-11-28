@@ -495,6 +495,7 @@ export function Details({
       case "expired": return t("Fetch this game's PSPKG links again.");
       case "cancelled": return t("Verification cancelled");
       case "partial": return t("Some PSPKG links are ready.");
+      case "resolving": return t("Checking the PSPKG provider links.");
       default: return "";
     }
   };
@@ -505,6 +506,7 @@ export function Details({
       case "unsupported-category": return t("Unsupported download category");
       case "multipart": return t("Multipart download");
       case "unsafe-url": return t("URL rejected by download policy");
+      case "resolving": return t("Checking provider");
       case "missing-page": return t("Provider file missing");
       default: return reason ? t("Provider unavailable") : "";
     }
@@ -540,7 +542,7 @@ export function Details({
                   disabled={pending || !!browser?.active || !drive || (!!link.reason && link.reason !== "verify-required")}
                   onClick={() => void selectPspkgLink(link.id)}>
                   <strong>{link.label === "PSPKG" && !link.edition ? `PSPKG ${link.number}` : link.label}</strong>
-                  <small>{[link.edition || [link.titleId, link.version, link.region, link.format, link.compression].filter(Boolean).join(" · "),
+                  <small>{[link.providerHost, link.edition || [link.titleId, link.version, link.region, link.format, link.compression].filter(Boolean).join(" · "),
                     reasonLabel(link.reason)].filter(Boolean).join(" · ")}</small>
                 </button>
               ))}

@@ -99,15 +99,17 @@ static const cJSON *match_title(const TitleEntry *titles, size_t count, const ch
 
 static int compare_mirrors(const void *a, const void *b) {
     const Release *x = *(const Release *const *)a, *y = *(const Release *const *)b;
-    int key = strcmp(x->mirror_key, y->mirror_key);
-    return key ? key : strcmp(x->id, y->id);
+    int key = strcmp(remote_mirror_group_locked(x), remote_mirror_group_locked(y));
+    if (key) return key;
+    bool x_missing = remote_link_missing_locked(x), y_missing = remote_link_missing_locked(y);
+    return x_missing == y_missing ? strcmp(x->id, y->id) : x_missing ? 1 : -1;
 }
 
 static size_t first_mirror(const Release *const *rows, size_t count, const char *key) {
     size_t lo = 0, hi = count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (strcmp(rows[mid]->mirror_key, key) < 0) lo = mid + 1;
+        if (strcmp(remote_mirror_group_locked(rows[mid]), key) < 0) lo = mid + 1;
         else hi = mid;
     }
     return lo;
@@ -137,7 +139,7 @@ static bool describe_mirrors(cJSON *entry, const Release *r, const Release *cons
             if (!name || !cJSON_AddItemToArray(hosts, name)) { cJSON_Delete(name); return false; }
         }
     }
-    return (count <= 1 || cJSON_AddNumberToObject(entry, "mirrorCount", (double)available)) &&
+    return (available <= 1 || cJSON_AddNumberToObject(entry, "mirrorCount", (double)available)) &&
            (available || cJSON_AddTrueToObject(entry, "providerMissing")) &&
            (!metadata || cJSON_AddTrueToObject(entry, "providerMetadata"));
 }
@@ -176,7 +178,8 @@ static bool append_remote_locked(cJSON *out) {
     size_t mirror_count = 0;
     for (i = 0; i < orbit.remote_release_count; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (r->mirror_key[0] && source_enabled_locked(r)) mirrors[mirror_count++] = r;
+        if (!r->remote_alias && *remote_mirror_group_locked(r) && source_enabled_locked(r))
+            mirrors[mirror_count++] = r;
     }
     qsort(mirrors, mirror_count, sizeof *mirrors, compare_mirrors);
     i = 0;
@@ -189,13 +192,16 @@ static bool append_remote_locked(cJSON *out) {
     bool ok = true;
     for (i = 0; i < orbit.remote_release_count && ok; i++) {
         const Release *r = &orbit.remote_releases[i];
-        if (!source_enabled_locked(r)) continue;
+        if (r->remote_alias || !source_enabled_locked(r)) continue;
+        bool pspkg = !strcmp(r->remote_catalog_id, PSPKG_PS5_SOURCE) || !strcmp(r->remote_catalog_id, PSPKG_PS4_SOURCE);
+        if (!pspkg && remote_link_missing_locked(r)) continue;
         size_t begin = 0, end = 0;
-        if (r->mirror_key[0]) {
-            begin = first_mirror(mirrors, mirror_count, r->mirror_key);
+        const char *group = remote_mirror_group_locked(r);
+        if (*group) {
+            begin = first_mirror(mirrors, mirror_count, group);
             if (begin == mirror_count || mirrors[begin] != r) continue;
             end = begin + 1;
-            while (end < mirror_count && !strcmp(mirrors[end]->mirror_key, r->mirror_key)) end++;
+            while (end < mirror_count && !strcmp(remote_mirror_group_locked(mirrors[end]), group)) end++;
         }
         cJSON *entry = catalog_remote_choice_locked(r, mirrors + begin, end - begin);
         if (!entry) { ok = false; break; }
@@ -252,7 +258,7 @@ static cJSON *snapshot_locked(bool addons) {
                          ? &orbit.releases[slot]
                          : release_find(id);
         slot++;
-        if (!source_enabled_locked(r)) continue;
+        if (!source_enabled_locked(r) || remote_link_missing_locked(r)) continue;
         cJSON *entry = cJSON_Duplicate(x, true);
         if (!entry) {
             cJSON_Delete(a);
@@ -262,6 +268,7 @@ static cJSON *snapshot_locked(bool addons) {
         cJSON_DeleteItemFromObjectCaseSensitive(entry, "browserUrl");
         cJSON_AddBoolToObject(entry, "browserAvailable", provider_browser_supported(r));
         cJSON_AddBoolToObject(entry, "directAvailable", provider_url_supported(r));
+        if (remote_metadata_option(r)) cJSON_AddTrueToObject(entry, "providerMetadata");
         char host[254];
         if (!remote_link_missing_locked(r) && remote_link_host(r, host, sizeof host)) cJSON_AddStringToObject(entry, "torboxHost", host);
         firmware_describe(entry, orbit.firmware);

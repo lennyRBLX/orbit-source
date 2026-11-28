@@ -39,12 +39,23 @@ class Fixture(BaseHTTPRequestHandler):
                    {"Content-Type": "application/json"})
 
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
+        body = self.rfile.read(int(self.headers["Content-Length"]))
         if self.path != "/webdl/createwebdownload":
             self.reply(b"", 404)
             return
         self.server.calls.append("create")
-        if self.server.rejection == "missing":
+        if self.server.pspkg_mode == "supported":
+            provider = self.server.base + "/pspkg-provider/buzzheavier.com/file.pkg"
+            if provider.encode() not in body:
+                self.api(None, 400)
+                return
+            self.server.downloads = [{
+                "id": 2, "original_url": provider,
+                "download_present": True, "download_finished": True,
+                "files": [{"id": 0, "short_name": "file.pkg", "size": len(FILE)}],
+            }]
+            self.api({"webdownload_id": 2})
+        elif self.server.rejection == "missing":
             self.reply(json.dumps({"success": False, "error": "SOURCE_NOT_FOUND",
                                    "detail": "File not found"}).encode(), 400,
                        {"Content-Type": "application/json"})
@@ -173,6 +184,7 @@ class TorBoxRouting(unittest.TestCase):
             fixture.key = key
             fixture.polls = 0
             fixture.transient = transient
+            fixture.pspkg_mode = pspkg
             fixture.pspkg_missing = pspkg == "missing"
             thread = threading.Thread(target=fixture.serve_forever, daemon=True)
             thread.start()
@@ -277,12 +289,6 @@ class TorBoxRouting(unittest.TestCase):
         self.assertEqual((link["titleId"], link["version"], link["region"], link["format"]),
                          ("PPSA04029", "02.120", "EUR", "PKG"))
         self.assertEqual(link.get("torboxAvailable"), mode == "supported")
-        if mode == "supported":
-            fixture.downloads = [{
-                "id": 2, "original_url": fixture.base + "/pspkg-provider/buzzheavier.com/file.pkg",
-                "download_present": True, "download_finished": True,
-                "files": [{"id": 0, "short_name": "file.pkg", "size": len(FILE)}],
-            }]
         call("/browser", {"action": "pspkg-download", "releaseId": release["id"],
                           "linkId": link["id"], "storageId": "desktop", "delivery": "torbox"})
         browser = wait_for(lambda: value if not (value := call("/browser"))["active"] else None)
@@ -300,6 +306,7 @@ class TorBoxRouting(unittest.TestCase):
         self.assertNotIn("list", direct)
         covered = self.run_download(hosts, pspkg="supported")
         self.assertIn("list", covered)
+        self.assertIn("create", covered)
         self.assertIn("/torbox-file", covered)
 
     def test_pspkg_handoff_cancellation_expiry_and_landing_states(self):

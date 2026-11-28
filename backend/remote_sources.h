@@ -37,8 +37,13 @@ int pegasus_entry_to_release(const cJSON *entry, const char *source_id, Release 
 bool remote_page_pending(const Release *release);
 const char *remote_browser_provider(const char *url);
 bool remote_link_host(const Release *release, char *host, size_t cap);
+bool remote_link_missing_locked(const Release *release);
+void remote_mark_missing_locked(const Release *release);
+/* The release must be a live catalogue entry. */
+const char *remote_mirror_group_locked(const Release *release);
 bool remote_next_mirror_locked(const Release *release, const char *after, Release *mirror);
 bool remote_mirror_locked(const Release *release, const char *id, Release *mirror);
+/* Acquires orbit.mutex to check provider metadata. */
 bool remote_mirror_file(const Release *selected, const Release *file);
 bool remote_metadata_option(const Release *release);
 bool remote_link_missing_locked(const Release *release);
@@ -50,8 +55,9 @@ int direct_file_format(Release *release, const char *name);
 bool direct_release_init(Release *release, const char *url);
 int direct_release_parse(const cJSON *entry, Release *release);
 bool download_file_magic(const Release *release, const unsigned char *sample, size_t length);
-#define REMOTE_FILE_REMOVED "The source no longer has this file. Choose another download option if there is one."
-#define REMOTE_DOWNLOAD_MISSING (-2)
+enum { REMOTE_DOWNLOAD_MISSING = -2 };
+#define REMOTE_DOWNLOAD_REMOVED "The source no longer has this file. Choose another download option if there is one."
+bool remote_download_html_missing(long status, const char *html, bool challenge);
 int remote_download_resolve(Release *release, Release *locator, atomic_bool *cancel,
                             char *error, size_t cap);
 bool remote_download_confirm_missing(const char *url, atomic_bool *cancel);

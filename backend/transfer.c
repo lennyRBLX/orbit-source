@@ -1320,9 +1320,15 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed,
     }
     if (torbox(t) || j->mirror_verified) return true;
     Release locator;
-    int checked = remote_page_pending(candidate)
+    bool pending = remote_page_pending(candidate);
+    int checked = pending
         ? remote_download_resolve(candidate, &locator, &j->cancel, t->error, sizeof t->error)
         : remote_download_verify(candidate, candidate->url, &j->cancel, t->error, sizeof t->error);
+    if (checked == REMOTE_DOWNLOAD_MISSING && (pending || !candidate->remote_page)) {
+        pthread_mutex_lock(&orbit.mutex);
+        remote_mark_missing_locked(candidate);
+        pthread_mutex_unlock(&orbit.mutex);
+    }
     if (checked || !remote_mirror_file(t->release, candidate) ||
         (!j->mirror_id[0] && t->release->filename[0] && strcmp(t->release->filename, candidate->filename))) {
         *direct_missing = checked == REMOTE_DOWNLOAD_MISSING;
@@ -1863,7 +1869,7 @@ finish:
         if ((stable_community_file || (can_recover && covered)) &&
             remote_download_confirm_missing(r->url, &j->cancel)) {
             direct_missing = true;
-            copy_text(t.error, sizeof t.error, REMOTE_FILE_REMOVED);
+            copy_text(t.error, sizeof t.error, REMOTE_DOWNLOAD_REMOVED);
         }
     }
     pthread_mutex_lock(&orbit.mutex);

@@ -76,10 +76,10 @@ void random_hex(char *out, size_t n) {
 }
 Release *release_find(const char *id) {
     if (!strncmp(id, "rs-", 3)) {
-        Release *targeted = remote_title_find_locked(id);
-        if (targeted) return targeted;
         for (size_t i = 0; i < orbit.remote_release_count; i++)
             if (!strcmp(orbit.remote_releases[i].id, id)) return &orbit.remote_releases[i];
+        Release *targeted = remote_title_find_locked(id);
+        if (targeted) return targeted;
     }
     for (size_t i = 0; i < orbit.release_count; i++)
         if (!strcmp(orbit.releases[i].id, id))
@@ -514,7 +514,7 @@ int state_load(void) {
         const char *mirror_ids[] = {json_text(x, "mirrorId"), json_text(x, "mirrorFirst")};
         for (size_t i = 0; i < sizeof mirror_ids / sizeof *mirror_ids; i++) {
             const char *id = mirror_ids[i];
-            if (*id && (strcmp(r->source, "remote") || !r->mirror_key[0] ||
+            if (*id && (strcmp(r->source, "remote") ||
                 strlen(id) >= sizeof j->mirror_id || strncmp(id, "rs-", 3) ||
                 strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(id) ||
                 !strcmp(id, r->id))) {

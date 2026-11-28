@@ -17,7 +17,7 @@ typedef struct {
     char *body;
     size_t used;
     bool page, collect_page, truncated, direct, challenge, json, error_page, redirect_rejected;
-    bool metadata_only, redirect_status, range;
+    bool metadata_only, redirect_status, range, plain_text;
     const char *page_token;
     const char *initial_url;
     CURLcode code;
@@ -91,7 +91,7 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
     if (n >= 5 && !memcmp(data, "HTTP/", 5)) {
         r->used = 0;
         r->page = r->truncated = r->challenge = r->json = false;
-        r->error_page = r->redirect_status = false;
+        r->error_page = r->redirect_status = r->plain_text = false;
         if (r->body) r->body[0] = 0;
         const char *status = memchr(data, ' ', n);
         if (status && data + n - status >= 4) {
@@ -122,6 +122,7 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
         while (offset < n && isspace((unsigned char)data[offset])) offset++;
         size_t length = n - offset;
         r->json = length >= 16 && !strncasecmp(data + offset, "application/json", 16);
+        r->plain_text = length >= 10 && !strncasecmp(data + offset, "text/plain", 10);
         r->page = (length >= 9 && !strncasecmp(data + offset, "text/html", 9)) ||
                   (length >= 21 && !strncasecmp(data + offset, "application/xhtml+xml", 21)) ||
                   r->json ||
@@ -134,7 +135,7 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
     Response *r = context;
     size_t n = a * b;
     if (cancelled(r)) return 0;
-    bool collect = r->collect_page && (r->page || r->error_page);
+    bool collect = r->collect_page && (r->page || r->error_page || r->plain_text);
     if (!collect && r->collect_page && !r->used) {
         size_t offset = 0;
         while (offset < n && isspace((unsigned char)data[offset])) offset++;
@@ -147,6 +148,10 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
     }
     size_t take = n <= limit - r->used ? n : limit - r->used;
     memcpy((collect ? (unsigned char *)r->body : r->sample) + r->used, data, take);
+    if (collect && r->used < SAMPLE_BYTES) {
+        size_t remaining = SAMPLE_BYTES - r->used;
+        memcpy(r->sample + r->used, data, take < remaining ? take : remaining);
+    }
     r->used += take;
     if (collect) r->body[r->used] = 0;
     r->truncated = take != n;
@@ -306,7 +311,7 @@ int remote_download_verify(Release *r, const char *url, atomic_bool *cancel, cha
     int code = response_missing(&response) ? REMOTE_DOWNLOAD_MISSING :
                ok ? file_from_response(r, &response, url, NULL) : -1;
     free(response.body);
-    if (code) copy_text(error, cap, code == REMOTE_DOWNLOAD_MISSING ? REMOTE_FILE_REMOVED :
+    if (code) copy_text(error, cap, code == REMOTE_DOWNLOAD_MISSING ? REMOTE_DOWNLOAD_REMOVED :
                                       response.direct ? "This URL did not return a downloadable PKG, FPKG, ZIP, 7z or RAR with a filename and size."
                                       : code > 0 ? "This option uses an unsupported download format."
                                              : "The provider did not return a verifiable PKG, FPKG, RAR or ZIP.");
@@ -462,7 +467,8 @@ static bool phrase(const char *text, const char *word) {
 }
 
 static bool missing_text(const char *text) {
-    const char *messages[] = {"file not found", "file removed", "file was removed", "file has been removed",
+    const char *messages[] = {"file not found", "file missing", "file is missing",
+        "file removed", "file was removed", "file has been removed",
         "file deleted", "file was deleted", "file has been deleted", "file does not exist",
         "file doesn't exist", "file is no longer available", "this item is no longer available", "status: deleted", "no such key"};
     /* A standalone status is common, but 'deleted' in a filename or a
@@ -490,31 +496,51 @@ static bool missing_text(const char *text) {
     return false;
 }
 
-static bool response_challenge(const Response *response) {
-    const char *body = response->body;
-    return response->challenge || (body && (find_text(body, "_cf_chl_opt") || find_text(body, "<title>just a moment") ||
-           find_text(body, "<title>attention required")));
+static bool page_challenge(const char *body) {
+    return body && (find_text(body, "_cf_chl_opt") || find_text(body, "<title>just a moment") ||
+           find_text(body, "<title>attention required"));
 }
 
-static bool response_missing(const Response *response) {
-    if (response_challenge(response) || !response->body || !response->used ||
-        (response->status != 200 && response->status != 404 && response->status != 410)) return false;
-    char *text = malloc(response->used + 1);
+static bool response_challenge(const Response *response) {
+    return response->challenge || page_challenge(response->body);
+}
+
+static bool page_has_download(const char *html);
+static bool element_text(const char *tag, const char *end, char *out, size_t cap);
+static void page_size(const char *html, const char *anchor, const char *name, RemoteFileMetadata *file);
+
+static bool page_message_missing(const char *body, size_t length, bool json_body) {
+    char *text = malloc(length + 1);
     if (!text) return false;
     bool missing = false;
-    if (response->json) {
+    if (json_body) {
         const char *fields[] = {"status", "message", "error", "detail"};
-        cJSON *json = response->truncated ? NULL : cJSON_Parse(response->body);
+        cJSON *json = cJSON_Parse(body);
         for (size_t i = 0; i < sizeof fields / sizeof *fields && !missing; i++) {
             const char *value = json_text(json, fields[i]);
-            visible_text(value, value + strlen(value), text, response->used + 1);
+            visible_text(value, value + strlen(value), text, length + 1);
             missing = missing_text(text);
         }
         cJSON_Delete(json);
     } else {
-        visible_text(response->body, response->body + response->used, text, response->used + 1);
+        visible_text(body, body + length, text, length + 1);
         missing = missing_text(text);
-        for (const char *tag = response->body; !missing && (tag = strchr(tag, '<')); ) {
+        for (const char *tag = body; (tag = strchr(tag, '<')) != NULL; tag++) {
+            const char *next = skip_markup(tag);
+            if (next != tag) {
+                if (!*next) break;
+                tag = next - 1;
+                continue;
+            }
+            if (!tag_is(tag + 1, "h1") && !tag_is(tag + 1, "title")) continue;
+            const char *end = strchr(tag, '>');
+            char heading[128];
+            if (end && element_text(tag, end, heading, sizeof heading) && missing_text(heading)) {
+                free(text);
+                return !page_has_download(body);
+            }
+        }
+        for (const char *tag = body; !missing && (tag = strchr(tag, '<')); ) {
             const char *next = skip_markup(tag);
             if (next != tag) { tag = next; continue; }
             const char *end = strchr(tag, '>');
@@ -529,14 +555,30 @@ static bool response_missing(const Response *response) {
         }
     }
     free(text);
-    return missing;
+    if (!missing || page_has_download(body)) return false;
+    RemoteFileMetadata file = {0};
+    page_size(body, NULL, "", &file);
+    return !file.confidence;
+}
+
+static bool response_missing(const Response *response) {
+    if (cancelled(response) || response_challenge(response)) return false;
+    if (response->status == 404 || response->status == 410) return true;
+    return response->status == 200 && response->body && response->used && !response->truncated &&
+           response->code == CURLE_OK && page_message_missing(response->body, response->used, response->json);
+}
+
+bool remote_download_html_missing(long status, const char *html, bool challenge) {
+    if (challenge || page_challenge(html)) return false;
+    if (status == 404 || status == 410) return true;
+    return status == 200 && html && *html && page_message_missing(html, strlen(html), false);
 }
 
 bool remote_download_confirm_missing(const char *url, atomic_bool *cancel) {
-    Response response = {.cancel = cancel, .collect_page = true};
-    fetch(url, &response);
-    bool missing = response_missing(&response);
-    free(response.body);
+    Response page = {.cancel = cancel, .collect_page = true, .metadata_only = true};
+    fetch(url, &page);
+    bool missing = response_missing(&page);
+    free(page.body);
     return missing;
 }
 
@@ -573,6 +615,36 @@ static bool element_text(const char *tag, const char *end, char *out, size_t cap
     if (!close || close - end > 4096) return false;
     visible_text(end + 1, close, out, cap);
     return *out != 0;
+}
+
+static bool page_has_download(const char *html) {
+    for (const char *tag = html; (tag = strchr(tag, '<'));) {
+        const char *skip = skip_markup(tag);
+        if (skip != tag) { tag = skip; continue; }
+        const char *end = strchr(tag, '>');
+        if (!end) break;
+        const char *current = tag;
+        tag = end + 1;
+        char label[160], href[2048];
+        bool anchor = tag_is(current + 1, "a");
+        bool input = tag_is(current + 1, "input");
+        if (!anchor && !input && !tag_is(current + 1, "button")) continue;
+        if (tag_attribute(current, end, "hidden", label, sizeof label) ||
+            tag_attribute(current, end, "disabled", label, sizeof label) ||
+            (tag_value(current, end, "aria-disabled", label, sizeof label) && !strcasecmp(label, "true")))
+            continue;
+        if (anchor && (!tag_value(current, end, "href", href, sizeof href) ||
+                      (!strcmp(href, "#") && !tag_value(current, end, "onclick", label, sizeof label)))) continue;
+        if (anchor && tag_attribute(current, end, "download", label, sizeof label)) return true;
+        if (input && (!tag_value(current, end, "type", label, sizeof label) ||
+                      (strcasecmp(label, "submit") && strcasecmp(label, "button")))) continue;
+        if ((input ? tag_value(current, end, "value", label, sizeof label)
+                   : element_text(current, end, label, sizeof label)) && phrase(label, "download"))
+            return true;
+        if (tag_value(current, end, "aria-label", label, sizeof label) && phrase(label, "download")) return true;
+        if (tag_value(current, end, "title", label, sizeof label) && phrase(label, "download")) return true;
+    }
+    return false;
 }
 
 static bool title_filename(char *name, Release *file) {
@@ -657,10 +729,11 @@ static const char *size_value(const char *text, bool bytes_allowed, int64_t *siz
     while (isdigit((unsigned char)*p)) value = value * 10 + (*p++ - '0');
     bool decimal = (*p == '.' || *p == ',') && isdigit((unsigned char)p[1]);
     if (decimal) {
+        bool comma = *p == ',';
         const char *from = ++p;
         double scale = 1;
         for (; isdigit((unsigned char)*p); p++) scale /= 10, value += (*p - '0') * scale;
-        if (p - from == 3 && text[0] != '0') return NULL;
+        if (comma && p - from == 3 && text[0] != '0') return NULL;
     }
     while (isspace((unsigned char)*p)) p++;
     *exact = bytes_allowed && !decimal && (!*p || (*p == 'B' && !p[1]));
@@ -730,6 +803,8 @@ static bool download_label(const char *label) {
 
 static void page_size(const char *html, const char *anchor, const char *name, RemoteFileMetadata *file) {
     SizeChoice best = {0};
+    const char *first_tag = strchr(html, '<');
+    if (!first_tag) offer_size(&best, file, html, 1, false, false);
     const char *fields[] = {"data-size-bytes", "data-size", "data-filesize", "data-file-size", "contentSize"};
     for (const char *tag = html; (tag = strchr(tag, '<'));) {
         const char *skip = skip_markup(tag);
@@ -1296,7 +1371,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
         (page.status >= 300 && page.status < 400 && page.code != CURLE_OK))
         metadata->status = REMOTE_METADATA_REDIRECT;
     else if (response_challenge(&page)) metadata->status = REMOTE_METADATA_CHALLENGE;
-    else if (page.status == 404 || page.status == 410 || response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
+    else if (response_missing(&page)) metadata->status = REMOTE_METADATA_MISSING;
     else if (response_interactive(&page)) metadata->status = REMOTE_METADATA_INTERACTIVE;
     else if (page.code == CURLE_OPERATION_TIMEDOUT) metadata->status = REMOTE_METADATA_TIMEOUT;
     else if (page.error_page || (page.status && !ok && page.code == CURLE_OK))
@@ -1451,8 +1526,8 @@ static void archive_metadata(const Response *page, const Release *r, RemoteFileM
     if (result == REMOTE_DOWNLOAD_MISSING) metadata->status = REMOTE_METADATA_MISSING;
 }
 
-/* 0: verified direct file, 1: continue with Orbit's supported provider browser,
- * -1: no supported file can be determined from the selected option. */
+/* Returns 0 for a verified direct file, 1 for an interactive provider page,
+ * REMOTE_DOWNLOAD_MISSING for a removed file, and -1 for other failures. */
 int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, char *error, size_t cap) {
     Response page = {.cancel = cancel, .collect_page = true};
     int result = -1;
@@ -1538,7 +1613,7 @@ int remote_download_resolve(Release *r, Release *locator, atomic_bool *cancel, c
         copy_text(error, cap, "This option lists several files. Choose a mirror that identifies one download.");
 done:
     free(page.body);
-    if (result == REMOTE_DOWNLOAD_MISSING) copy_text(error, cap, REMOTE_FILE_REMOVED);
+    if (result == REMOTE_DOWNLOAD_MISSING) copy_text(error, cap, REMOTE_DOWNLOAD_REMOVED);
     else if (result < 0 && !error[0])
         copy_text(error, cap, "This option did not identify a supported PKG, FPKG, RAR or ZIP download.");
     return result;
