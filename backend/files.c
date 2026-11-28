@@ -11,6 +11,7 @@
  * computer uses a short-lived link: a browser's download can't send the
  * pairing token. */
 #include "files.h"
+#include "image_format.h"
 #include "extract.h"
 #include "packages.h"
 #include "history.h"
@@ -171,8 +172,7 @@ static const char *file_type(const char *name) {
     const char *e = extension(name);
     if (!strcasecmp(e, ".zip") || !strcasecmp(e, ".7z") || !strcasecmp(e, ".rar")) return "archive";
     if (!strcasecmp(e, ".pkg") || !strcasecmp(e, ".fpkg")) return "package";
-    /* The images ShadowMount mounts, as the installer's check knows them (packages.c). */
-    if (!strcasecmp(e, ".exfat") || !strcasecmp(e, ".ffpkg") || !strcasecmp(e, ".ffpfsc") || !strcasecmp(e, ".ffpfs")) return "image";
+    if (image_format_for_suffix(e)) return "image";
     return "file";
 }
 /* A folder ShadowMount can run: it has eboot.bin or sce_sys/param.json. */

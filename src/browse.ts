@@ -164,6 +164,8 @@ export const releaseFormat = (r: Release) =>
 
 export const DOWNLOAD_FORMATS: Record<string, string> = {
   FFPFSC: "FFPFSC",
+  FFPFS: "FFPFS",
+  FFPKG: "FFPKG",
   exFAT: "exFAT",
   PKG: "PKG",
   FPKG: "FPKG",

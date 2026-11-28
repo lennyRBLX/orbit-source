@@ -1,5 +1,6 @@
 """Exercise the 1.9.7 link queue and ShadowMountPlus handoff over loopback."""
 
+import io
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+from zipfile import ZipFile
 
 from torbox_routing_integration import BINARY, FILE, ROOT, wait_for
 
@@ -31,23 +33,32 @@ class Fixture(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
-        if path not in ("/game.pkg", "/disc.ffpkg", "/part.bin", "/replacement.bin",
+        if path == "/catalogue.json":
+            entry = {"title": "UFS provider fixture", "titleId": "PPSA99998", "downloadLinks": [{
+                "name": "UFS2", "url": f"http://127.0.0.1:{self.server.server_port}/remote-image",
+            }]}
+            self.reply(json.dumps({"packages": [entry]}).encode(), headers=[("Content-Type", "application/json")])
+            return
+        if path not in ("/game.pkg", "/disc.ffpkg", "/image.zip", "/remote-image", "/part.bin", "/replacement.bin",
                         "/orbit-package/" + "f" * 64 + ".pkg"):
             self.reply(b"", 404)
             return
         if path == "/part.bin" and "Range" not in self.headers:
             self.reply(b"", 410)
             return
-        start, end, status = 0, len(FILE) - 1, 200
+        data = {"/image.zip": self.server.image_archive, "/remote-image": self.server.ufs_image}.get(path, FILE)
+        start, end, status = 0, len(data) - 1, 200
         headers = [("Content-Type", "application/octet-stream"), ("ETag", '"file"')]
+        if path == "/remote-image":
+            headers.append(("Content-Disposition", 'attachment; filename="remote-disc"'))
         if self.headers.get("Range"):
             first, last = self.headers["Range"].removeprefix("bytes=").split("-")
-            start, end, status = int(first), int(last) if last else end, 206
-            headers.append(("Content-Range", f"bytes {start}-{end}/{len(FILE)}"))
+            start, end, status = int(first), min(int(last), end) if last else end, 206
+            headers.append(("Content-Range", f"bytes {start}-{end}/{len(data)}"))
         if path == "/part.bin" and end > start:
             self.reply(b"", 410)
             return
-        self.reply(FILE[start:end + 1], status, headers)
+        self.reply(data[start:end + 1], status, headers)
 
     do_HEAD = do_GET
 
@@ -101,6 +112,12 @@ class LinkDownloads(unittest.TestCase):
             server.homebrew = root / "drive" / "homebrew"
             server.homebrew.mkdir(parents=True)
             server.games, server.installs, server.stream, server.stream_bytes = [], [], None, b""
+            pfs = (2).to_bytes(8, "little") + (20130315).to_bytes(8, "little")
+            archive = io.BytesIO()
+            with ZipFile(archive, "w") as zip_file:
+                zip_file.writestr("game.ffpfs", pfs)
+            server.image_archive = archive.getvalue()
+            server.ufs_image = bytes(65536 + 1372) + (0x19540119).to_bytes(4, "little") + b"data"
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             with socket.socket() as sock:
@@ -108,7 +125,8 @@ class LinkDownloads(unittest.TestCase):
                 port = sock.getsockname()[1]
             host = f"http://127.0.0.1:{server.server_port}"
             env = dict(os.environ, ORBIT_TEST_LIBRARY_PORT=str(server.server_port),
-                       ORBIT_TEST_URL=host + "/game.pkg", ORBIT_TEST_SIZE=str(len(FILE)))
+                       ORBIT_TEST_URL=host + "/game.pkg", ORBIT_TEST_SIZE=str(len(FILE)),
+                       ORBIT_TEST_CATALOGUE_URL=host + "/catalogue.json")
             token = ""
             service = None
 
@@ -145,7 +163,7 @@ class LinkDownloads(unittest.TestCase):
                     with self.assertRaises(HTTPError) as old:
                         call("/downloads/direct", {"url": host + "/game.pkg", "storageId": "desktop"})
                     self.assertEqual(old.exception.code, 404)
-                    call("/links", {"urls": [host + url for url in ("/game.pkg", "/disc.ffpkg", "/part.bin")],
+                    call("/links", {"urls": [host + url for url in ("/game.pkg", "/disc.ffpkg", "/part.bin", "/image.zip")],
                                     "storageId": "desktop"})
 
                     def checked():
@@ -168,14 +186,22 @@ class LinkDownloads(unittest.TestCase):
 
                     def registered():
                         job = job_status(jobs[1], "complete")
-                        return job and (job.get("installation") or {}).get("shadowMount") == "registered"
+                        if job and (job.get("installation") or {}).get("shadowMount") == "registered":
+                            return job
 
-                    wait_for(registered)
+                    self.assertEqual(wait_for(registered)["format"], "FFPKG")
+                    self.assertEqual(wait_for(lambda: job_status(jobs[3], "complete"))["detectedFormat"], "FFPFS")
+                    self.assertEqual((server.homebrew / "game.ffpfs").read_bytes(), pfs)
                     wait_for(lambda: job_status(jobs[2], "error"))
                     call(f"/downloads/{jobs[2]}/replace-link", {"url": host + "/replacement.bin"})
                     wait_for(checked)
                     job = wait_for(lambda: job_status(jobs[2], "complete"))
                     self.assertEqual((server.homebrew / job.get("output", job["filename"])).read_bytes(), FILE)
+
+                    release = wait_for(lambda: next((r for r in call("/catalog") if r["title"] == "UFS provider fixture"), None))
+                    remote = call("/downloads", {"releaseId": release["id"], "storageId": "desktop", "delivery": "direct"})
+                    self.assertEqual(wait_for(lambda: job_status(remote["id"], "complete"))["format"], "FFPKG")
+                    self.assertEqual((server.homebrew / "remote-disc.ffpkg").read_bytes(), server.ufs_image)
 
                     stream_id = "e" * 32
                     call("/installations/stream", {"streamId": stream_id, "token": "f" * 64,
@@ -187,8 +213,16 @@ class LinkDownloads(unittest.TestCase):
 
                     service.terminate()
                     service.wait(timeout=15)
+                    queue = root / "state" / "state.json"
+                    saved = json.loads(queue.read_text())
+                    legacy = next(item for item in saved["jobs"] if item["id"] == jobs[1])
+                    legacy["release"]["format"] = "File"
+                    queue.write_text(json.dumps(saved))
                     service = start()
                     token = wait_for(connect)
+                    self.assertEqual(wait_for(registered)["format"], "FFPKG")
+                    self.assertEqual(job_status(jobs[3], "complete")["detectedFormat"], "FFPFS")
+                    self.assertEqual(job_status(remote["id"], "complete")["filename"], "remote-disc.ffpkg")
                     self.assertIsNotNone(wait_for(lambda: job_status(jobs[2], "complete")))
                     self.assertIsNotNone(record(jobs[0], "installed"))
                 except Exception:

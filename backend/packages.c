@@ -7,6 +7,7 @@
  * With deletePackages on, a package is deleted only after the PS5 reports it
  * installed, and only if it is still the file that was checked. */
 #include "packages.h"
+#include "image_format.h"
 #include "game_verify.h"
 #include "power.h"
 #include "files.h"
@@ -411,7 +412,8 @@ static int walk(int parent, const char *name, const char *prefix, cJSON *r, unsi
         closedir(dir); return result;
     }
     if (!S_ISREG(st.st_mode) || st.st_nlink != 1) return -1;
-    if (extension(name, ".exfat") || extension(name, ".ffpfsc") || extension(name, ".ffpfs") || extension(name, ".ffpkg")) {
+    const char *suffix = strrchr(name, '.');
+    if (suffix != name && image_format_for_suffix(suffix)) {
         if (mount_target(r, relative_path, &st, false)) return -1;
         *mountable = true;
     }

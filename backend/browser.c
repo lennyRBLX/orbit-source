@@ -311,6 +311,7 @@ static bool capture(Release *r, Release *community, char *etag, char *modified, 
 static void community_file(Release *selected, const Release *file) {
     copy_text(selected->url, sizeof selected->url, file->url);
     copy_text(selected->filename, sizeof selected->filename, file->filename);
+    selected->remote_image_suffix_added = file->remote_image_suffix_added;
     copy_text(selected->format, sizeof selected->format, file->format);
     copy_text(selected->compression, sizeof selected->compression, file->compression);
     copy_text(selected->archive_password, sizeof selected->archive_password, file->archive_password);

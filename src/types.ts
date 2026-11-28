@@ -38,7 +38,7 @@ export interface Release extends AddonIdentity {
   providerMetadata?: boolean;
   providerMissing?: boolean;
   // An unresolved provider page can omit the file type.
-  format: "FFPFSC" | "exFAT" | "FPKG" | "PKG" | "Game folder" | "Unknown";
+  format: "FFPFSC" | "FFPFS" | "FFPKG" | "exFAT" | "FPKG" | "PKG" | "Game folder" | "Unknown";
   contentFormat?: "LZ4";
   assetCompression?: "ZSTD";
   // Downloaded as an archive and extracted on the drive; format is what's inside.

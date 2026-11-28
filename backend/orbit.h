@@ -31,7 +31,7 @@ typedef struct {
     char remote_catalog_id[25]; /* Empty for built-in download providers. */
     char remote_label[128]; /* Download link label from a community catalogue. */
     char remote_version[32], remote_region[32], remote_edition[128], remote_filename[160], remote_source_page[256];
-    bool remote_filename_synthetic;
+    bool remote_filename_synthetic, remote_image_suffix_added;
     char remote_format_hint[12], remote_compression_hint[8];
     char remote_choice[65]; /* Stable fingerprint of a revealed PSPKG choice. */
     char remote_provider_page[256]; /* Public provider selected for a PSPKG job. */

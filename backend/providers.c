@@ -1,4 +1,5 @@
 #include "orbit.h"
+#include "image_format.h"
 #include "provider_network.h"
 #include "links.h"
 #include "remote_sources.h"
@@ -13,9 +14,8 @@ bool provider_browser_source(const char *source) {
 }
 static bool browser_format(const Release *r) {
     if (r->archive_unverified && (strcmp(r->format, "Unknown") || r->extracted_size || !r->compression[0])) return false;
-    const char *suffix = !strcmp(r->format, "exFAT") ? ".exfat" :
-                         !strcmp(r->format, "FFPFSC") ? ".ffpfsc" :
-                         (!strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG")) ? ".pkg" : NULL;
+    const char *suffix = image_suffix_for_format(r->format);
+    if (!suffix && (!strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG"))) suffix = ".pkg";
     if (!suffix && !r->archive_unverified && (strcmp(r->format, "Game folder") || !r->compression[0] ||
         strncmp(r->title_id, "PPSA", 4))) return false;
     if (r->compression[0]) {
@@ -487,12 +487,15 @@ static bool pspkg_file_candidate(const char *url) {
     if (!path || ((size_t)(path - host) == strlen("pspkg.com") &&
         !strncasecmp(host, "pspkg.com", strlen("pspkg.com")))) return false;
     size_t length = strcspn(path, "?");
-    const char *suffixes[] = {".pkg", ".fpkg", ".zip", ".7z", ".rar", ".ffpfsc", ".exfat"};
+    const char *suffixes[] = {".pkg", ".fpkg", ".zip", ".7z", ".rar"};
     for (size_t i = 0; i < sizeof suffixes / sizeof *suffixes; i++) {
         size_t n = strlen(suffixes[i]);
         if (length > n && !strncasecmp(path + length - n, suffixes[i], n)) return true;
     }
-    return false;
+    char name[160];
+    if (!remote_url_filename(url, name, sizeof name)) return false;
+    const char *suffix = strrchr(name, '.');
+    return suffix != name && image_format_for_suffix(suffix);
 }
 
 bool provider_capture_url(const Release *release, const char *candidate) {

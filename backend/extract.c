@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "extract.h"
+#include "image_format.h"
 #include "sevenzip.h"
 #include "unrar.h"
 #include <archive.h>
@@ -848,8 +849,11 @@ static int inspect_finish(Inspection *s, char format[12]) {
         snprintf(s->error, s->cap, "The archive is empty.");
         return -1;
     }
-    const char *kind = files == 1 ? ends_with(single, ".pkg") ? "PKG"
-        : ends_with(single, ".exfat") ? "exFAT" : ends_with(single, ".ffpfsc") ? "FFPFSC" : NULL : NULL;
+    const char *kind = NULL;
+    if (files == 1) {
+        if (ends_with(single, ".pkg") || ends_with(single, ".fpkg")) kind = "PKG";
+        else kind = image_format_for_suffix(strrchr(single, '.'));
+    }
     if (!kind) {
         /* Layout recognition supplies a label only. Safe contents do not need
          * to match a known game layout in order to be extracted. */

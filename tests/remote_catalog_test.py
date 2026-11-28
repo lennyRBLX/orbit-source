@@ -159,6 +159,9 @@ class RemoteCatalogueTests(unittest.TestCase):
 
             self.assertEqual(mapped("game.exfat")["format"], "exFAT")
             self.assertEqual(mapped("game.ffpfsc")["format"], "FFPFSC")
+            self.assertEqual(mapped("game.FFPKG")["format"], "FFPKG")
+            self.assertEqual(mapped("game.ffpfs", format="PFS")["format"], "FFPFS")
+            self.assertEqual(mapped("game.zip", format="PFS")["format"], "FFPFS")
             archive = mapped("game.7z", archivePassword="example")
             self.assertEqual((archive["compression"], archive["archivePassword"]), ("7z", "example"))
             self.assertEqual(mapped("game-ZSTD.rar"), 1)
@@ -235,7 +238,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                 def entry(path, label):
                     return dict(base, downloadLinks=[{"name": label, "url": address + path}])
 
-                for label in ("Folder · LZ4", "FpKg / ZsTd", "FPKG · PFS", "exFAT"):
+                for label in ("Folder · LZ4", "FpKg / ZsTd"):
                     self.assertEqual(service.command("map", entry=entry("/game.zip", label)), 1)
                 for suffix in (".rar.001", ".part2.rar"):
                     self.assertEqual(service.command("map", entry=entry("/game" + suffix, "Mirror")), 1)
@@ -275,6 +278,47 @@ class RemoteCatalogueTests(unittest.TestCase):
                 self.assertTrue(all(row["browserAvailable"] and not row["directAvailable"] for row in rows))
                 self.assertTrue(all(row["torboxHost"] == "127.0.0.1" for row in rows))
                 self.assertEqual(len({row["gameId"] for row in rows}), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_shadowmount_images_are_verified_before_resolving_provider_links(self):
+        server = FixtureServer()
+        pfs = (2).to_bytes(8, "little") + (20130315).to_bytes(8, "little")
+        ufs = bytes(65536 + 1372) + (0x19540119).to_bytes(4, "little")
+        server.downloads["/ufs-page"] = (200, {"Content-Type": "text/html"},
+                                         b'<a href="/ufs">Download</a>')
+        for path, filename, body in (
+            ("/pfs", "Game.FFPFS", pfs),
+            ("/ufs", "Game Image", ufs),
+            ("/bad-image", "Wrong.ffpkg", pfs),
+        ):
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            }
+            if path == "/ufs":
+                headers["Content-Range"] = f"bytes 0-{len(body) - 1}/100000"
+            server.downloads[path] = (206 if path == "/ufs" else 200, headers, body)
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory, Driver(directory, server.url) as service:
+                for path, hint, expected in (("/pfs", "PFS", ("FFPFS", "Game.FFPFS")),
+                                             ("/ufs-page", "UFS2", ("FFPKG", "Game Image.ffpkg")),
+                                             ("/bad-image", "FFPKG", None)):
+                    entry = {"title": "Game", "titleId": "PPSA12345", "downloadLinks": [{
+                        "name": hint, "url": server.url.replace("/catalogue.json", path),
+                    }]}
+                    with self.subTest(path=path):
+                        result = service.command("resolve", entry=entry)
+                        if expected:
+                            self.assertEqual((result["format"], result["filename"]), expected)
+                        else:
+                            self.assertEqual(result, -1)
+                self.assertIn(("/ufs", "bytes=0-66911"), server.ranges)
         finally:
             server.shutdown()
             server.server_close()
@@ -339,8 +383,8 @@ class RemoteCatalogueTests(unittest.TestCase):
                         resolved = resolve(path)
                         self.assertEqual((resolved["filename"], resolved["format"], resolved["sizeBytes"]),
                                          (name, "PKG", size))
-                self.assertIn(("/token", "bytes=0-7"), server.ranges)
-                self.assertIn(("/no-range", "bytes=0-7"), server.ranges)
+                self.assertIn(("/token", "bytes=0-66911"), server.ranges)
+                self.assertIn(("/no-range", "bytes=0-66911"), server.ranges)
                 for path in ("/bad-type", "/bad-magic", "/unsupported"):
                     with self.subTest(path=path):
                         self.assertEqual(resolve(path), -1)
@@ -680,7 +724,7 @@ class RemoteCatalogueTests(unittest.TestCase):
                     time.sleep(.02)
                 file, = result["files"]
                 self.assertEqual((file["status"], file["sizeBytes"], file["exact"]), ("found", 2000, True))
-                self.assertIn(("/Direct.pkg", "bytes=0-7"), server.ranges)
+                self.assertIn(("/Direct.pkg", "bytes=0-66911"), server.ranges)
         finally:
             server.shutdown()
             server.server_close()
@@ -809,15 +853,19 @@ class RemoteCatalogueTests(unittest.TestCase):
                 '<a href="https://rootz.so/d/mirror">Rootz</a></section>'
                 '<section><h3>Game PKG ZSTD</h3><a href="https://datanodes.to/abcd12345678">Download</a></section>'
                 '<section><h3>Game PKG</h3><a href="https://filekeeper.net/abcd12345678">Part 1</a></section>'
-                '<section><h3>Update PKG</h3><a href="https://rootz.so/d/update">Update</a></section>')
+                '<section><h3>Update PKG</h3><a href="https://rootz.so/d/update">Update</a></section>'
+                '<section><h3>Game PFS</h3><a href="https://files.example.org/Game.ffpfs">Download</a></section>'
+                '<section><h3>Game FFPKG</h3><a href="https://files.example.org/Game.ffpkg">Download</a></section>')
         with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
             links = service.command("pspkg-links", html=html)
             self.assertEqual([row["filterReason"] for row in links],
-                             ["", "", "unsupported-format", "multipart", "unsupported-category"])
+                             ["", "", "unsupported-format", "multipart", "unsupported-category", "", ""])
             self.assertEqual(links[0]["titleId"], "PPSA12345")
             self.assertEqual(links[0]["version"], "2.31")
             self.assertEqual(links[0]["sizeEstimateBytes"], 54_250_000_000)
             self.assertIn("ZSTD", links[2]["edition"])
+            self.assertEqual([row["filename"] for row in links[-2:]], ["Game.ffpfs", "Game.ffpkg"])
+            self.assertEqual([row["format"] for row in links[-2:]], ["FFPFS", "FFPKG"])
 
     def test_pspkg_filters_ads_in_public_and_verified_html(self):
         provider = "https://vikingfile.com/f/game123456"
@@ -860,7 +908,7 @@ class RemoteCatalogueTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory, Driver(directory) as service:
                 metadata = service.command("metadata-page", url=server.url.replace("/catalogue.json", page))
                 self.assertEqual(server.paths, [page, pkg])
-                self.assertEqual(server.ranges, [(page, None), (pkg, "bytes=0-7")])
+                self.assertEqual(server.ranges, [(page, None), (pkg, "bytes=0-66911")])
                 link, = metadata["links"]
                 self.assertEqual((link["sizeBytes"], link["exact"], link["version"]), (42, True, "2.12"))
         finally:

@@ -2,6 +2,7 @@
 #include "orbit.h"
 #include "power.h"
 #include "firmware.h"
+#include "image_format.h"
 #include "packages.h"
 #include "archive_account.h"
 #include "viking_session.h"
@@ -128,7 +129,7 @@ static bool disposition_named(const char *header) {
     }
     return false;
 }
-static bool disposition_matches(const char *header, const char *expected) {
+static bool disposition_matches(const char *header, const Release *release) {
     bool plain = false, extended = false, plain_match = false, extended_match = false;
     const char *p = strchr(header, ';');
     while (p && *p) {
@@ -161,12 +162,12 @@ static bool disposition_matches(const char *header, const char *expected) {
             int length = 0;
             char *decoded = curl_easy_unescape(NULL, encoded + 1, 0, &length);
             extended = true;
-            extended_match = decoded && length == (int)strlen(expected) &&
-                             !memcmp(decoded, expected, (size_t)length);
+            extended_match = decoded && (size_t)length == strlen(decoded) &&
+                             release_filename_matches(release, decoded);
             curl_free(decoded);
         } else {
             if (plain) return false;
-            plain = true; plain_match = !strcmp(value, expected);
+            plain = true; plain_match = release_filename_matches(release, value);
         }
         if (!*p) break;
     }
@@ -320,7 +321,7 @@ static size_t headers(char *s, size_t a, size_t b, void *arg) {
         bool full_probe = get_verified_file(t) && t->range_probe && t->status == 200;
         if ((t->capture_probe || torbox(t) || ((remote_transfer(t) || direct_transfer(t)) && named)) &&
             (t->accepted || full_probe) && t->disposition[0] && (named || !viking_route)) {
-            if (!disposition_matches(t->disposition, t->release->filename)) {
+            if (!disposition_matches(t->disposition, t->release)) {
                 t->accepted = false;
                 copy_text(t->error, sizeof t->error, "Provider returned a different filename.");
             }
@@ -1065,9 +1066,15 @@ finish_benchmark:
 }
 #endif
 static bool file_type_matches(const Transfer *t) {
-    unsigned char sample[8];
-    ssize_t size = pread(t->fd, sample, sizeof sample, 0);
-    return size == (ssize_t)sizeof sample && download_file_magic(t->release, sample, (size_t)size);
+    DownloadSample sample = {0};
+    ssize_t size = pread(t->fd, sample.prefix, sizeof sample.prefix, 0);
+    if (size <= 0) return false;
+    if (!t->release->compression[0] && !strcmp(t->release->format, "FFPKG")) {
+        if (pread(t->fd, sample.ufs_magic, sizeof sample.ufs_magic, DOWNLOAD_UFS_MAGIC_OFFSET) !=
+            (ssize_t)sizeof sample.ufs_magic) return false;
+        size = DOWNLOAD_UFS_MAGIC_OFFSET + sizeof sample.ufs_magic;
+    }
+    return download_file_magic(t->release, &sample, (size_t)size);
 }
 static bool checksum(Transfer *t) {
     if (!t->release->sha256[0])
@@ -1206,7 +1213,10 @@ static int extract_job(Job *j, int dir, const char *partial, char *note, size_t 
         rc = inspect_archive(&x, &inspected, format, error, cap);
         if (!rc && remote) {
             const char *expected = !strcmp(j->release.format, "FPKG") ? "PKG" : j->release.format;
-            if (strcmp(format, expected) || (x.expected > 0 && x.expected != inspected)) {
+            /* Unlabeled archives are listed as game folders until inspection. */
+            bool game_file = !strcmp(expected, "Game folder") &&
+                (!strcmp(format, "PKG") || image_suffix_for_format(format));
+            if ((!game_file && strcmp(format, expected)) || (x.expected > 0 && x.expected != inspected)) {
                 copy_text(error, cap, "Archive contents do not match the community catalogue.");
                 rc = -1;
             }
@@ -1340,6 +1350,7 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed,
     if (!j->filename[0]) {
         Release file = *t->release;
         copy_text(file.filename, sizeof file.filename, candidate->filename);
+        file.remote_image_suffix_added = candidate->remote_image_suffix_added;
         copy_text(file.format, sizeof file.format, candidate->format);
         copy_text(file.compression, sizeof file.compression, candidate->compression);
         file.size = candidate->size;
@@ -1352,6 +1363,7 @@ static bool prepare_mirror(Transfer *t, Release *candidate, bool *source_failed,
     }
     copy_text(t->release->url, sizeof t->release->url, candidate->url);
     copy_text(t->release->filename, sizeof t->release->filename, candidate->filename);
+    t->release->remote_image_suffix_added = candidate->remote_image_suffix_added;
     return true;
 }
 

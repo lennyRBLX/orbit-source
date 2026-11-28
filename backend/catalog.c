@@ -187,7 +187,9 @@ int release_parse(const cJSON *x, Release *r, bool diagnostic) {
         r->archive_unverified = cJSON_IsString(contents) && !strcmp(contents->valuestring, "unverified");
         if ((contents && !r->archive_unverified) || (extracted && !cJSON_IsNull(extracted)) ||
             cJSON_GetObjectItemCaseSensitive(x, "requirements")) return -1;
-        return diagnostic && link_release_valid(r) ? 0 : -1;
+        if (!diagnostic || !link_release_valid(r)) return -1;
+        link_kind(r);
+        return 0;
     }
     if (*r->sha256) {
         if (strlen(r->sha256) != 64)
@@ -289,6 +291,7 @@ cJSON *release_json(const Release *r) {
     if (r->remote_compression_hint[0]) { FIELD("compressionHint", remote_compression_hint); }
     if (r->remote_filename[0]) { FIELD("filenameHint", remote_filename); }
     if (r->remote_filename_synthetic) cJSON_AddTrueToObject(o, "syntheticFilename");
+    if (r->remote_image_suffix_added) cJSON_AddTrueToObject(o, "addedImageSuffix");
     if (r->remote_page) cJSON_AddTrueToObject(o, "remotePage");
     if (r->mirror_key[0]) { FIELD("mirrorKey", mirror_key); }
     if (r->archive_password[0]) { FIELD("archivePassword", archive_password); }

@@ -1,4 +1,5 @@
 #include "remote_sources.h"
+#include "image_format.h"
 #include "provider_network.h"
 #include "padrino.h"
 #include "pspkg.h"
@@ -80,10 +81,6 @@ static bool source_package(const cJSON *entry, const char *source_id) {
         ? "\nSource: https://pspkg.com/ps5/" : "\nSource: https://pspkg.com/ps4/") != NULL;
 }
 
-static bool image_format(const Release *r) {
-    return !strcmp(r->format, "exFAT") || !strcmp(r->format, "FFPFSC");
-}
-
 static int file_format(Release *r, const char *name, bool community, const char *detected);
 
 /* Include the full source id in the digest even when its displayed prefix is shortened. */
@@ -145,29 +142,34 @@ static bool valid(const Release *r) {
     }
     if (r->archive_password[0] && (!remote_page_pending(r) && !r->compression[0]))
         return false;
+    const char *image_suffix = image_suffix_for_format(r->format);
+    if (r->remote_image_suffix_added) {
+        const char *suffix = strrchr(r->filename, '.');
+        if (!r->remote_page || !r->url[0] || !image_suffix || r->compression[0] ||
+            !suffix || suffix == r->filename || strcmp(suffix, image_suffix)) return false;
+    }
     if (remote_page_pending(r) && !r->filename[0])
         return (!r->compression[0] || !strcmp(r->compression, "zip") || !strcmp(r->compression, "rar") ||
                 !strcmp(r->compression, "7z")) &&
             !r->extracted_size && !r->sha256[0] &&
             (!strcmp(r->format, "Unknown") || !strcmp(r->format, "Game folder") ||
-             !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG") || image_format(r));
+             !strcmp(r->format, "FPKG") || !strcmp(r->format, "PKG") || image_suffix);
     if (!filename_valid(r->filename) ||
-        (strcmp(r->format, "PKG") && strcmp(r->format, "FPKG") && !image_format(r) &&
+        (strcmp(r->format, "PKG") && strcmp(r->format, "FPKG") && !image_suffix &&
          (strcmp(r->format, "Game folder") || !r->compression[0]))) return false;
     if (r->remote_page) {
         Release checked = *r;
         const char *suffix = !strcmp(r->compression, "zip") ? ".zip" :
                              !strcmp(r->compression, "rar") ? ".rar" :
                              !strcmp(r->compression, "7z") ? ".7z" :
-                             !r->compression[0] ? (!strcmp(r->format, "exFAT") ? ".exfat" :
-                                                   !strcmp(r->format, "FFPFSC") ? ".ffpfsc" : ".pkg") : NULL;
+                             !r->compression[0] ? (image_suffix ? image_suffix : ".pkg") : NULL;
         if (!suffix || file_format(&checked, r->filename, true, suffix) ||
             strcmp(checked.compression, r->compression) || strcmp(checked.format, r->format)) return false;
     } else {
         const char *suffix = strrchr(r->filename, '.');
         if (!suffix || strcmp(compression(suffix), r->compression) ||
             (!r->compression[0] && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
-             !(image_format(r) && !strcasecmp(suffix + 1, r->format)))) return false;
+             !(image_suffix && !strcasecmp(suffix, image_suffix)))) return false;
     }
     if (!r->compression[0] && r->extracted_size) return false;
     return !r->sha256[0] || (strlen(r->sha256) == 64 &&
@@ -181,6 +183,9 @@ int remote_release_parse(const cJSON *entry, Release *r) {
     const cJSON *page = cJSON_GetObjectItemCaseSensitive(entry, "remotePage");
     if (page && !cJSON_IsTrue(page)) return -1;
     r->remote_page = cJSON_IsTrue(page);
+    const cJSON *suffix_added = cJSON_GetObjectItemCaseSensitive(entry, "addedImageSuffix");
+    if (suffix_added && !cJSON_IsTrue(suffix_added)) return -1;
+    r->remote_image_suffix_added = cJSON_IsTrue(suffix_added);
     r->remote_filename_synthetic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "syntheticFilename"));
     if (!FIELD("sourceId", source) || strcmp(r->source, "remote") ||
         !FIELD("remoteCatalogId", remote_catalog_id) || !FIELD("title", title) ||
@@ -224,6 +229,14 @@ bool remote_url_filename(const char *url, char *name, size_t cap) {
 
 bool remote_page_pending(const Release *r) {
     return r->remote_page && !r->url[0];
+}
+
+bool release_filename_matches(const Release *r, const char *name) {
+    if (!strcmp(r->filename, name)) return true;
+    if (!r->remote_image_suffix_added) return false;
+    const char *suffix = strrchr(r->filename, '.');
+    return suffix && strlen(name) == (size_t)(suffix - r->filename) &&
+        !memcmp(r->filename, name, (size_t)(suffix - r->filename));
 }
 
 bool job_needs_browser(const Release *r) {
@@ -311,7 +324,7 @@ static bool token(const char *label, const char *word) {
 
 static bool unsupported_label(const char *label) {
     return token(label, "lz4") || token(label, "zstd") || token(label, "zst") ||
-           token(label, "zstandard") || token(label, "pfs");
+           token(label, "zstandard");
 }
 
 static bool multipart_label(const char *label) {
@@ -323,18 +336,20 @@ static bool multipart_label(const char *label) {
     return false;
 }
 
-static const char *label_format(const char *label) {
+const char *remote_label_format(const char *label) {
     if (token(label, "fpkg")) return "FPKG";
     if (token(label, "pkg")) return "PKG";
     if (token(label, "exfat")) return "exFAT";
     if (token(label, "ffpfsc")) return "FFPFSC";
+    if (token(label, "ffpkg") || token(label, "ufs2") || token(label, "ufs")) return "FFPKG";
+    if (token(label, "ffpfs") || token(label, "pfs")) return "FFPFS";
     if (token(label, "folder") || token(label, "rar") || token(label, "zip") ||
         token(label, "7z")) return "Game folder";
     return "";
 }
 
-/* The payload filename determines the container. A link's PKG/FPKG label
- * describes what is inside a supported archive. Unlabeled archives are folders. */
+/* The payload filename determines the container. A link's format label can
+ * describe what is inside a supported archive. Unlabeled archives are folders. */
 static int file_format(Release *r, const char *name, bool community, const char *detected) {
     if (!filename_valid(name) || strlen(name) >= sizeof r->filename) return -1;
     if (community && unsupported_label(name)) return 1;
@@ -350,16 +365,27 @@ static int file_format(Release *r, const char *name, bool community, const char 
         if (volume < suffix && volume - name >= 5 && !strncasecmp(volume - 5, ".part", 5)) return 2;
     }
     if (!suffix || (!*compression(suffix) && strcasecmp(suffix, ".pkg") && strcasecmp(suffix, ".fpkg") &&
-        strcasecmp(suffix, ".exfat") && strcasecmp(suffix, ".ffpfsc")))
+        !image_format_for_suffix(suffix)))
         suffix = detected;
-    if (!suffix || (!community && (!strcasecmp(suffix, ".exfat") || !strcasecmp(suffix, ".ffpfsc")))) return -1;
+    const char *image = image_format_for_suffix(suffix);
+    if (!suffix || (!community && image)) return -1;
     const char *archive = compression(suffix);
-    if (community && image_format(r) && strcasecmp(r->format, suffix + 1)) return 1;
+    const char *hinted_image = image_suffix_for_format(r->format);
+    if (hinted_image && !*archive && strcasecmp(hinted_image, suffix)) return 1;
     bool fpkg = !strcasecmp(suffix, ".fpkg");
     bool pkg = !strcasecmp(suffix, ".pkg");
     const char *format = "Game folder";
-    if (community && !strcasecmp(suffix, ".exfat")) format = "exFAT";
-    else if (community && !strcasecmp(suffix, ".ffpfsc")) format = "FFPFSC";
+    char image_name[sizeof r->filename];
+    bool added_suffix = image && suffix == detected;
+    if (image) {
+        format = image;
+        /* An opaque provider filename still needs the image extension on disk. */
+        if (added_suffix) {
+            if (snprintf(image_name, sizeof image_name, "%s%s", name, suffix) >= (int)sizeof image_name)
+                return -1;
+            name = image_name;
+        }
+    } else if (*archive && hinted_image) format = image_format_for_suffix(hinted_image);
     else if (fpkg || !strcmp(r->format, "FPKG")) format = "FPKG";
     else if (pkg || !strcmp(r->format, "PKG")) format = "PKG";
     memset(r->format, 0, sizeof r->format);
@@ -368,6 +394,7 @@ static int file_format(Release *r, const char *name, bool community, const char 
     copy_text(r->compression, sizeof r->compression, archive);
     if (!*archive) memset(r->archive_password, 0, sizeof r->archive_password);
     copy_text(r->filename, sizeof r->filename, name);
+    r->remote_image_suffix_added = added_suffix;
     return 0;
 }
 
@@ -382,7 +409,7 @@ int remote_provider_file_format(Release *r, const char *name, const char *detect
     const char *suffix = strrchr(name, '.');
     /* A feed can label the contents as an image while the provider serves an archive.
      * Use the archive's actual format so the normal inspection verifies its contents. */
-    if (file.remote_page && image_format(&file) &&
+    if (file.remote_page && image_suffix_for_format(file.format) &&
         ((suffix && *compression(suffix)) || (detected && *compression(detected))))
         copy_text(file.format, sizeof file.format, "Unknown");
     int result = file_format(&file, name, true, detected);
@@ -581,12 +608,12 @@ static int map_link(const cJSON *entry, const cJSON *link, const char *source_id
         unsupported_label(format) || unsupported_label(category) || unsupported_label(provider) ||
         unsupported_label(json_text(link, "compression")) || unsupported_label(json_text(link, "assetCompression")) ||
         unsupported_label(json_text(entry, "compression")) || unsupported_label(json_text(entry, "assetCompression"))) return 1;
-    const char *hint = label_format(kind);
-    if (!*hint) hint = label_format(label);
-    if (!*hint) hint = label_format(edition);
+    const char *hint = remote_label_format(kind);
+    if (!*hint) hint = remote_label_format(label);
+    if (!*hint) hint = remote_label_format(edition);
     if (!*hint) {
         if (unsupported_label(format) || unsupported_label(category)) return 1;
-        hint = label_format(*format ? format : category);
+        hint = remote_label_format(*format ? format : category);
         if (*format && !*hint && strcasecmp(format, "Unknown") && strcasecmp(format, "Unknown file type")) return 1;
     }
     copy_text(r->format, sizeof r->format, hint);

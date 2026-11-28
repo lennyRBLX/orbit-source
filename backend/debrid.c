@@ -793,7 +793,7 @@ DebridResult debrid_resolve(Job *job, const Release *route, Release *resolved, t
             (!needs_metadata || !remote_provider_file_format(&selected, resolved->filename[0] ? resolved->filename : name, NULL));
     } else if (match) {
         match = (!resolved->size || resolved->size == size) &&
-            (!resolved->filename[0] || !strcmp(name, resolved->filename)) &&
+            (!resolved->filename[0] || release_filename_matches(resolved, name)) &&
             (!needs_metadata || !remote_provider_file_format(&selected, name, NULL));
     }
     cJSON_Delete(list);

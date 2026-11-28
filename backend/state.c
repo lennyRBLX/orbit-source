@@ -2,6 +2,7 @@
 #include "orbit.h"
 #include "remote_sources.h"
 #include "links.h"
+#include "image_format.h"
 #include "packages.h"
 #include "firmware.h"
 #include "state_file.h"
@@ -558,7 +559,7 @@ int state_load(void) {
             if ((!r->archive_unverified && !(inspected_source && r->compression[0])) || !cJSON_IsNumber(inspected) || !isfinite(inspected->valuedouble) ||
                 inspected->valuedouble < 0 || inspected->valuedouble > 9007199254740991.0 ||
                 floor(inspected->valuedouble) != inspected->valuedouble ||
-                (*format && strcmp(format, "PKG") && strcmp(format, "exFAT") && strcmp(format, "FFPFSC") &&
+                (*format && strcmp(format, "PKG") && !image_suffix_for_format(format) &&
                  strcmp(format, "Game folder") && strcmp(format, "Unknown"))) {
                 cJSON_Delete(o); return -1;
             }

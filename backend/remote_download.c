@@ -1,5 +1,6 @@
 #include "remote_sources.h"
 #include "archive_account.h"
+#include "image_format.h"
 #include "provider_network.h"
 #include "ca.h"
 #include "pspkg.h"
@@ -12,7 +13,8 @@
 #include <strings.h>
 
 #define PAGE_LIMIT (1024U * 1024U)
-#define SAMPLE_BYTES 8
+#define MIN_SAMPLE_BYTES 8
+#define MAX_SAMPLE_BYTES (DOWNLOAD_UFS_MAGIC_OFFSET + sizeof ((DownloadSample *)0)->ufs_magic)
 
 typedef struct {
     char *body;
@@ -24,7 +26,7 @@ typedef struct {
     CURLcode code;
     long status;
     char effective_host[254];
-    unsigned char sample[SAMPLE_BYTES];
+    DownloadSample sample;
     char url[2048], name[160];
     int64_t size;
     atomic_bool *cancel;
@@ -41,6 +43,7 @@ static int progress(void *context, curl_off_t a, curl_off_t b, curl_off_t c, cur
 }
 
 static bool resolve_href(const char *base, const char *href, char *out, size_t cap);
+static const char *prefix_suffix(const DownloadSample *sample, size_t length);
 
 static bool metadata_origin(const char *initial, const char *next) {
     if (!strcmp(initial, next)) return true;
@@ -87,9 +90,11 @@ static size_t headers(char *data, size_t a, size_t b, void *context) {
     size_t n = a * b;
     if (n >= 5 && !memcmp(data, "HTTP/", 5)) {
         r->used = 0;
+        memset(&r->sample, 0, sizeof r->sample);
         r->page = r->truncated = r->challenge = r->json = false;
         r->error_page = r->redirect_status = r->plain_text = false;
-        if (r->body) r->body[0] = 0;
+        free(r->body);
+        r->body = NULL;
         const char *status = memchr(data, ' ', n);
         if (status && data + n - status >= 4) {
             r->error_page = status[1] == '4' || status[1] == '5';
@@ -141,20 +146,25 @@ static size_t body(char *data, size_t a, size_t b, void *context) {
         while (offset < n && isspace((unsigned char)data[offset])) offset++;
         collect = r->page = offset < n && data[offset] == '<';
     }
-    size_t limit = collect ? PAGE_LIMIT : SAMPLE_BYTES;
+    size_t limit = collect ? PAGE_LIMIT : MAX_SAMPLE_BYTES;
     if (collect && !r->body) {
         r->body = malloc(PAGE_LIMIT + 1);
         if (!r->body) return 0;
     }
     size_t take = n <= limit - r->used ? n : limit - r->used;
-    memcpy((collect ? (unsigned char *)r->body : r->sample) + r->used, data, take);
-    if (collect && r->used < SAMPLE_BYTES) {
-        size_t remaining = SAMPLE_BYTES - r->used;
-        memcpy(r->sample + r->used, data, take < remaining ? take : remaining);
+    if (collect) memcpy(r->body + r->used, data, take);
+    if (r->used < sizeof r->sample.prefix) {
+        size_t remaining = sizeof r->sample.prefix - r->used;
+        memcpy(r->sample.prefix + r->used, data, take < remaining ? take : remaining);
+    }
+    if (r->used < MAX_SAMPLE_BYTES && r->used + take > DOWNLOAD_UFS_MAGIC_OFFSET) {
+        size_t start = r->used > DOWNLOAD_UFS_MAGIC_OFFSET ? r->used : DOWNLOAD_UFS_MAGIC_OFFSET;
+        size_t end = r->used + take < MAX_SAMPLE_BYTES ? r->used + take : MAX_SAMPLE_BYTES;
+        memcpy(r->sample.ufs_magic + start - DOWNLOAD_UFS_MAGIC_OFFSET, data + start - r->used, end - start);
     }
     r->used += take;
     if (collect) r->body[r->used] = 0;
-    r->truncated = take != n;
+    r->truncated = take != n || (!collect && prefix_suffix(&r->sample, r->used));
     return r->truncated ? 0 : n;
 }
 
@@ -198,7 +208,11 @@ static bool fetch(const char *url, Response *r) {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     if (r->archive_session) archive_account_apply(curl);
     if (r->collect_page && !r->range) curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-    if (!r->collect_page || r->range) curl_easy_setopt(curl, CURLOPT_RANGE, "0-7");
+    if (!r->collect_page || r->range) {
+        char range[24];
+        snprintf(range, sizeof range, "0-%zu", MAX_SAMPLE_BYTES - 1);
+        curl_easy_setopt(curl, CURLOPT_RANGE, range);
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, r);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headers);
@@ -235,7 +249,7 @@ static bool fetch(const char *url, Response *r) {
             long long end, total;
             char trailing;
             if (sscanf(header->value, "bytes 0-%lld/%lld%c", &end, &total, &trailing) == 2 &&
-                end >= SAMPLE_BYTES - 1 && total > end) r->size = total;
+                end >= MIN_SAMPLE_BYTES - 1 && total > end) r->size = total;
         } else if (status == 200) {
             curl_off_t size = -1;
             if (!curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &size)) r->size = size;
@@ -249,25 +263,34 @@ static bool fetch(const char *url, Response *r) {
     return ok;
 }
 
-static const char *sample_suffix(const unsigned char *p, size_t length) {
-    if (length < SAMPLE_BYTES) return NULL;
+static const char *prefix_suffix(const DownloadSample *sample, size_t length) {
+    const unsigned char *p = sample->prefix;
+    if (length < MIN_SAMPLE_BYTES) return NULL;
     if (!memcmp(p, "PK\3\4", 4)) return ".zip";
     if (!memcmp(p, "7z\xbc\xaf\x27\x1c", 6)) return ".7z";
     if (!memcmp(p, "Rar!\x1a\x07", 6) && (p[6] == 0 || (p[6] == 1 && p[7] == 0))) return ".rar";
     if (!memcmp(p, "\x7f" "CNT", 4) || !memcmp(p, "\x7f" "FIH", 4)) return ".pkg";
     if (!memcmp(p, "PFSC", 4)) return ".ffpfsc";
     if (!memcmp(p + 3, "EXFAT", 5)) return ".exfat";
+    /* A PFS header starts with a little-endian 64-bit version and magic. */
+    if (length >= sizeof sample->prefix && (p[0] == 1 || p[0] == 2) &&
+        !memcmp(p + 1, "\0\0\0\0\0\0\0\x0b\x2a\x33\x01\0\0\0\0", 15)) return ".ffpfs";
     return NULL;
 }
 
-bool download_file_magic(const Release *r, const unsigned char *p, size_t length) {
-    const char *suffix = sample_suffix(p, length);
-    const char *expected = r->compression[0] ? r->compression : "pkg";
-    if (!r->compression[0]) {
-        if (!strcmp(r->format, "exFAT")) expected = "exfat";
-        else if (!strcmp(r->format, "FFPFSC")) expected = "ffpfsc";
-    }
-    return suffix && !strcmp(suffix + 1, expected);
+static const char *sample_suffix(const DownloadSample *sample, size_t length) {
+    const char *suffix = prefix_suffix(sample, length);
+    if (!suffix && length >= MAX_SAMPLE_BYTES && !memcmp(sample->ufs_magic, "\x19\x01\x54\x19", 4))
+        return ".ffpkg";
+    return suffix;
+}
+
+bool download_file_magic(const Release *r, const DownloadSample *sample, size_t length) {
+    const char *suffix = sample_suffix(sample, length);
+    if (!suffix) return false;
+    if (r->compression[0]) return !strcmp(suffix + 1, r->compression);
+    const char *expected = image_suffix_for_format(r->format);
+    return !strcmp(suffix, expected ? expected : ".pkg");
 }
 
 static bool safe_page_name(const char *name);
@@ -289,16 +312,16 @@ static int file_from_response(Release *r, const Response *response, const char *
     }
     if (!*actual) actual = name;
     if (!response->direct && !safe_page_name(actual)) return -1;
-    if (r->filename[0] && strcmp(r->filename, actual)) return -1;
+    if (r->filename[0] && !release_filename_matches(r, actual)) return -1;
     Release file = *r;
-    const char *suffix = sample_suffix(response->sample, response->used);
+    const char *suffix = sample_suffix(&response->sample, response->used);
     int format = response->direct ? direct_file_format(&file, actual) :
         remote_provider_file_format(&file, actual, r->remote_page ? suffix : NULL);
     if (format) return format;
     if (r->compression[0] && strcmp(r->compression, file.compression)) return 1;
-    if (response->page || response->size < SAMPLE_BYTES || response->size > 9007199254740991LL ||
+    if (response->page || response->size < MIN_SAMPLE_BYTES || response->size > 9007199254740991LL ||
         (r->size && r->size != response->size) ||
-        !download_file_magic(&file, response->sample, response->used)) return -1;
+        !download_file_magic(&file, &response->sample, response->used)) return -1;
     copy_text(file.url, sizeof file.url, url);
     file.size = response->size;
     *r = file;
@@ -1294,15 +1317,14 @@ static cJSON *pspkg_page_links(const char *html, const char *page, const char *h
             cJSON_AddStringToObject(item, "filename", filename);
         else filename[0] = 0;
         bool unsupported = phrase(edition, "zstd") || phrase(edition, "lz4") ||
-                           phrase(label, "zstd") || phrase(label, "lz4") || phrase(edition, "pfs");
+                           phrase(label, "zstd") || phrase(label, "lz4");
         bool multipart = phrase(edition, "part") || phrase(edition, "multipart") ||
                          phrase(label, "part") || phrase(label, "volume");
-        const char *formats[] = {"FPKG", "PKG", "PFS", "exFAT", "FFPFSC"};
-        for (size_t i = 0; i < sizeof formats / sizeof *formats; i++)
-            if (phrase(edition, formats[i]) || phrase(group, formats[i])) {
-                cJSON_AddStringToObject(item, "format", formats[i]);
-                break;
-            }
+        const char *format = remote_label_format(edition);
+        if (!*format || !strcmp(format, "Game folder")) format = remote_label_format(group);
+        if (!*format || !strcmp(format, "Game folder")) format = remote_label_format(label);
+        if (image_suffix_for_format(detected.format)) format = detected.format;
+        if (*format && strcmp(format, "Game folder")) cJSON_AddStringToObject(item, "format", format);
         const char *compressions[] = {"ZSTD", "LZ4", "RAR", "ZIP", "7z"};
         for (size_t i = 0; i < sizeof compressions / sizeof *compressions; i++)
             if (phrase(edition, compressions[i]) || phrase(label, compressions[i])) {
@@ -1410,7 +1432,7 @@ static void download_page_metadata(const Response *page, const Release *r, Remot
     const char *title = find_text(page->body, "<title>");
     char title_text[512];
     if (title && element_text(title, title + 6, title_text, sizeof title_text) &&
-        (phrase(title_text, "LZ4") || phrase(title_text, "ZSTD") || phrase(title_text, "PFS"))) {
+        (phrase(title_text, "LZ4") || phrase(title_text, "ZSTD"))) {
         metadata->status = REMOTE_METADATA_UNSUPPORTED;
         metadata->size = 0;
         metadata->exact = false;
@@ -1614,7 +1636,7 @@ bool remote_download_metadata(const Release *r, RemoteFileMetadata *metadata, cJ
             metadata->exact = true;
             metadata->confidence = 4;
             metadata->status = REMOTE_METADATA_FOUND;
-        } else if (direct && page.size <= 0 && download_file_magic(r, page.sample, page.used)) {
+        } else if (direct && page.size <= 0 && download_file_magic(r, &page.sample, page.used)) {
             metadata->status = REMOTE_METADATA_NO_SIZE;
         } else metadata->status = REMOTE_METADATA_UNSUPPORTED;
     } else if (direct) metadata->status = interactive ? REMOTE_METADATA_INTERACTIVE : REMOTE_METADATA_NO_SIZE;
@@ -1824,6 +1846,6 @@ done:
     free(page.body);
     if (result == REMOTE_DOWNLOAD_MISSING) copy_text(error, cap, REMOTE_DOWNLOAD_REMOVED);
     else if (result < 0 && !error[0])
-        copy_text(error, cap, "This option did not identify a supported PKG, FPKG, RAR or ZIP download.");
+        copy_text(error, cap, "The provider file could not be verified.");
     return result;
 }

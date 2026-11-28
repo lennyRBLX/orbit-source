@@ -12,6 +12,7 @@
  * Links stay private: status replies name only the host, and the saved queue keeps
  * the link so a download can resume. One batch of up to 20 links at a time. */
 #include "links.h"
+#include "image_format.h"
 #include <ctype.h>
 #include <curl/curl.h>
 #include <openssl/crypto.h>
@@ -153,9 +154,11 @@ void link_kind(Release *r) {
          * it has the file, then checks the room to unpack it. */
         r->archive_unverified = true;
         copy_text(r->format, sizeof r->format, "Unknown");
-    } else copy_text(r->format, sizeof r->format,
-                     ends_with(name, ".pkg") ? "PKG" : ends_with(name, ".exfat") ? "exFAT" :
-                     ends_with(name, ".ffpfsc") ? "FFPFSC" : "File");
+    } else {
+        const char *image = image_format_for_suffix(strrchr(name, '.'));
+        copy_text(r->format, sizeof r->format, image ? image :
+                  ends_with(name, ".pkg") ? "PKG" : ends_with(name, ".fpkg") ? "FPKG" : "File");
+    }
 }
 bool link_release_valid(const Release *r) {
     if (strcmp(r->source, "link") || strncmp(r->id, "link-", 5) || strlen(r->id) != 21 ||
@@ -172,8 +175,11 @@ bool link_release_valid(const Release *r) {
     clean_name(r->filename, clean, sizeof clean);
     Release kind = *r;
     link_kind(&kind);
+    /* Older queues saved these three extensions with the generic File label. */
+    bool legacy = !strcmp(r->format, "File") &&
+        (!strcmp(kind.format, "FFPKG") || !strcmp(kind.format, "FFPFS") || !strcmp(kind.format, "FPKG"));
     return !strcmp(clean, r->filename) && !strcmp(kind.compression, r->compression) &&
-           !strcmp(kind.format, r->format) && kind.archive_unverified == r->archive_unverified;
+           (legacy || !strcmp(kind.format, r->format)) && kind.archive_unverified == r->archive_unverified;
 }
 /* The same link always gets the same id, so adding it twice to a drive is caught. */
 static void link_id(const char *url, char *out, size_t cap) {

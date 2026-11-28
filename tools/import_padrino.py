@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / 'catalog/padrino.json.gz'
 TITLE_ID = re.compile(r'(CUSA|PPSA)[0-9]{5}\Z')
 UNSUPPORTED_COMPRESSION = re.compile(r'(?<![a-z0-9])(?:lz4|zstd|zst|zstandard)(?![a-z0-9])', re.I)
-FILE = re.compile(r'\.(?:pkg|fpkg|exfat|ffpfsc|zip|7z|rar)\Z', re.I)
+FILE = re.compile(r'\.(?:pkg|fpkg|exfat|ffpkg|ffpfs|ffpfsc|zip|7z|rar)\Z', re.I)
 VOLUME = re.compile(r'(?:\.part[0-9]+\.rar|\.r[0-9]{2}|\.z[0-9]{2}|\.[0-9]{3})\Z', re.I)
 PART_LABEL = re.compile(r'(?<![a-z0-9])(?:part|volume)[ ._-]*[0-9]+', re.I)
 VIKING = {'vikingfile.com', 'vik1ngfile.site', 'vik1ngf1le.online'}
@@ -158,7 +158,7 @@ def option(row):
         result['format'] = 'FPKG'
     elif re.search(r'\bexfat\b', row.get('label') or '', re.I):
         result['format'] = 'exfat'
-    elif row.get('format') in ('pkg', 'zip', 'rar', '7z', 'exfat', 'ffpfsc'):
+    elif row.get('format') in ('pkg', 'zip', 'rar', '7z', 'exfat', 'ffpkg', 'ffpfs', 'ffpfsc'):
         result['format'] = row['format']
     if page:
         result['page'] = True

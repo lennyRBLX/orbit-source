@@ -52,13 +52,21 @@ bool remote_metadata_option(const Release *release);
 bool remote_link_missing_locked(const Release *release);
 void remote_mark_missing_locked(const Release *release);
 bool remote_url_filename(const char *url, char *name, size_t cap);
+bool release_filename_matches(const Release *release, const char *name);
+const char *remote_label_format(const char *label);
 int remote_file_format(Release *release, const char *name);
 int remote_file_detected_format(Release *release, const char *name, const char *suffix);
 int remote_provider_file_format(Release *release, const char *name, const char *detected);
 int direct_file_format(Release *release, const char *name);
 bool direct_release_init(Release *release, const char *url);
 int direct_release_parse(const cJSON *entry, Release *release);
-bool download_file_magic(const Release *release, const unsigned char *sample, size_t length);
+/* FreeBSD UFS2 places fs_magic 1372 bytes into the 64 KiB superblock. */
+#define DOWNLOAD_UFS_MAGIC_OFFSET (65536 + 1372)
+typedef struct {
+    unsigned char prefix[16];
+    unsigned char ufs_magic[4];
+} DownloadSample;
+bool download_file_magic(const Release *release, const DownloadSample *sample, size_t length);
 enum { REMOTE_DOWNLOAD_MISSING = -2 };
 #define REMOTE_DOWNLOAD_REMOVED "The source no longer has this file. Choose another download option if there is one."
 bool remote_download_html_missing(long status, const char *html, bool challenge);

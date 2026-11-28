@@ -27,6 +27,7 @@ bool job_active(const Job *j) { return !strcmp(j->status, "downloading"); }
 bool job_can_refresh_link(const Job *j) { (void)j; return false; }
 const char *notify_event_name(unsigned index) { (void)index; return NULL; }
 /* User-pasted links are covered by the full service integration test. */
+void link_kind(Release *r) { (void)r; }
 bool link_release_valid(const Release *r) { (void)r; return false; }
 bool link_url_allowed(const char *url) { (void)url; return false; }
 void link_host(const char *url, char *out, size_t cap) { (void)url; if (cap) out[0] = 0; }
